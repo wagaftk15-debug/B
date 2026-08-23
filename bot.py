@@ -1,10 +1,8 @@
 import os
 import json
-import random
-import hashlib
 import requests
 import psycopg2
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
@@ -14,10 +12,6 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # رابط قاعدة البيانات (يُضاف من لوحة Railway → Variables باسم DATABASE_URL)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-# نطاق الرقم العشوائي لكل مستخدم (تقدر تعدله متل ما بدك)
-SHANQLA_MIN = 1
-SHANQLA_MAX = 999
 
 
 # ───────────────────────── قاعدة البيانات ─────────────────────────
@@ -32,6 +26,8 @@ def init_db():
     try:
         conn = get_connection()
         cur = conn.cursor()
+
+        # جدول المستخدمين ورقمهم اللي دخّلوه بأنفسهم
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS shanqla (
@@ -39,73 +35,128 @@ def init_db():
                 username TEXT,
                 first_name TEXT,
                 count INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        # حالة انتظار: نتتبع إذا كان البوت مستني من المستخدم يكتب رقمه
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                user_id BIGINT PRIMARY KEY,
+                action TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )
             """
         )
+
         conn.commit()
         cur.close()
         conn.close()
-        print("تم تجهيز قاعدة البيانات بنجاح.")
+        print("[DB] تم تجهيز قاعدة البيانات بنجاح.")
     except Exception as e:
-        print(f"فشل تجهيز قاعدة البيانات: {e}")
+        print(f"[DB] ❌ فشل تجهيز قاعدة البيانات: {e}")
 
 
-def generate_shanqla_count(user_id):
-    """رقم عشوائي لكن ثابت لكل مستخدم (نفس الشخص دايماً بياخد نفس الرقم)."""
-    seed_str = f"shanqla-{user_id}"
-    seed = int(hashlib.sha256(seed_str.encode()).hexdigest(), 16)
-    rng = random.Random(seed)
-    return rng.randint(SHANQLA_MIN, SHANQLA_MAX)
-
-
-def get_or_create_shanqla(user_id, username=None, first_name=None):
-    """يرجع عدد الشنقلات المخزن للمستخدم، وينشئه أول مرة لو مش موجود."""
+def set_pending_action(user_id, action):
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if row:
-            # تحديث الاسم لو تغيّر
-            cur.execute(
-                "UPDATE shanqla SET username = %s, first_name = %s WHERE user_id = %s",
-                (username, first_name, user_id),
-            )
-            conn.commit()
-            cur.close()
-            conn.close()
-            print(f"[DB] مستخدم موجود مسبقاً: user_id={user_id} count={row[0]}")
-            return row[0]
-
-        count = generate_shanqla_count(user_id)
         cur.execute(
             """
-            INSERT INTO shanqla (user_id, username, first_name, count)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO pending_actions (user_id, action, created_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET action = EXCLUDED.action, created_at = NOW()
+            """,
+            (user_id, action),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] ❌ set_pending_action error: {e}")
+
+
+def get_pending_action(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT action FROM pending_actions WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[DB] ❌ get_pending_action error: {e}")
+        return None
+
+
+def clear_pending_action(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] ❌ clear_pending_action error: {e}")
+
+
+def save_shanqla_count(user_id, count, username=None, first_name=None):
+    """يحفظ/يحدّث الرقم اللي دخّله المستخدم بنفسه، ويتأكد من الحفظ فعلياً."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO shanqla (user_id, username, first_name, count, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET count = EXCLUDED.count,
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                updated_at = NOW()
             """,
             (user_id, username, first_name, count),
         )
         conn.commit()
-        # نتأكد فعلياً إنه انحفظ بقراءته مرة ثانية من الداتابيس (مش من الذاكرة)
+
+        # تأكيد فعلي بقراءة القيمة من قاعدة البيانات بعد الحفظ
         cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
         confirm_row = cur.fetchone()
         cur.close()
         conn.close()
 
         if confirm_row and confirm_row[0] == count:
-            print(f"[DB] ✅ تم حفظ مستخدم جديد بنجاح: user_id={user_id} username={username} count={count}")
-        else:
-            print(f"[DB] ⚠️ تحذير: الإدخال ما تأكدش بعد الحفظ لـ user_id={user_id}")
-
-        return count
+            print(f"[DB] ✅ تم حفظ الرقم بنجاح: user_id={user_id} count={count}")
+            return True
+        print(f"[DB] ⚠️ تحذير: الحفظ ما تأكدش لـ user_id={user_id}")
+        return False
     except Exception as e:
-        print(f"[DB] ❌ get_or_create_shanqla error: {e}")
-        return generate_shanqla_count(user_id)
+        print(f"[DB] ❌ save_shanqla_count error: {e}")
+        return False
+
+
+def get_user_count(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[DB] ❌ get_user_count error: {e}")
+        return None
 
 
 def get_algeria_stats():
-    """مجموع شنقلات كل المستخدمين اللي استعملوا البوت + عددهم."""
+    """مجموع أرقام كل المستخدمين اللي دخّلوا رقمهم بأنفسهم + عددهم."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -113,29 +164,43 @@ def get_algeria_stats():
         users_count, total = cur.fetchone()
         cur.close()
         conn.close()
-        print(f"[DB] إحصائية: عدد المستخدمين={users_count} المجموع={total}")
         return users_count, total
     except Exception as e:
         print(f"[DB] ❌ get_algeria_stats error: {e}")
         return 0, 0
 
 
-def get_all_users_debug(limit=20):
-    """يرجع آخر المستخدمين المخزنين، تستخدمها للتأكد اليدوي إن البيانات محفوظة فعلاً."""
+def get_all_users_ranked():
+    """كل المستخدمين مرتبين تنازلياً حسب رقمهم، للموقع."""
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT user_id, username, first_name, count, created_at FROM shanqla ORDER BY created_at DESC LIMIT %s",
-            (limit,),
+            """
+            SELECT user_id, username, first_name, count, created_at
+            FROM shanqla
+            ORDER BY count DESC, created_at ASC
+            """
         )
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        return rows
+        return [
+            {"user_id": r[0], "username": r[1], "first_name": r[2], "count": r[3]}
+            for r in rows
+        ]
     except Exception as e:
-        print(f"[DB] ❌ get_all_users_debug error: {e}")
+        print(f"[DB] ❌ get_all_users_ranked error: {e}")
         return []
+
+
+def mask_name(username, first_name):
+    """يعتم الاسم ويسيب الحرف الأول فقط ظاهر."""
+    name = username or first_name or "مستخدم"
+    name = str(name).strip()
+    if len(name) <= 1:
+        return name
+    return name[0] + "*" * (len(name) - 1)
 
 
 # ───────────────────────── دوال تيليجرام ─────────────────────────
@@ -160,19 +225,277 @@ def answer_callback(callback_id, text, show_alert=False):
         print(f"answer_callback error: {e}")
 
 
-def main_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "😂 شحال عندي شنقلة فدار؟", "callback_data": "my_shanqla"}],
-            [{"text": "🇩🇿 شحال عند الشعب الجزائري؟", "callback_data": "algeria_shanqla"}],
-        ]
+def main_keyboard(site_url):
+    keyboard = [
+        [{"text": "✍️ سجّل شنقلتي", "callback_data": "enter_shanqla"}],
+        [{"text": "🇩🇿 شحال عند الشعب الجزائري؟", "callback_data": "algeria_shanqla"}],
+    ]
+    if site_url:
+        keyboard.append([{"text": "🌐 افتح الموقع", "web_app": {"url": site_url}}])
+    return {"inline_keyboard": keyboard}
+
+
+# ───────────────────────── واجهة الويب (تطبيق مصغّر) ─────────────────────────
+MINI_APP_PAGE = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>شنقلة فدار 🇩🇿</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-1: #1c2f2a;
+    --bg-2: #0c1512;
+    --card: rgba(247, 237, 224, 0.05);
+    --card-line: rgba(247, 237, 224, 0.10);
+    --cream: #f2f0e6;
+    --muted: #9db3ab;
+    --green: #59b389;
+    --green-deep: #3c8464;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; overscroll-behavior: none; }
+  body {
+    background: radial-gradient(130% 95% at 50% -5%, var(--bg-1) 0%, var(--bg-2) 65%);
+    font-family: 'Tajawal', 'Segoe UI', Tahoma, Arial, sans-serif;
+    color: var(--cream);
+  }
+
+  .app {
+    height: 100dvh;
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-top: env(safe-area-inset-top, 0px);
+    position: relative;
+  }
+
+  .glow {
+    position: absolute;
+    top: -120px; right: -80px;
+    width: 320px; height: 320px;
+    background: radial-gradient(circle, rgba(89,179,137,0.18), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: center; gap: 9px;
+    padding: 16px 16px 6px; flex-shrink: 0; position: relative; z-index: 1;
+  }
+  .topbar svg { width: 21px; height: 21px; color: var(--green); flex-shrink: 0; }
+  .topbar span { font-family: 'Amiri', serif; font-size: 19px; font-weight: 700; letter-spacing: 0.5px; }
+
+  .view { display: none; flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 8px 22px 28px; position: relative; z-index: 1; animation: fadeIn 0.35s ease; }
+  .view.active { display: flex; flex-direction: column; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  #view-home { align-items: center; justify-content: center; text-align: center; }
+  .flourish { width: 128px; height: 14px; opacity: 0.6; margin: 0 auto 24px; display: block; }
+  .hero-label { color: var(--muted); font-size: 13px; letter-spacing: 0.4px; margin-bottom: 10px; }
+  .count {
+    font-family: 'Amiri', serif; font-size: clamp(56px, 18vw, 84px); line-height: 1;
+    font-weight: 700; color: var(--green); margin: 0; transition: transform 0.25s ease;
+  }
+  .count-desc { color: var(--muted); font-size: 14px; line-height: 1.7; margin: 16px 0 0; max-width: 270px; }
+  .cta-btn {
+    margin-top: 22px; background: var(--green); color: #0c1512; border: none;
+    font-family: inherit; font-weight: 900; font-size: 14.5px; padding: 13px 26px;
+    border-radius: 14px; cursor: pointer;
+  }
+
+  #view-users { padding-top: 16px; }
+  .users-summary {
+    display: flex; justify-content: space-around; background: var(--card);
+    border: 1px solid var(--card-line); border-radius: 18px; padding: 18px 10px;
+    margin-bottom: 18px; flex-shrink: 0;
+  }
+  .stat { text-align: center; }
+  .stat b { display: block; font-family: 'Amiri', serif; font-size: 25px; color: var(--green); }
+  .stat span { font-size: 11px; color: var(--muted); }
+
+  .section-label { font-size: 13px; color: var(--muted); margin: 4px 2px 10px; }
+  .list { background: var(--card); border: 1px solid var(--card-line); border-radius: 18px; overflow: hidden; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 14px 17px; border-bottom: 1px solid var(--card-line); }
+  .row:last-child { border-bottom: none; }
+  .row .rank { color: var(--muted); font-size: 12px; width: 22px; flex-shrink: 0; }
+  .row .name { font-size: 14.5px; letter-spacing: 0.5px; flex: 1; }
+  .row .amount { font-size: 13.5px; font-weight: 700; color: var(--green); white-space: nowrap; }
+  .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 44px 10px; }
+
+  .tabbar {
+    flex-shrink: 0; display: flex; gap: 10px; border-top: 1px solid var(--card-line);
+    background: rgba(12, 21, 18, 0.88); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); position: relative; z-index: 1;
+  }
+  .tab {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 7px;
+    background: none; border: 1px solid transparent; color: var(--muted); font-family: inherit;
+    font-size: 13px; font-weight: 700; padding: 12px 8px; border-radius: 14px; cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+  .tab svg { width: 19px; height: 19px; flex-shrink: 0; }
+  .tab.active { color: var(--green); background: rgba(89, 179, 137, 0.10); border-color: rgba(89, 179, 137, 0.25); }
+</style>
+</head>
+<body>
+  <div class="app">
+    <div class="glow"></div>
+
+    <div class="topbar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+        <path d="M12 3v18M5 12h14"/>
+      </svg>
+      <span>شنقلة فدار 🇩🇿</span>
+    </div>
+
+    <main id="view-home" class="view active">
+      <svg class="flourish" viewBox="0 0 128 14" fill="none" stroke="#59b389" stroke-width="1">
+        <line x1="0" y1="7" x2="48" y2="7"/><circle cx="64" cy="7" r="4"/><line x1="80" y1="7" x2="128" y2="7"/>
+      </svg>
+      <div class="hero-label">مجموع شنقلة فدار عند الشعب الجزائري</div>
+      <div class="count" id="count">{{ total }}</div>
+      <div class="count-desc">كل رقم هون مدخّل يدوياً من صاحبه، سجّل رقمك أنت كمان عبر البوت 👇</div>
+      <button class="cta-btn" onclick="sendToBot()">سجّل رقمك بالبوت</button>
+    </main>
+
+    <main id="view-users" class="view">
+      <div class="users-summary">
+        <div class="stat"><b id="u-count">0</b><span>شخص سجّل رقمه</span></div>
+        <div class="stat"><b id="u-total">0</b><span>المجموع الكلي</span></div>
+      </div>
+      <div class="section-label">الترتيب</div>
+      <div class="list" id="users-list">
+        <div class="empty">جاري التحميل...</div>
+      </div>
+    </main>
+
+    <nav class="tabbar">
+      <button class="tab active" data-view="home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M4 11.5 12 5l8 6.5"/><path d="M6 10.5V19h12v-8.5"/>
+        </svg>
+        الرئيسية
+      </button>
+      <button class="tab" data-view="users">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="12" cy="8" r="3.4"/><path d="M5 20c0-3.6 3-6.2 7-6.2s7 2.6 7 6.2"/>
+        </svg>
+        المستخدمون
+      </button>
+    </nav>
+  </div>
+
+  <script>
+    if (window.Telegram && window.Telegram.WebApp) {
+      const tg = window.Telegram.WebApp;
+      tg.ready();
+      tg.expand();
+      if (tg.setHeaderColor) { try { tg.setHeaderColor('#0c1512'); } catch (e) {} }
+      if (tg.setBackgroundColor) { try { tg.setBackgroundColor('#0c1512'); } catch (e) {} }
+      if (tg.disableVerticalSwipes) { try { tg.disableVerticalSwipes(); } catch (e) {} }
     }
+
+    function sendToBot() {
+      if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.sendData) {
+        window.Telegram.WebApp.sendData('enter_shanqla');
+      }
+    }
+
+    const tabs = document.querySelectorAll('.tab');
+    const views = { home: document.getElementById('view-home'), users: document.getElementById('view-users') };
+
+    function showView(name) {
+      Object.entries(views).forEach(([key, el]) => el.classList.toggle('active', key === name));
+      tabs.forEach(t => t.classList.toggle('active', t.dataset.view === name));
+      if (name === 'users') loadUsers();
+    }
+    tabs.forEach(t => t.addEventListener('click', () => showView(t.dataset.view)));
+
+    async function refreshTotal() {
+      try {
+        const res = await fetch('/api/total');
+        const data = await res.json();
+        const el = document.getElementById('count');
+        if (el.textContent != data.total) {
+          el.textContent = data.total;
+          el.style.transform = 'scale(1.12)';
+          setTimeout(() => { el.style.transform = 'scale(1)'; }, 200);
+        }
+      } catch (e) { console.error('تعذر تحديث المجموع', e); }
+    }
+
+    async function loadUsers() {
+      try {
+        const res = await fetch('/api/users');
+        const data = await res.json();
+        document.getElementById('u-count').textContent = data.users_count;
+        document.getElementById('u-total').textContent = data.total;
+
+        const list = document.getElementById('users-list');
+        if (!data.users || data.users.length === 0) {
+          list.innerHTML = '<div class="empty">ما في حدا سجّل رقمه لسا 🙂</div>';
+          return;
+        }
+        list.innerHTML = data.users.map((u, i) => `
+          <div class="row">
+            <span class="rank">${i + 1}</span>
+            <span class="name">${u.masked_name}</span>
+            <span class="amount">${u.count}</span>
+          </div>
+        `).join('');
+      } catch (e) { console.error('تعذر تحميل قائمة المستخدمين', e); }
+    }
+
+    refreshTotal();
+    setInterval(refreshTotal, 5000);
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('tab') === 'users') showView('users');
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def home():
+    _, total = get_algeria_stats()
+    return render_template_string(MINI_APP_PAGE, total=total)
+
+
+@app.route("/api/total")
+def api_total():
+    _, total = get_algeria_stats()
+    return jsonify({"total": total})
+
+
+@app.route("/api/users")
+def api_users():
+    users_count, total = get_algeria_stats()
+    ranked = get_all_users_ranked()
+    result = [
+        {"masked_name": mask_name(u["username"], u["first_name"]), "count": u["count"]}
+        for u in ranked
+    ]
+    return jsonify({"users_count": users_count, "total": total, "users": result})
 
 
 # ───────────────────────── الويب هوك ─────────────────────────
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    site_url = f"https://{domain}" if domain else ""
 
     if "message" in update:
         msg = update["message"]
@@ -183,64 +506,93 @@ def webhook():
         username = sender.get("username")
         first_name = sender.get("first_name")
 
+        # المستخدم فتح الموقع وضغط "سجّل رقمك بالبوت" (Web App sendData)
+        web_app_data = msg.get("web_app_data")
+        if web_app_data and web_app_data.get("data") == "enter_shanqla":
+            set_pending_action(user_id, "awaiting_number")
+            send_message(chat_id, "طيب، ابعتلي رقمك (عدد) بس، كم عندك شنقلة فدار؟ 😄")
+            return jsonify({"ok": True})
+
+        # لو البوت مستني رقم من هاد المستخدم
+        pending = get_pending_action(user_id) if user_id else None
+        if pending == "awaiting_number" and text and not text.startswith("/"):
+            cleaned = text.strip().replace(",", "").replace("٬", "")
+            # تحويل الأرقام العربية لأرقام إنجليزية لو المستخدم كتبها عربي
+            arabic_digits = "٠١٢٣٤٥٦٧٨٩"
+            cleaned = "".join(str(arabic_digits.index(ch)) if ch in arabic_digits else ch for ch in cleaned)
+
+            if cleaned.isdigit():
+                count = int(cleaned)
+                if count < 0 or count > 1_000_000:
+                    send_message(chat_id, "رقم غير منطقي 😅 اكتب رقم بين 0 و1,000,000.")
+                else:
+                    saved = save_shanqla_count(user_id, count, username, first_name)
+                    clear_pending_action(user_id)
+                    if saved:
+                        _, total = get_algeria_stats()
+                        send_message(
+                            chat_id,
+                            f"تمام ✅ سجّلنا إنه عندك {count} شنقلة فدار.\n"
+                            f"🇩🇿 مجموع الشعب الجزائري الآن: {total}",
+                        )
+                    else:
+                        send_message(chat_id, "صار خطأ بالحفظ، جرب مرة ثانية لو سمحت 🙏")
+            else:
+                send_message(chat_id, "لازم تكتب رقم فقط (مثلاً: 42) 🙏")
+            return jsonify({"ok": True})
+
         if text.startswith("/start"):
             send_message(
                 chat_id,
-                "أهلاً فيك 👋\nهاد البوت يحسبلك شحال عندك من \"شنقلة فدار\" 😂\nاضغط زر تحت:",
-                main_keyboard(),
+                "أهلاً فيك 👋\nهاد البوت بيحسب كم عند كل واحد من \"شنقلة فدار\"، وأنت بتكتب رقمك بنفسك.\n"
+                "اضغط زر تحت:",
+                main_keyboard(site_url),
             )
 
         elif text in ("/شنقلتي", "/my"):
-            count = get_or_create_shanqla(user_id, username, first_name)
-            send_message(chat_id, f"عندك {count} شنقلة فدار 😂")
+            existing = get_user_count(user_id)
+            set_pending_action(user_id, "awaiting_number")
+            if existing is not None:
+                send_message(chat_id, f"رقمك المسجل حالياً: {existing} شنقلة فدار.\nابعتلي رقم جديد لو بدك تعدّله.")
+            else:
+                send_message(chat_id, "لسا ما سجّلت رقمك. اكتبلي كم عندك شنقلة فدار؟")
 
         elif text in ("/الجزائر", "/algeria"):
             users_count, total = get_algeria_stats()
             send_message(
                 chat_id,
-                f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص استعملوا البوت لحد الآن)",
+                f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص سجّلوا رقمهم لحد الآن)",
             )
 
-        elif text in ("/تأكيد", "/debug"):
-            rows = get_all_users_debug(20)
-            if not rows:
-                send_message(chat_id, "ما في ولا سجل محفوظ لسا بقاعدة البيانات.")
-            else:
-                lines = ["📋 آخر السجلات المحفوظة فعلياً بقاعدة البيانات:\n"]
-                for r in rows:
-                    uid, uname, fname, count, created_at = r
-                    who = f"@{uname}" if uname else (fname or f"id:{uid}")
-                    lines.append(f"• {who} — {count} شنقلة — {created_at}")
-                send_message(chat_id, "\n".join(lines))
+        elif text in ("/الموقع", "/site") and site_url:
+            send_message(chat_id, f"🌐 شوف الموقع من هون:\n{site_url}")
 
         else:
             send_message(
                 chat_id,
                 "استخدم الأزرار تحت، أو اكتب /شنقلتي أو /الجزائر 👇",
-                main_keyboard(),
+                main_keyboard(site_url),
             )
 
     elif "callback_query" in update:
         cq = update["callback_query"]
         sender = cq.get("from", {})
         user_id = sender["id"]
-        username = sender.get("username")
-        first_name = sender.get("first_name")
         chat_id = cq["message"]["chat"]["id"]
         callback_id = cq["id"]
         data_key = cq.get("data", "")
 
-        if data_key == "my_shanqla":
-            count = get_or_create_shanqla(user_id, username, first_name)
+        if data_key == "enter_shanqla":
             answer_callback(callback_id, "")
-            send_message(chat_id, f"عندك {count} شنقلة فدار 😂")
+            set_pending_action(user_id, "awaiting_number")
+            send_message(chat_id, "طيب، ابعتلي رقمك (عدد) بس، كم عندك شنقلة فدار؟ 😄")
 
         elif data_key == "algeria_shanqla":
             answer_callback(callback_id, "")
             users_count, total = get_algeria_stats()
             send_message(
                 chat_id,
-                f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص استعملوا البوت لحد الآن)",
+                f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص سجّلوا رقمهم لحد الآن)",
             )
 
     return jsonify({"ok": True})
