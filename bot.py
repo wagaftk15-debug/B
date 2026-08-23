@@ -1,3 +1,4 @@
+```python
 import os
 import json
 import time
@@ -15,10 +16,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # ───────────────────────── تجهيز DATABASE_URL ─────────────────────────
 def build_database_url():
-    """يبني DATABASE_URL من البيئة، ويصلحها لـ Railway."""
+    """يبني DATABASE_URL من البيئة، ويعدل خيارات الاتصال لـ Railway."""
     url = os.environ.get("DATABASE_URL", "").strip()
 
-    # لو مش موجود، حاول نبنيه من متغيرات PG_*
     if not url:
         host = os.environ.get("PGHOST") or os.environ.get("POSTGRES_HOST")
         port = os.environ.get("PGPORT") or os.environ.get("POSTGRES_PORT") or "5432"
@@ -28,20 +28,18 @@ def build_database_url():
 
         if host and password:
             url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-            print("[DB] تم بناء DATABASE_URL من متغيرات PG_*")
         else:
             return ""
 
-    # تحويل postgres:// إلى postgresql:// (أفضل لـ psycopg2)
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
 
-    # إضافة sslmode=require لو مش موجود (مهم جداً على Railway)
+    # استخدام prefer بدلاً من require لتجنب فشل SSL في الاتصالات الداخلية على Railway
     try:
         parsed = urlparse(url)
         query = parse_qs(parsed.query)
         if "sslmode" not in query:
-            query["sslmode"] = ["require"]
+            query["sslmode"] = ["prefer"]
         new_query = urlencode(query, doseq=True)
         url = urlunparse(parsed._replace(query=new_query))
     except Exception as e:
@@ -49,19 +47,18 @@ def build_database_url():
 
     return url
 
-DATABASE_URL = build_database_url()
-
-# ───────────────────────── اتصال آمن ─────────────────────────
+# ───────────────────────── اتصال آمن وديناميكي ─────────────────────────
 @contextmanager
 def get_db_connection():
-    """Context manager آمن للاتصال بقاعدة البيانات."""
-    if not DATABASE_URL:
+    """Context manager يقرأ الرابط ديناميكياً في كل مرّة لاتصال مضمون."""
+    db_url = build_database_url()
+    if not db_url:
         raise OperationalError("DATABASE_URL غير موجود في البيئة")
 
     conn = None
     try:
         conn = psycopg2.connect(
-            DATABASE_URL,
+            db_url,
             connect_timeout=10,
             keepalives=1,
             keepalives_idle=30,
@@ -79,32 +76,31 @@ def get_db_connection():
             conn.close()
 
 def init_db():
-    if not DATABASE_URL:
-        print("[DB] ⚠️ DATABASE_URL غير موجود. البوت رح يشتغل بدون حفظ.")
+    if not build_database_url():
+        print("[DB] ⚠️ DATABASE_URL غير موجود. البوت سيعمل بدون حفظ.")
         return
 
     for attempt in range(3):
         try:
             with get_db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS shanqla (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT,
-                        first_name TEXT,
-                        count INTEGER NOT NULL,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        updated_at TIMESTAMP DEFAULT NOW()
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS pending_actions (
-                        user_id BIGINT PRIMARY KEY,
-                        action TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    )
-                """)
-                cur.close()
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS shanqla (
+                            user_id BIGINT PRIMARY KEY,
+                            username TEXT,
+                            first_name TEXT,
+                            count INTEGER NOT NULL,
+                            created_at TIMESTAMP DEFAULT NOW(),
+                            updated_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS pending_actions (
+                            user_id BIGINT PRIMARY KEY,
+                            action TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """)
             print("[DB] ✅ تم تجهيز قاعدة البيانات بنجاح.")
             return
         except Exception as e:
@@ -115,66 +111,64 @@ def init_db():
 
 # ───────────────────────── دوال قاعدة البيانات ─────────────────────────
 def set_pending_action(user_id, action):
-    if not DATABASE_URL:
-        return
+    if not build_database_url():
+        return False
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO pending_actions (user_id, action, created_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET action = EXCLUDED.action, created_at = NOW()
-            """, (user_id, action))
-            cur.close()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pending_actions (user_id, action, created_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET action = EXCLUDED.action, created_at = NOW()
+                """, (user_id, action))
+        return True
     except Exception as e:
         print(f"[DB] ❌ set_pending_action: {e}")
+        return False
 
 def get_pending_action(user_id):
-    if not DATABASE_URL:
+    if not build_database_url():
         return None
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT action FROM pending_actions WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            cur.close()
-            return row[0] if row else None
+            with conn.cursor() as cur:
+                cur.execute("SELECT action FROM pending_actions WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
     except Exception as e:
         print(f"[DB] ❌ get_pending_action: {e}")
         return None
 
 def clear_pending_action(user_id):
-    if not DATABASE_URL:
+    if not build_database_url():
         return
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
-            cur.close()
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
     except Exception as e:
         print(f"[DB] ❌ clear_pending_action: {e}")
 
 def save_shanqla_count(user_id, count, username=None, first_name=None):
-    if not DATABASE_URL:
+    if not build_database_url():
         return False, "DATABASE_URL غير موجود. أضف المتغير من لوحة Railway."
 
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO shanqla (user_id, username, first_name, count, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET count = EXCLUDED.count,
-                    username = COALESCE(EXCLUDED.username, shanqla.username),
-                    first_name = COALESCE(EXCLUDED.first_name, shanqla.first_name),
-                    updated_at = NOW()
-            """, (user_id, username, first_name, count))
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO shanqla (user_id, username, first_name, count, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET count = EXCLUDED.count,
+                        username = COALESCE(EXCLUDED.username, shanqla.username),
+                        first_name = COALESCE(EXCLUDED.first_name, shanqla.first_name),
+                        updated_at = NOW()
+                """, (user_id, username, first_name, count))
 
-            cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
-            confirm_row = cur.fetchone()
-            cur.close()
+                cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
+                confirm_row = cur.fetchone()
 
             if confirm_row and confirm_row[0] == count:
                 print(f"[DB] ✅ تم الحفظ: user_id={user_id} count={count}")
@@ -184,30 +178,29 @@ def save_shanqla_count(user_id, count, username=None, first_name=None):
     except OperationalError as e:
         error_text = str(e)
         if "password authentication failed" in error_text:
-            return False, "كلمة مرور قاعدة البيانات غلط. امسح DATABASE_URL وأعد إضافته كـ Reference."
+            return False, "كلمة مرور قاعدة البيانات غير صحيحة."
         if "could not connect" in error_text or "Connection refused" in error_text:
-            return False, "ما قدر يتصل بقاعدة البيانات. تأكد إن خدمة Postgres Online."
+            return False, "تعذر الاتصال بقاعدة البيانات. تأكد من عمل خدمة Postgres."
         return False, f"OperationalError: {error_text}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 def check_db_connection():
-    if not DATABASE_URL:
+    if not build_database_url():
         return False, "DATABASE_URL مش موجود إطلاقاً في Variables."
 
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchone()
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_name = 'shanqla'
-                )
-            """)
-            table_exists = cur.fetchone()[0]
-            cur.close()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_name = 'shanqla'
+                    )
+                """)
+                table_exists = cur.fetchone()[0]
 
             if not table_exists:
                 return False, "الاتصال شغال، بس جدول shanqla مش موجود."
@@ -221,50 +214,47 @@ def check_db_connection():
         return False, f"{type(e).__name__}: {e}"
 
 def get_user_count(user_id):
-    if not DATABASE_URL:
+    if not build_database_url():
         return None
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-            cur.close()
-            return row[0] if row else None
+            with conn.cursor() as cur:
+                cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
     except Exception as e:
         print(f"[DB] ❌ get_user_count: {e}")
         return None
 
 def get_algeria_stats():
-    if not DATABASE_URL:
+    if not build_database_url():
         return 0, 0
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*), COALESCE(SUM(count), 0) FROM shanqla")
-            users_count, total = cur.fetchone()
-            cur.close()
-            return users_count, total
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*), COALESCE(SUM(count), 0) FROM shanqla")
+                users_count, total = cur.fetchone()
+                return users_count, total
     except Exception as e:
         print(f"[DB] ❌ get_algeria_stats: {e}")
         return 0, 0
 
 def get_all_users_ranked():
-    if not DATABASE_URL:
+    if not build_database_url():
         return []
     try:
         with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT user_id, username, first_name, count, created_at
-                FROM shanqla
-                ORDER BY count DESC, created_at ASC
-            """)
-            rows = cur.fetchall()
-            cur.close()
-            return [
-                {"user_id": r[0], "username": r[1], "first_name": r[2], "count": r[3]}
-                for r in rows
-            ]
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id, username, first_name, count, created_at
+                    FROM shanqla
+                    ORDER BY count DESC, created_at ASC
+                """)
+                rows = cur.fetchall()
+                return [
+                    {"user_id": r[0], "username": r[1], "first_name": r[2], "count": r[3]}
+                    for r in rows
+                ]
     except Exception as e:
         print(f"[DB] ❌ get_all_users_ranked: {e}")
         return []
@@ -518,7 +508,7 @@ def home():
 def health():
     ok, msg = check_db_connection()
     return jsonify({
-        "database_url_set": bool(DATABASE_URL),
+        "database_url_set": bool(build_database_url()),
         "ok": ok,
         "message": msg
     })
@@ -679,3 +669,5 @@ set_webhook()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+```
