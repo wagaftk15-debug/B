@@ -75,6 +75,7 @@ def get_or_create_shanqla(user_id, username=None, first_name=None):
             conn.commit()
             cur.close()
             conn.close()
+            print(f"[DB] مستخدم موجود مسبقاً: user_id={user_id} count={row[0]}")
             return row[0]
 
         count = generate_shanqla_count(user_id)
@@ -86,11 +87,20 @@ def get_or_create_shanqla(user_id, username=None, first_name=None):
             (user_id, username, first_name, count),
         )
         conn.commit()
+        # نتأكد فعلياً إنه انحفظ بقراءته مرة ثانية من الداتابيس (مش من الذاكرة)
+        cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
+        confirm_row = cur.fetchone()
         cur.close()
         conn.close()
+
+        if confirm_row and confirm_row[0] == count:
+            print(f"[DB] ✅ تم حفظ مستخدم جديد بنجاح: user_id={user_id} username={username} count={count}")
+        else:
+            print(f"[DB] ⚠️ تحذير: الإدخال ما تأكدش بعد الحفظ لـ user_id={user_id}")
+
         return count
     except Exception as e:
-        print(f"get_or_create_shanqla error: {e}")
+        print(f"[DB] ❌ get_or_create_shanqla error: {e}")
         return generate_shanqla_count(user_id)
 
 
@@ -103,10 +113,29 @@ def get_algeria_stats():
         users_count, total = cur.fetchone()
         cur.close()
         conn.close()
+        print(f"[DB] إحصائية: عدد المستخدمين={users_count} المجموع={total}")
         return users_count, total
     except Exception as e:
-        print(f"get_algeria_stats error: {e}")
+        print(f"[DB] ❌ get_algeria_stats error: {e}")
         return 0, 0
+
+
+def get_all_users_debug(limit=20):
+    """يرجع آخر المستخدمين المخزنين، تستخدمها للتأكد اليدوي إن البيانات محفوظة فعلاً."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, username, first_name, count, created_at FROM shanqla ORDER BY created_at DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[DB] ❌ get_all_users_debug error: {e}")
+        return []
 
 
 # ───────────────────────── دوال تيليجرام ─────────────────────────
@@ -171,6 +200,18 @@ def webhook():
                 chat_id,
                 f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص استعملوا البوت لحد الآن)",
             )
+
+        elif text in ("/تأكيد", "/debug"):
+            rows = get_all_users_debug(20)
+            if not rows:
+                send_message(chat_id, "ما في ولا سجل محفوظ لسا بقاعدة البيانات.")
+            else:
+                lines = ["📋 آخر السجلات المحفوظة فعلياً بقاعدة البيانات:\n"]
+                for r in rows:
+                    uid, uname, fname, count, created_at = r
+                    who = f"@{uname}" if uname else (fname or f"id:{uid}")
+                    lines.append(f"• {who} — {count} شنقلة — {created_at}")
+                send_message(chat_id, "\n".join(lines))
 
         else:
             send_message(
