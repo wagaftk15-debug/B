@@ -1,7 +1,10 @@
 import os
 import json
+import hmac
+import hashlib
 import requests
 import psycopg2
+from urllib.parse import parse_qsl
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -525,6 +528,32 @@ def send_suggestion_invoice(chat_id):
     )
 
 
+def create_invoice_link(amount, title, description, payload_str):
+    """
+    Like send_invoice, but instead of pushing the invoice into a chat, it returns
+    a payment link. Used by the Mini App so users can pay for a donation without
+    leaving the web view (opened client-side via Telegram.WebApp.openInvoice).
+    """
+    payload = {
+        "title": title,
+        "description": description,
+        "payload": payload_str,
+        "provider_token": "",
+        "currency": "XTR",
+        "prices": [{"label": title, "amount": amount}],
+    }
+    try:
+        r = requests.post(f"{TELEGRAM_API}/createInvoiceLink", json=payload, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]
+        print(f"create_invoice_link error: {data}")
+        return None
+    except Exception as e:
+        print(f"create_invoice_link error: {e}")
+        return None
+
+
 def answer_pre_checkout(pre_checkout_query_id, ok=True, error_message=None):
     """Must answer pre_checkout_query within 10 seconds, or the payment is auto-rejected."""
     payload = {"pre_checkout_query_id": pre_checkout_query_id, "ok": ok}
@@ -573,6 +602,31 @@ def notify_admin_new_suggestion(user_id, username, content):
         ADMIN_CHAT_ID,
         f"💡 New suggestion from {who}\n\n{content}",
     )
+
+
+# ───────────────────────── Telegram WebApp initData validation ─────────────────────────
+def validate_init_data(init_data: str, bot_token: str):
+    """
+    Verifies the HMAC signature of the initData string the Mini App sends back,
+    proving it actually came from Telegram and identifies a real user.
+    Returns the parsed key/value dict on success, or None if invalid/missing.
+    """
+    if not init_data or not bot_token:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+        received_hash = parsed.pop("hash", None)
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(computed_hash, received_hash):
+            return None
+        return parsed
+    except Exception as e:
+        print(f"validate_init_data error: {e}")
+        return None
 
 
 # ───────────────────────── web app (fullscreen mini app) ─────────────────────────
@@ -793,6 +847,39 @@ MINI_APP_PAGE = """
     padding: 46px 10px;
   }
 
+  /* --- support page: donate with Stars --- */
+  #view-support { padding-top: 14px; }
+  .donate-btn {
+    width: 100%;
+    padding: 15px 16px;
+    margin-bottom: 10px;
+    border: 1px solid var(--card-line);
+    background: var(--card);
+    color: var(--parchment);
+    border-radius: 4px;
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: 0.4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .donate-btn:active { background: var(--wine-soft); border-color: var(--gold); }
+  .donate-btn:disabled { opacity: 0.55; }
+  .support-status {
+    text-align: center;
+    color: var(--muted);
+    font-family: 'Cormorant Garamond', serif;
+    font-style: italic;
+    font-size: 15px;
+    margin-top: 6px;
+    min-height: 20px;
+  }
+
   /* ───── navigation ───── */
   .tabbar {
     flex-shrink: 0;
@@ -870,6 +957,15 @@ MINI_APP_PAGE = """
       </div>
     </main>
 
+    <main id="view-support" class="view">
+      <p class="section-label">Support the registry</p>
+      <p class="count-desc" style="margin:0 0 22px;">
+        Every star helps keep Betrothed running and growing 💛
+      </p>
+      <div id="donate-options"></div>
+      <p class="support-status" id="support-status"></p>
+    </main>
+
     <nav class="tabbar">
       <button class="tab active" data-view="home">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
@@ -883,12 +979,18 @@ MINI_APP_PAGE = """
         </svg>
         Members
       </button>
+      <button class="tab" data-view="support">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M12 21s-7-4.4-9.5-8.6C.7 8.5 3 5 6.6 5c2 0 3.6 1.2 5.4 3 1.8-1.8 3.4-3 5.4-3 3.6 0 5.9 3.5 4.1 7.4C19 16.6 12 21 12 21z"/>
+        </svg>
+        Support
+      </button>
     </nav>
   </div>
 
   <script>
-    if (window.Telegram && window.Telegram.WebApp) {
-      const tg = window.Telegram.WebApp;
+    const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+    if (tg) {
       tg.ready();
       tg.expand();
       if (tg.setHeaderColor) { try { tg.setHeaderColor('#100a0e'); } catch (e) {} }
@@ -896,13 +998,20 @@ MINI_APP_PAGE = """
       if (tg.disableVerticalSwipes) { try { tg.disableVerticalSwipes(); } catch (e) {} }
     }
 
+    const DONATION_AMOUNTS = [100, 200, 500, 1000];
+
     const tabs = document.querySelectorAll('.tab');
-    const views = { home: document.getElementById('view-home'), community: document.getElementById('view-community') };
+    const views = {
+      home: document.getElementById('view-home'),
+      community: document.getElementById('view-community'),
+      support: document.getElementById('view-support'),
+    };
 
     function showView(name) {
       Object.entries(views).forEach(([key, el]) => el.classList.toggle('active', key === name));
       tabs.forEach(t => t.classList.toggle('active', t.dataset.view === name));
       if (name === 'community') loadCommunity();
+      if (name === 'support') renderDonateOptions();
     }
     tabs.forEach(t => t.addEventListener('click', () => showView(t.dataset.view)));
 
@@ -947,11 +1056,71 @@ MINI_APP_PAGE = """
       } catch (e) { console.error('Could not load the members list', e); }
     }
 
+    function renderDonateOptions() {
+      const wrap = document.getElementById('donate-options');
+      if (wrap.dataset.rendered === '1') return;
+      wrap.dataset.rendered = '1';
+      wrap.innerHTML = DONATION_AMOUNTS.map(a =>
+        `<button class="donate-btn" data-amount="${a}">⭐ Support with ${a} Stars</button>`
+      ).join('');
+      wrap.querySelectorAll('.donate-btn').forEach(btn => {
+        btn.addEventListener('click', () => startDonation(parseInt(btn.dataset.amount, 10), btn));
+      });
+    }
+
+    function setStatus(text) {
+      document.getElementById('support-status').textContent = text || '';
+    }
+
+    async function startDonation(amount, btn) {
+      if (!tg || !tg.initData) {
+        setStatus('Please open this from inside Telegram.');
+        return;
+      }
+      const buttons = document.querySelectorAll('.donate-btn');
+      buttons.forEach(b => b.disabled = true);
+      setStatus('Preparing your invoice…');
+
+      try {
+        const res = await fetch('/api/create-invoice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount, init_data: tg.initData })
+        });
+        const data = await res.json();
+
+        if (!data.ok || !data.link) {
+          setStatus('Could not start the payment, please try again.');
+          buttons.forEach(b => b.disabled = false);
+          return;
+        }
+
+        setStatus('');
+        tg.openInvoice(data.link, (status) => {
+          buttons.forEach(b => b.disabled = false);
+          if (status === 'paid') {
+            setStatus('Thank you for your support 💛');
+            if (tg.HapticFeedback) { try { tg.HapticFeedback.notificationOccurred('success'); } catch (e) {} }
+            loadCommunity();
+          } else if (status === 'cancelled') {
+            setStatus('');
+          } else {
+            setStatus('Payment was not completed.');
+          }
+        });
+      } catch (e) {
+        console.error('startDonation error', e);
+        setStatus('Something went wrong, please try again.');
+        buttons.forEach(b => b.disabled = false);
+      }
+    }
+
     refreshCount();
     setInterval(refreshCount, 5000);
 
     const params = new URLSearchParams(window.location.search);
     if (params.get('tab') === 'community') showView('community');
+    if (params.get('tab') === 'support') showView('support');
   </script>
 </body>
 </html>
@@ -991,6 +1160,54 @@ def api_users():
         for u in users
     ]
     return jsonify({"users": result})
+
+
+@app.route("/api/create-invoice", methods=["POST"])
+def api_create_invoice():
+    """
+    Called from the Support tab inside the Mini App. Validates the Telegram
+    WebApp initData (so we know the request really came from that Telegram user),
+    then returns a Stars invoice link the client opens with Telegram.WebApp.openInvoice.
+    The actual payment confirmation still arrives at /webhook/<token> as a normal
+    successful_payment update, so donations are recorded exactly like bot-side ones.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    init_data = body.get("init_data", "")
+    amount = body.get("amount")
+
+    parsed = validate_init_data(init_data, BOT_TOKEN)
+    if not parsed:
+        return jsonify({"ok": False, "error": "invalid_init_data"}), 401
+
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_amount"}), 400
+
+    if amount not in DONATION_AMOUNTS:
+        return jsonify({"ok": False, "error": "invalid_amount"}), 400
+
+    try:
+        user_info = json.loads(parsed.get("user", "{}"))
+        user_id = user_info.get("id")
+    except Exception:
+        user_id = None
+
+    if not user_id:
+        return jsonify({"ok": False, "error": "no_user"}), 400
+
+    upsert_user(user_id, username=user_info.get("username"), first_name=user_info.get("first_name"))
+
+    link = create_invoice_link(
+        amount,
+        "Support Betrothed 💍",
+        f"Your support of {amount} Telegram Stars helps us keep the bot running and growing 🙏",
+        f"donate_{amount}_{user_id}",
+    )
+    if not link:
+        return jsonify({"ok": False, "error": "invoice_failed"}), 500
+
+    return jsonify({"ok": True, "link": link})
 
 
 # ───────────────────────── webhook (receives bot updates) ─────────────────────────
