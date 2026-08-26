@@ -1,276 +1,467 @@
-
 import os
 import json
-import time
 import requests
 import psycopg2
-from psycopg2 import OperationalError
-from contextlib import contextmanager
 from flask import Flask, request, jsonify, render_template_string
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+# Bot token is read from an environment variable called BOT_TOKEN
+# (add it under Railway -> Variables)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ───────────────────────── تجهيز DATABASE_URL ─────────────────────────
-def build_database_url():
-    """يبني DATABASE_URL من البيئة، ويعدل خيارات الاتصال لـ Railway."""
-    url = os.environ.get("DATABASE_URL", "").strip()
+# Database connection string (add it under Railway -> Variables as DATABASE_URL)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-    if not url:
-        host = os.environ.get("PGHOST") or os.environ.get("POSTGRES_HOST")
-        port = os.environ.get("PGPORT") or os.environ.get("POSTGRES_PORT") or "5432"
-        user = os.environ.get("PGUSER") or os.environ.get("POSTGRES_USER") or "postgres"
-        password = os.environ.get("PGPASSWORD") or os.environ.get("POSTGRES_PASSWORD")
-        dbname = os.environ.get("PGDATABASE") or os.environ.get("POSTGRES_DB") or "railway"
+# Admin chat id (optional) so they get pinged on every new suggestion
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
-        if host and password:
-            url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-        else:
-            return ""
+# Available support amounts, in Telegram Stars
+DONATION_AMOUNTS = [100, 200, 500, 1000]
 
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
+# Price of submitting a new idea / feature suggestion, in Telegram Stars
+SUGGESTION_PRICE = 100
 
-    # استخدام prefer بدلاً من require لتجنب فشل SSL في الاتصالات الداخلية على Railway
-    try:
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-        if "sslmode" not in query:
-            query["sslmode"] = ["prefer"]
-        new_query = urlencode(query, doseq=True)
-        url = urlunparse(parsed._replace(query=new_query))
-    except Exception as e:
-        print(f"[DB] تحذير أثناء تعديل DATABASE_URL: {e}")
+# Daily bonus points awarded per claim
+DAILY_POINTS = 100
 
-    return url
 
-# ───────────────────────── اتصال آمن وديناميكي ─────────────────────────
-@contextmanager
-def get_db_connection():
-    """Context manager يقرأ الرابط ديناميكياً في كل مرّة لاتصال مضمون."""
-    db_url = build_database_url()
-    if not db_url:
-        raise OperationalError("DATABASE_URL غير موجود في البيئة")
+# ───────────────────────── data layer (PostgreSQL) ─────────────────────────
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
 
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            db_url,
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5,
-        )
-        yield conn
-        conn.commit()
-    except Exception:
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
-            conn.close()
 
 def init_db():
-    if not build_database_url():
-        print("[DB] ⚠️ DATABASE_URL غير موجود. البوت سيعمل بدون حفظ.")
+    """Creates the required tables if they don't exist yet. Runs once on startup."""
+    if not DATABASE_URL:
+        print("DATABASE_URL is not set, skipping database connection.")
         return
-
-    for attempt in range(3):
-        try:
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS shanqla (
-                            user_id BIGINT PRIMARY KEY,
-                            username TEXT,
-                            first_name TEXT,
-                            count INTEGER NOT NULL,
-                            created_at TIMESTAMP DEFAULT NOW(),
-                            updated_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS pending_actions (
-                            user_id BIGINT PRIMARY KEY,
-                            action TEXT NOT NULL,
-                            created_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """)
-            print("[DB] ✅ تم تجهيز قاعدة البيانات بنجاح.")
-            return
-        except Exception as e:
-            print(f"[DB] ❌ محاولة {attempt+1}/3 فشلت: {e}")
-            time.sleep(2)
-
-    print("[DB] ❌ فشل تجهيز قاعدة البيانات بعد 3 محاولات.")
-
-# ───────────────────────── دوال قاعدة البيانات ─────────────────────────
-def set_pending_action(user_id, action):
-    if not build_database_url():
-        return False
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO pending_actions (user_id, action, created_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET action = EXCLUDED.action, created_at = NOW()
-                """, (user_id, action))
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # General table for every user who has ever interacted with the bot
+        # (stores their last known name/username)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS registrations (
+                user_id BIGINT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS donations (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount INTEGER NOT NULL,
+                telegram_payment_charge_id TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        # Paid idea / feature suggestions
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                content TEXT,
+                telegram_payment_charge_id TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        # Pending state: tracks what the bot is waiting for next from each user
+        # (e.g. the suggestion text, right after payment)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                user_id BIGINT PRIMARY KEY,
+                action TEXT NOT NULL,
+                charge_id TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+        # User points (daily bonus claimed via a dedicated button)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_points (
+                user_id BIGINT PRIMARY KEY,
+                total_points INTEGER NOT NULL DEFAULT 0,
+                last_claim_date DATE
+            )
+            """
+        )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("Database is ready.")
+    except Exception as e:
+        print(f"Failed to set up the database: {e}")
+
+
+def upsert_user(user_id, username=None, first_name=None):
+    """Saves/updates the last known name for anyone who has interacted with the bot."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                updated_at = NOW()
+            """,
+            (user_id, username, first_name),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"upsert_user error: {e}")
+
+
+def get_count():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM registrations")
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"get_count error: {e}")
+        return 0
+
+
+def is_registered(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM registrations WHERE user_id = %s", (user_id,))
+        exists = cur.fetchone() is not None
+        cur.close()
+        conn.close()
+        return exists
+    except Exception as e:
+        print(f"is_registered error: {e}")
+        return False
+
+
+def register_user(user_id):
+    """Registers the user, returns True if it succeeded, False if already registered."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO registrations (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (user_id,),
+        )
+        added = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return added
+    except Exception as e:
+        print(f"register_user error: {e}")
+        return False
+
+
+def record_donation(user_id, amount, charge_id):
+    """Records a successful support payment in the donations table."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO donations (user_id, amount, telegram_payment_charge_id)
+            VALUES (%s, %s, %s)
+            """,
+            (user_id, amount, charge_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
         return True
     except Exception as e:
-        print(f"[DB] ❌ set_pending_action: {e}")
+        print(f"record_donation error: {e}")
         return False
 
-def get_pending_action(user_id):
-    if not build_database_url():
-        return None
+
+def get_donations_stats():
+    """Returns (number of donations, total stars) from the donations table."""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT action FROM pending_actions WHERE user_id = %s", (user_id,))
-                row = cur.fetchone()
-                return row[0] if row else None
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM donations")
+        count, total = cur.fetchone()
+        cur.close()
+        conn.close()
+        return count, total
     except Exception as e:
-        print(f"[DB] ❌ get_pending_action: {e}")
-        return None
-
-def clear_pending_action(user_id):
-    if not build_database_url():
-        return
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
-    except Exception as e:
-        print(f"[DB] ❌ clear_pending_action: {e}")
-
-def save_shanqla_count(user_id, count, username=None, first_name=None):
-    if not build_database_url():
-        return False, "DATABASE_URL غير موجود. أضف المتغير من لوحة Railway."
-
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO shanqla (user_id, username, first_name, count, updated_at)
-                    VALUES (%s, %s, %s, %s, NOW())
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET count = EXCLUDED.count,
-                        username = COALESCE(EXCLUDED.username, shanqla.username),
-                        first_name = COALESCE(EXCLUDED.first_name, shanqla.first_name),
-                        updated_at = NOW()
-                """, (user_id, username, first_name, count))
-
-                cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
-                confirm_row = cur.fetchone()
-
-            if confirm_row and confirm_row[0] == count:
-                print(f"[DB] ✅ تم الحفظ: user_id={user_id} count={count}")
-                return True, None
-
-            return False, "الحفظ تم لكن التأكيد فشل"
-    except OperationalError as e:
-        error_text = str(e)
-        if "password authentication failed" in error_text:
-            return False, "كلمة مرور قاعدة البيانات غير صحيحة."
-        if "could not connect" in error_text or "Connection refused" in error_text:
-            return False, "تعذر الاتصال بقاعدة البيانات. تأكد من عمل خدمة Postgres."
-        return False, f"OperationalError: {error_text}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def check_db_connection():
-    if not build_database_url():
-        return False, "DATABASE_URL مش موجود إطلاقاً في Variables."
-
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_name = 'shanqla'
-                    )
-                """)
-                table_exists = cur.fetchone()[0]
-
-            if not table_exists:
-                return False, "الاتصال شغال، بس جدول shanqla مش موجود."
-            return True, "الاتصال بقاعدة البيانات شغال وجدول shanqla موجود ✅"
-    except OperationalError as e:
-        error_text = str(e)
-        if "password authentication failed" in error_text:
-            return False, "كلمة مرور قاعدة البيانات غلط (password authentication failed)."
-        return False, f"OperationalError: {error_text}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def get_user_count(user_id):
-    if not build_database_url():
-        return None
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count FROM shanqla WHERE user_id = %s", (user_id,))
-                row = cur.fetchone()
-                return row[0] if row else None
-    except Exception as e:
-        print(f"[DB] ❌ get_user_count: {e}")
-        return None
-
-def get_algeria_stats():
-    if not build_database_url():
-        return 0, 0
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*), COALESCE(SUM(count), 0) FROM shanqla")
-                users_count, total = cur.fetchone()
-                return users_count, total
-    except Exception as e:
-        print(f"[DB] ❌ get_algeria_stats: {e}")
+        print(f"get_donations_stats error: {e}")
         return 0, 0
 
-def get_all_users_ranked():
-    if not build_database_url():
-        return []
+
+def get_registered_users_with_donations():
+    """
+    Returns the list of registered members with each one's display name
+    (from the users table) and total stars donated, ordered by registration date.
+    """
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT user_id, username, first_name, count, created_at
-                    FROM shanqla
-                    ORDER BY count DESC, created_at ASC
-                """)
-                rows = cur.fetchall()
-                return [
-                    {"user_id": r[0], "username": r[1], "first_name": r[2], "count": r[3]}
-                    for r in rows
-                ]
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                r.user_id,
+                COALESCE(NULLIF(u.username, ''), NULLIF(u.first_name, ''), 'Member') AS display_name,
+                COALESCE(SUM(d.amount), 0) AS total_donated,
+                r.created_at
+            FROM registrations r
+            LEFT JOIN users u ON u.user_id = r.user_id
+            LEFT JOIN donations d ON d.user_id = r.user_id
+            GROUP BY r.user_id, u.username, u.first_name, r.created_at
+            ORDER BY r.created_at ASC
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            {"user_id": row[0], "name": row[1], "donated": int(row[2])}
+            for row in rows
+        ]
     except Exception as e:
-        print(f"[DB] ❌ get_all_users_ranked: {e}")
+        print(f"get_registered_users_with_donations error: {e}")
         return []
 
-def mask_name(username, first_name):
-    name = username or first_name or "مستخدم"
+
+def mask_name(name):
+    """
+    Blanks out every character of a name except the first one.
+    Example: "Amanda" -> "A*****"
+    """
+    if not name:
+        return "*"
     name = str(name).strip()
     if len(name) <= 1:
         return name
     return name[0] + "*" * (len(name) - 1)
 
-# ───────────────────────── دوال تيليجرام ─────────────────────────
+
+# ───────────────────────── idea suggestions ─────────────────────────
+def set_pending_action(user_id, action, charge_id=None):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO pending_actions (user_id, action, charge_id, created_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET action = EXCLUDED.action,
+                charge_id = EXCLUDED.charge_id,
+                created_at = NOW()
+            """,
+            (user_id, action, charge_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"set_pending_action error: {e}")
+
+
+def get_pending_action(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT action, charge_id FROM pending_actions WHERE user_id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return {"action": row[0], "charge_id": row[1]}
+        return None
+    except Exception as e:
+        print(f"get_pending_action error: {e}")
+        return None
+
+
+def clear_pending_action(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"clear_pending_action error: {e}")
+
+
+def record_suggestion(user_id, content, charge_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO suggestions (user_id, content, telegram_payment_charge_id)
+            VALUES (%s, %s, %s)
+            """,
+            (user_id, content, charge_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"record_suggestion error: {e}")
+        return False
+
+
+def get_suggestions_count():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM suggestions")
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"get_suggestions_count error: {e}")
+        return 0
+
+
+# ───────────────────────── unsubscribing (opting out) ─────────────────────────
+def unregister_user(user_id):
+    """Deletes the user from the registrations table. Returns True if they were removed."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM registrations WHERE user_id = %s", (user_id,))
+        removed = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return removed
+    except Exception as e:
+        print(f"unregister_user error: {e}")
+        return False
+
+
+# ───────────────────────── daily points system ─────────────────────────
+def claim_daily_points(user_id):
+    """
+    Tries to grant the user DAILY_POINTS for today.
+    Returns (True, new_total) if this is the first claim today.
+    Returns (False, current_total) if they already claimed today.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_points (user_id, total_points, last_claim_date)
+            VALUES (%s, %s, CURRENT_DATE)
+            ON CONFLICT (user_id) DO UPDATE
+            SET total_points = user_points.total_points + %s,
+                last_claim_date = CURRENT_DATE
+            WHERE user_points.last_claim_date IS DISTINCT FROM CURRENT_DATE
+            RETURNING total_points
+            """,
+            (user_id, DAILY_POINTS, DAILY_POINTS),
+        )
+        row = cur.fetchone()
+        if row:
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True, row[0]
+
+        # Nothing was updated, meaning they already claimed today - fetch their current total
+        cur.execute("SELECT total_points FROM user_points WHERE user_id = %s", (user_id,))
+        existing = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return False, (existing[0] if existing else 0)
+    except Exception as e:
+        print(f"claim_daily_points error: {e}")
+        return False, 0
+
+
+def get_user_points(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT total_points FROM user_points WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else 0
+    except Exception as e:
+        print(f"get_user_points error: {e}")
+        return 0
+
+
+def get_leaderboard(limit=10):
+    """Returns the top point earners (name + total points)."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                p.user_id,
+                COALESCE(NULLIF(u.username, ''), NULLIF(u.first_name, ''), 'Member') AS display_name,
+                p.total_points
+            FROM user_points p
+            LEFT JOIN users u ON u.user_id = p.user_id
+            WHERE p.total_points > 0
+            ORDER BY p.total_points DESC, p.user_id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"user_id": r[0], "name": r[1], "points": r[2]} for r in rows]
+    except Exception as e:
+        print(f"get_leaderboard error: {e}")
+        return []
+
+
+# ───────────────────────── Telegram helpers ─────────────────────────
 def send_message(chat_id, text, reply_markup=None):
-    if not TELEGRAM_API:
-        print("BOT_TOKEN غير موجود، ما بقدر أبعت رسالة")
-        return
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
@@ -279,9 +470,8 @@ def send_message(chat_id, text, reply_markup=None):
     except Exception as e:
         print(f"send_message error: {e}")
 
-def answer_callback(callback_id, text="", show_alert=False):
-    if not TELEGRAM_API:
-        return
+
+def answer_callback(callback_id, text, show_alert=False):
     try:
         requests.post(
             f"{TELEGRAM_API}/answerCallbackQuery",
@@ -291,382 +481,762 @@ def answer_callback(callback_id, text="", show_alert=False):
     except Exception as e:
         print(f"answer_callback error: {e}")
 
-def main_keyboard(site_url):
+
+def send_invoice(chat_id, amount, title, description, payload_str):
+    """
+    Sends a Telegram Stars (XTR) invoice. provider_token must be empty for Stars.
+    payload_str is stored inside the invoice and comes back to us after a
+    successful payment, so we can tell which kind of purchase it was
+    (a plain donation, or a paid suggestion).
+    """
+    payload = {
+        "chat_id": chat_id,
+        "title": title,
+        "description": description,
+        "payload": payload_str,
+        "provider_token": "",  # must be empty when using the XTR (Stars) currency
+        "currency": "XTR",
+        "prices": [{"label": title, "amount": amount}],
+    }
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendInvoice", json=payload, timeout=10)
+        print(f"send_invoice({payload_str}) -> {r.json()}")
+    except Exception as e:
+        print(f"send_invoice error: {e}")
+
+
+def send_donation_invoice(chat_id, amount):
+    send_invoice(
+        chat_id,
+        amount,
+        "Support Betrothed 💍",
+        f"Your support of {amount} Telegram Stars helps us keep the bot running and growing 🙏",
+        f"donate_{amount}_{chat_id}",
+    )
+
+
+def send_suggestion_invoice(chat_id):
+    send_invoice(
+        chat_id,
+        SUGGESTION_PRICE,
+        "Suggest a new idea 💡",
+        f"Pay {SUGGESTION_PRICE} Stars to send us your idea or suggestion for the bot, our team reviews every one",
+        f"suggest_{SUGGESTION_PRICE}_{chat_id}",
+    )
+
+
+def answer_pre_checkout(pre_checkout_query_id, ok=True, error_message=None):
+    """Must answer pre_checkout_query within 10 seconds, or the payment is auto-rejected."""
+    payload = {"pre_checkout_query_id": pre_checkout_query_id, "ok": ok}
+    if error_message:
+        payload["error_message"] = error_message
+    try:
+        requests.post(f"{TELEGRAM_API}/answerPreCheckoutQuery", json=payload, timeout=10)
+    except Exception as e:
+        print(f"answer_pre_checkout error: {e}")
+
+
+def donation_keyboard():
     keyboard = [
-        [{"text": "✍️ سجّل شنقلتي", "callback_data": "enter_shanqla"}],
-        [{"text": "🇩🇿 شحال عند الشعب الجزائري؟", "callback_data": "algeria_shanqla"}],
+        [{"text": f"⭐ Support with {amount} Stars", "callback_data": f"donate_{amount}"}]
+        for amount in DONATION_AMOUNTS
     ]
-    if site_url:
-        keyboard.append([{"text": "🌐 افتح الموقع", "web_app": {"url": site_url}}])
     return {"inline_keyboard": keyboard}
 
-# ───────────────────────── واجهة الويب ─────────────────────────
+
+def unsubscribe_confirm_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Yes, unsubscribe me", "callback_data": "confirm_unsubscribe"}],
+            [{"text": "🙅 No, cancel that", "callback_data": "cancel_unsubscribe"}],
+        ]
+    }
+
+
+def build_leaderboard_text():
+    top = get_leaderboard(10)
+    if not top:
+        return "Nobody has earned points yet 🙂 Be the first to claim yours today!"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 Points leaderboard:\n"]
+    for i, u in enumerate(top):
+        rank_icon = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{rank_icon} {mask_name(u['name'])} — {u['points']} pts")
+    return "\n".join(lines)
+
+
+def notify_admin_new_suggestion(user_id, username, content):
+    if not ADMIN_CHAT_ID:
+        return
+    who = f"@{username}" if username else f"id:{user_id}"
+    send_message(
+        ADMIN_CHAT_ID,
+        f"💡 New suggestion from {who}\n\n{content}",
+    )
+
+
+# ───────────────────────── web app (fullscreen mini app) ─────────────────────────
+# Design: a keepsake wedding ledger. Deep wine-and-ink page, aged-gold rules and
+# a wax-seal medallion around the headline number, styled like an engraved
+# invitation rather than a stats dashboard.
 MINI_APP_PAGE = """
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
-<title>شنقلة فدار 🇩🇿</title>
+<title>Betrothed</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@400;500;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,600&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg-1: #1c2f2a;
-    --bg-2: #0c1512;
-    --card: rgba(247, 237, 224, 0.05);
-    --card-line: rgba(247, 237, 224, 0.10);
-    --cream: #f2f0e6;
-    --muted: #9db3ab;
-    --green: #59b389;
+    --ink: #1b1017;
+    --ink-2: #100a0e;
+    --wine: #5c2138;
+    --wine-soft: rgba(201, 161, 90, 0.10);
+    --card: rgba(243, 233, 216, 0.045);
+    --card-line: rgba(201, 161, 90, 0.22);
+    --parchment: #f3e9d8;
+    --muted: #9c8a91;
+    --gold: #c9a15a;
+    --gold-bright: #e3c07f;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; margin: 0; overscroll-behavior: none; }
   body {
-    background: radial-gradient(130% 95% at 50% -5%, var(--bg-1) 0%, var(--bg-2) 65%);
-    font-family: 'Tajawal', 'Segoe UI', Tahoma, Arial, sans-serif;
-    color: var(--cream);
+    background:
+      radial-gradient(120% 70% at 50% -8%, rgba(92, 33, 56, 0.55) 0%, transparent 55%),
+      var(--ink);
+    background-color: var(--ink);
+    font-family: 'Work Sans', 'Segoe UI', Tahoma, Arial, sans-serif;
+    color: var(--parchment);
   }
+
   .app {
-    height: 100dvh; width: 100%; max-width: 480px; margin: 0 auto;
-    display: flex; flex-direction: column; overflow: hidden;
-    padding-top: env(safe-area-inset-top, 0px); position: relative;
+    height: 100dvh;
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-top: env(safe-area-inset-top, 0px);
+    position: relative;
+    border-inline: 1px solid rgba(201, 161, 90, 0.14);
   }
-  .glow {
-    position: absolute; top: -120px; right: -80px; width: 320px; height: 320px;
-    background: radial-gradient(circle, rgba(89,179,137,0.18), transparent 70%);
-    pointer-events: none; z-index: 0;
+
+  /* ───── letterhead ───── */
+  .letterhead {
+    text-align: center;
+    padding: 20px 16px 10px;
+    flex-shrink: 0;
+    position: relative;
+    z-index: 1;
   }
-  .topbar {
-    display: flex; align-items: center; justify-content: center; gap: 9px;
-    padding: 16px 16px 6px; flex-shrink: 0; position: relative; z-index: 1;
+  .letterhead .eyebrow {
+    font-size: 10.5px;
+    letter-spacing: 3.5px;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin: 0 0 4px;
   }
-  .topbar svg { width: 21px; height: 21px; color: var(--green); flex-shrink: 0; }
-  .topbar span { font-family: 'Amiri', serif; font-size: 19px; font-weight: 700; }
-  .view { display: none; flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
-    padding: 8px 22px 28px; position: relative; z-index: 1; animation: fadeIn 0.35s ease; }
+  .letterhead .brand {
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 600;
+    font-size: 26px;
+    letter-spacing: 0.5px;
+    margin: 0;
+  }
+  .letterhead .brand em { font-style: italic; color: var(--gold-bright); }
+  .rule {
+    width: 92px;
+    height: 1px;
+    margin: 12px auto 0;
+    background: linear-gradient(90deg, transparent, var(--gold), transparent);
+  }
+
+  /* ───── pages ───── */
+  .view {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 6px 24px 28px;
+    position: relative;
+    z-index: 1;
+    animation: settle 0.4s ease;
+  }
   .view.active { display: flex; flex-direction: column; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes settle { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* --- home page: the seal --- */
   #view-home { align-items: center; justify-content: center; text-align: center; }
-  .flourish { width: 128px; height: 14px; opacity: 0.6; margin: 0 auto 24px; display: block; }
-  .hero-label { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
-  .count {
-    font-family: 'Amiri', serif; font-size: clamp(56px, 18vw, 84px); line-height: 1;
-    font-weight: 700; color: var(--green); margin: 0; transition: transform 0.25s ease;
+  .seal {
+    position: relative;
+    width: 176px;
+    height: 176px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 18px;
   }
-  .count-desc { color: var(--muted); font-size: 14px; line-height: 1.7; margin: 16px 0 0; max-width: 270px; }
-  .cta-btn {
-    margin-top: 22px; background: var(--green); color: #0c1512; border: none;
-    font-family: inherit; font-weight: 900; font-size: 14.5px; padding: 13px 26px;
-    border-radius: 14px; cursor: pointer;
+  .seal svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .seal .count {
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 700;
+    font-size: clamp(46px, 15vw, 58px);
+    line-height: 1;
+    color: var(--parchment);
+    position: relative;
+    transition: transform 0.25s ease;
   }
-  #view-users { padding-top: 16px; }
-  .users-summary {
-    display: flex; justify-content: space-around; background: var(--card);
-    border: 1px solid var(--card-line); border-radius: 18px; padding: 18px 10px;
-    margin-bottom: 18px; flex-shrink: 0;
+  .eyebrow-label {
+    color: var(--gold);
+    font-size: 11px;
+    letter-spacing: 2.6px;
+    text-transform: uppercase;
+    margin: 4px 0 0;
   }
-  .stat { text-align: center; }
-  .stat b { display: block; font-family: 'Amiri', serif; font-size: 25px; color: var(--green); }
-  .stat span { font-size: 11px; color: var(--muted); }
-  .section-label { font-size: 13px; color: var(--muted); margin: 4px 2px 10px; }
-  .list { background: var(--card); border: 1px solid var(--card-line); border-radius: 18px; overflow: hidden; }
-  .row { display: flex; justify-content: space-between; align-items: center; padding: 14px 17px; border-bottom: 1px solid var(--card-line); }
-  .row:last-child { border-bottom: none; }
-  .row .rank { color: var(--muted); font-size: 12px; width: 22px; flex-shrink: 0; }
-  .row .name { font-size: 14.5px; flex: 1; }
-  .row .amount { font-size: 13.5px; font-weight: 700; color: var(--green); white-space: nowrap; }
-  .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 44px 10px; }
+  .count-desc {
+    color: var(--muted);
+    font-family: 'Cormorant Garamond', serif;
+    font-style: italic;
+    font-size: 17px;
+    line-height: 1.6;
+    margin: 18px 0 0;
+    max-width: 280px;
+  }
+
+  /* --- community page: the guest ledger --- */
+  #view-community { padding-top: 14px; }
+  .ledger-summary {
+    display: flex;
+    border: 1px solid var(--card-line);
+    border-radius: 4px;
+    background: var(--card);
+    margin-bottom: 20px;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .ledger-summary .stat {
+    flex: 1;
+    text-align: center;
+    padding: 16px 8px;
+  }
+  .ledger-summary .stat + .stat { border-left: 1px solid var(--card-line); }
+  .ledger-summary .stat b {
+    display: block;
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 700;
+    font-size: 25px;
+    color: var(--gold-bright);
+  }
+  .ledger-summary .stat span {
+    font-size: 10.5px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .section-label {
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin: 2px 2px 10px;
+  }
+  .ledger {
+    border-top: 1px solid var(--card-line);
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 2px;
+    border-bottom: 1px dashed var(--card-line);
+  }
+  .row .initial {
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 1px solid var(--gold);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--gold-bright);
+  }
+  .row .name {
+    flex: 1;
+    font-size: 14px;
+    letter-spacing: 0.3px;
+  }
+  .row .donated {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--gold-bright);
+    white-space: nowrap;
+  }
+  .row .donated.zero { color: var(--muted); font-weight: 400; }
+  .empty {
+    text-align: center;
+    color: var(--muted);
+    font-family: 'Cormorant Garamond', serif;
+    font-style: italic;
+    font-size: 16px;
+    padding: 46px 10px;
+  }
+
+  /* ───── navigation ───── */
   .tabbar {
-    flex-shrink: 0; display: flex; gap: 10px; border-top: 1px solid var(--card-line);
-    background: rgba(12, 21, 18, 0.88); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); position: relative; z-index: 1;
+    flex-shrink: 0;
+    display: flex;
+    border-top: 1px solid var(--card-line);
+    background: rgba(16, 10, 14, 0.9);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    padding: 4px 16px calc(4px + env(safe-area-inset-bottom, 0px));
+    position: relative;
+    z-index: 1;
   }
   .tab {
-    flex: 1; display: flex; align-items: center; justify-content: center; gap: 7px;
-    background: none; border: 1px solid transparent; color: var(--muted); font-family: inherit;
-    font-size: 13px; font-weight: 700; padding: 12px 8px; border-radius: 14px; cursor: pointer;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 11px;
+    letter-spacing: 0.6px;
+    padding: 12px 8px 10px;
+    cursor: pointer;
+    position: relative;
+    transition: color 0.15s ease;
   }
-  .tab svg { width: 19px; height: 19px; flex-shrink: 0; }
-  .tab.active { color: var(--green); background: rgba(89, 179, 137, 0.10); border-color: rgba(89, 179, 137, 0.25); }
+  .tab svg { width: 18px; height: 18px; }
+  .tab.active { color: var(--gold-bright); }
+  .tab.active::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 22px;
+    height: 2px;
+    background: var(--gold);
+  }
 </style>
 </head>
 <body>
   <div class="app">
-    <div class="glow"></div>
-    <div class="topbar">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-        <path d="M12 3v18M5 12h14"/>
-      </svg>
-      <span>شنقلة فدار 🇩🇿</span>
-    </div>
+
+    <header class="letterhead">
+      <p class="eyebrow">A registry of intentions</p>
+      <h1 class="brand">Betroth<em>ed</em></h1>
+      <div class="rule"></div>
+    </header>
+
     <main id="view-home" class="view active">
-      <svg class="flourish" viewBox="0 0 128 14" fill="none" stroke="#59b389" stroke-width="1">
-        <line x1="0" y1="7" x2="48" y2="7"/><circle cx="64" cy="7" r="4"/><line x1="80" y1="7" x2="128" y2="7"/>
-      </svg>
-      <div class="hero-label">مجموع شنقلة فدار عند الشعب الجزائري</div>
-      <div class="count" id="count">{{ total }}</div>
-      <div class="count-desc">كل رقم هون مدخّل يدوياً من صاحبه، سجّل رقمك أنت كمان عبر البوت 👇</div>
-      <button class="cta-btn" onclick="sendToBot()">سجّل رقمك بالبوت</button>
-    </main>
-    <main id="view-users" class="view">
-      <div class="users-summary">
-        <div class="stat"><b id="u-count">0</b><span>شخص سجّل رقمه</span></div>
-        <div class="stat"><b id="u-total">0</b><span>المجموع الكلي</span></div>
+      <div class="seal">
+        <svg viewBox="0 0 176 176" fill="none">
+          <circle cx="88" cy="88" r="86" stroke="#c9a15a" stroke-width="1" opacity="0.35"/>
+          <circle cx="88" cy="88" r="74" stroke="#c9a15a" stroke-width="1" stroke-dasharray="2 5" opacity="0.6"/>
+          <circle cx="70" cy="88" r="20" stroke="#e3c07f" stroke-width="1.4" opacity="0.85"/>
+          <circle cx="106" cy="88" r="20" stroke="#e3c07f" stroke-width="1.4" opacity="0.85"/>
+        </svg>
+        <div class="count" id="count">{{ count }}</div>
       </div>
-      <div class="section-label">الترتيب</div>
-      <div class="list" id="users-list">
-        <div class="empty">جاري التحميل...</div>
+      <p class="eyebrow-label">Have declared themselves ready</p>
+      <p class="count-desc">The registry lengthens by the day. Add your name, and let luck take its course.</p>
+    </main>
+
+    <main id="view-community" class="view">
+      <div class="ledger-summary">
+        <div class="stat"><b id="d-count">0</b><span>Gifts given</span></div>
+        <div class="stat"><b id="d-total">0</b><span>Stars total</span></div>
+      </div>
+      <div class="section-label">Registered members</div>
+      <div class="ledger" id="users-list">
+        <div class="empty">Loading the ledger…</div>
       </div>
     </main>
+
     <nav class="tabbar">
       <button class="tab active" data-view="home">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <path d="M4 11.5 12 5l8 6.5"/><path d="M6 10.5V19h12v-8.5"/>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <circle cx="9" cy="12" r="4.6"/><circle cx="15" cy="12" r="4.6"/>
         </svg>
-        الرئيسية
+        Registry
       </button>
-      <button class="tab" data-view="users">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-          <circle cx="12" cy="8" r="3.4"/><path d="M5 20c0-3.6 3-6.2 7-6.2s7 2.6 7 6.2"/>
+      <button class="tab" data-view="community">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M4 19c0-3.6 3-6 8-6s8 2.4 8 6"/><circle cx="12" cy="7.5" r="3.4"/>
         </svg>
-        المستخدمون
+        Members
       </button>
     </nav>
   </div>
+
   <script>
     if (window.Telegram && window.Telegram.WebApp) {
       const tg = window.Telegram.WebApp;
       tg.ready();
       tg.expand();
-      if (tg.setHeaderColor) { try { tg.setHeaderColor('#0c1512'); } catch (e) {} }
-      if (tg.setBackgroundColor) { try { tg.setBackgroundColor('#0c1512'); } catch (e) {} }
+      if (tg.setHeaderColor) { try { tg.setHeaderColor('#100a0e'); } catch (e) {} }
+      if (tg.setBackgroundColor) { try { tg.setBackgroundColor('#100a0e'); } catch (e) {} }
       if (tg.disableVerticalSwipes) { try { tg.disableVerticalSwipes(); } catch (e) {} }
     }
-    function sendToBot() {
-      if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.sendData) {
-        window.Telegram.WebApp.sendData('enter_shanqla');
-      }
-    }
+
     const tabs = document.querySelectorAll('.tab');
-    const views = { home: document.getElementById('view-home'), users: document.getElementById('view-users') };
+    const views = { home: document.getElementById('view-home'), community: document.getElementById('view-community') };
+
     function showView(name) {
       Object.entries(views).forEach(([key, el]) => el.classList.toggle('active', key === name));
       tabs.forEach(t => t.classList.toggle('active', t.dataset.view === name));
-      if (name === 'users') loadUsers();
+      if (name === 'community') loadCommunity();
     }
     tabs.forEach(t => t.addEventListener('click', () => showView(t.dataset.view)));
-    async function refreshTotal() {
+
+    function initialOf(name) {
+      const clean = (name || '').replace(/\\*/g, '');
+      return (clean.charAt(0) || '?').toUpperCase();
+    }
+
+    async function refreshCount() {
       try {
-        const res = await fetch('/api/total');
+        const res = await fetch('/api/count');
         const data = await res.json();
         const el = document.getElementById('count');
-        if (el.textContent != data.total) {
-          el.textContent = data.total;
+        if (el.textContent != data.count) {
+          el.textContent = data.count;
           el.style.transform = 'scale(1.12)';
           setTimeout(() => { el.style.transform = 'scale(1)'; }, 200);
         }
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error('Could not refresh the count', e); }
     }
-    async function loadUsers() {
+
+    async function loadCommunity() {
       try {
-        const res = await fetch('/api/users');
-        const data = await res.json();
-        document.getElementById('u-count').textContent = data.users_count;
-        document.getElementById('u-total').textContent = data.total;
+        const [statsRes, usersRes] = await Promise.all([fetch('/api/donations'), fetch('/api/users')]);
+        const stats = await statsRes.json();
+        const usersData = await usersRes.json();
+        document.getElementById('d-count').textContent = stats.donations_count;
+        document.getElementById('d-total').textContent = stats.stars_total;
+
         const list = document.getElementById('users-list');
-        if (!data.users || data.users.length === 0) {
-          list.innerHTML = '<div class="empty">ما في حدا سجّل رقمه لسا 🙂</div>';
+        if (!usersData.users || usersData.users.length === 0) {
+          list.innerHTML = '<div class="empty">No one has registered yet 🙂</div>';
           return;
         }
-        list.innerHTML = data.users.map((u, i) => `
+        list.innerHTML = usersData.users.map(u => `
           <div class="row">
-            <span class="rank">${i + 1}</span>
+            <span class="initial">${initialOf(u.masked_name)}</span>
             <span class="name">${u.masked_name}</span>
-            <span class="amount">${u.count}</span>
+            <span class="donated ${u.donated === 0 ? 'zero' : ''}">${u.donated} ⭐</span>
           </div>
         `).join('');
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error('Could not load the members list', e); }
     }
-    refreshTotal();
-    setInterval(refreshTotal, 5000);
+
+    refreshCount();
+    setInterval(refreshCount, 5000);
+
     const params = new URLSearchParams(window.location.search);
-    if (params.get('tab') === 'users') showView('users');
+    if (params.get('tab') === 'community') showView('community');
   </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def home():
-    _, total = get_algeria_stats()
-    return render_template_string(MINI_APP_PAGE, total=total)
+    count = get_count()
+    return render_template_string(MINI_APP_PAGE, count=count, suggestion_price=SUGGESTION_PRICE)
 
-@app.route("/health")
-def health():
-    ok, msg = check_db_connection()
-    return jsonify({
-        "database_url_set": bool(build_database_url()),
-        "ok": ok,
-        "message": msg
-    })
 
-@app.route("/api/total")
-def api_total():
-    _, total = get_algeria_stats()
-    return jsonify({"total": total})
+@app.route("/users")
+def users_page():
+    """Legacy link kept for compatibility: same app, opened on the members tab."""
+    count = get_count()
+    return render_template_string(MINI_APP_PAGE, count=count, suggestion_price=SUGGESTION_PRICE)
+
+
+@app.route("/api/count")
+def api_count():
+    return jsonify({"count": get_count()})
+
+
+@app.route("/api/donations")
+def api_donations():
+    count, total = get_donations_stats()
+    return jsonify({"donations_count": count, "stars_total": total})
+
 
 @app.route("/api/users")
 def api_users():
-    users_count, total = get_algeria_stats()
-    ranked = get_all_users_ranked()
+    """List of registered members with masked names (only the first letter shown) and total stars given."""
+    users = get_registered_users_with_donations()
     result = [
-        {"masked_name": mask_name(u["username"], u["first_name"]), "count": u["count"]}
-        for u in ranked
+        {"masked_name": mask_name(u["name"]), "donated": u["donated"]}
+        for u in users
     ]
-    return jsonify({"users_count": users_count, "total": total, "users": result})
+    return jsonify({"users": result})
 
-# ───────────────────────── الويب هوك ─────────────────────────
+
+# ───────────────────────── webhook (receives bot updates) ─────────────────────────
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    if not BOT_TOKEN:
-        return jsonify({"ok": False, "error": "BOT_TOKEN missing"}), 500
-
     update = request.get_json(force=True, silent=True) or {}
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    site_url = f"https://{domain}" if domain else ""
 
-    try:
-        if "message" in update:
-            msg = update["message"]
-            chat_id = msg["chat"]["id"]
-            text = (msg.get("text") or "").strip()
-            sender = msg.get("from", {})
-            user_id = sender.get("id")
-            username = sender.get("username")
-            first_name = sender.get("first_name")
+    # Pre-checkout confirmation request - must be answered within 10 seconds
+    if "pre_checkout_query" in update:
+        pcq = update["pre_checkout_query"]
+        answer_pre_checkout(pcq["id"], ok=True)
+        return jsonify({"ok": True})
 
-            # Web App sendData
-            web_app_data = msg.get("web_app_data")
-            if web_app_data and web_app_data.get("data") == "enter_shanqla":
-                set_pending_action(user_id, "awaiting_number")
-                send_message(chat_id, "طيب، ابعتلي رقمك (عدد) بس، كم عندك شنقلة فدار؟ 😄")
-                return jsonify({"ok": True})
+    # A regular text message (like /start) or a successful-payment notification
+    if "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text", "") or ""
 
-            # انتظار رقم
-            pending = get_pending_action(user_id) if user_id else None
-            if pending == "awaiting_number" and text and not text.startswith("/"):
-                cleaned = text.replace(",", "").replace("٬", "")
-                arabic_digits = "٠١٢٣٤٥٦٧٨٩"
-                cleaned = "".join(
-                    str(arabic_digits.index(ch)) if ch in arabic_digits else ch
-                    for ch in cleaned
-                )
-                if cleaned.isdigit():
-                    count = int(cleaned)
-                    if count < 0 or count > 1_000_000:
-                        send_message(chat_id, "رقم غير منطقي 😅 اكتب رقم بين 0 و1,000,000.")
-                    else:
-                        saved, error_text = save_shanqla_count(user_id, count, username, first_name)
-                        clear_pending_action(user_id)
-                        if saved:
-                            _, total = get_algeria_stats()
-                            send_message(
-                                chat_id,
-                                f"تمام ✅ سجّلنا إنه عندك {count} شنقلة فدار.\n"
-                                f"🇩🇿 مجموع الشعب الجزائري الآن: {total}",
-                            )
-                        else:
-                            send_message(
-                                chat_id,
-                                "صار خطأ بالحفظ 🙏\nتفاصيل الخطأ:\n"
-                                f"`{error_text}`\n\nابعت هاد النص لمطوّر البوت.",
-                            )
-                else:
-                    send_message(chat_id, "لازم تكتب رقم فقط (مثلاً: 42) 🙏")
-                return jsonify({"ok": True})
+        sender = msg.get("from", {})
+        user_id = sender.get("id")
+        if user_id:
+            upsert_user(user_id, username=sender.get("username"), first_name=sender.get("first_name"))
 
-            if text.startswith("/start"):
+        # Successful Telegram Stars payment (support gift or suggestion purchase)
+        if "successful_payment" in msg:
+            sp = msg["successful_payment"]
+            amount = sp.get("total_amount", 0)
+            charge_id = sp.get("telegram_payment_charge_id")
+            invoice_payload = sp.get("invoice_payload", "") or ""
+
+            if invoice_payload.startswith("suggest_"):
+                # This was a suggestion payment: wait for their next message and store it as the suggestion content
+                set_pending_action(user_id, "awaiting_suggestion", charge_id)
                 send_message(
                     chat_id,
-                    "أهلاً فيك 👋\nهاد البوت بيحسب كم عند كل واحد من \"شنقلة فدار\"، وأنت بتكتب رقمك بنفسك.\n"
-                    "اضغط زر تحت:",
-                    main_keyboard(site_url),
+                    "Payment received 💡\nNow send us your idea or suggestion in a single message, and we'll pass it straight to the dev team 🙏",
                 )
-            elif text in ("/شنقلتي", "/my"):
-                existing = get_user_count(user_id)
-                set_pending_action(user_id, "awaiting_number")
-                if existing is not None:
-                    send_message(chat_id, f"رقمك المسجل حالياً: {existing} شنقلة فدار.\nابعتلي رقم جديد لو بدك تعدّله.")
-                else:
-                    send_message(chat_id, "لسا ما سجّلت رقمك. اكتبلي كم عندك شنقلة فدار؟")
-            elif text in ("/الجزائر", "/algeria"):
-                users_count, total = get_algeria_stats()
-                send_message(
-                    chat_id,
-                    f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص سجّلوا رقمهم لحد الآن)",
-                )
-            elif text in ("/الموقع", "/site") and site_url:
-                send_message(chat_id, f"🌐 شوف الموقع من هون:\n{site_url}")
-            elif text in ("/تشخيص", "/debug", "/diag"):
-                ok, msg = check_db_connection()
-                icon = "✅" if ok else "❌"
-                send_message(chat_id, f"{icon} فحص قاعدة البيانات:\n{msg}")
             else:
+                record_donation(user_id, amount, charge_id)
                 send_message(
                     chat_id,
-                    "استخدم الأزرار تحت، أو اكتب /شنقلتي أو /الجزائر 👇",
-                    main_keyboard(site_url),
+                    f"Thank you, truly 🙏💛\nWe've received your support of {amount} Stars ⭐️\nMay it come back to you tenfold!",
                 )
+            return jsonify({"ok": True})
 
-        elif "callback_query" in update:
-            cq = update["callback_query"]
-            sender = cq.get("from", {})
-            user_id = sender.get("id")
-            chat_id = cq["message"]["chat"]["id"]
-            callback_id = cq["id"]
-            data_key = cq.get("data", "")
+        # If there's a paid suggestion waiting on its text, and this message isn't a command (doesn't start with /)
+        pending = get_pending_action(user_id) if user_id else None
+        if pending and pending["action"] == "awaiting_suggestion" and text and not text.startswith("/"):
+            record_suggestion(user_id, text, pending.get("charge_id"))
+            clear_pending_action(user_id)
+            send_message(chat_id, "Your idea has been recorded ✅ Thank you for taking the time to share it 🙏💡")
+            notify_admin_new_suggestion(user_id, sender.get("username"), text)
+            return jsonify({"ok": True})
 
-            if data_key == "enter_shanqla":
-                answer_callback(callback_id)
-                set_pending_action(user_id, "awaiting_number")
-                send_message(chat_id, "طيب، ابعتلي رقمك (عدد) بس، كم عندك شنقلة فدار؟ 😄")
-            elif data_key == "algeria_shanqla":
-                answer_callback(callback_id)
-                users_count, total = get_algeria_stats()
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            start_payload = parts[1].strip() if len(parts) > 1 else ""
+
+            if start_payload == "suggest":
+                # Came from the "Suggest a feature" button on the site: send the suggestion invoice directly
+                send_suggestion_invoice(chat_id)
+            else:
+                site_url = f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')}"
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "✅ I'm ready to marry", "callback_data": "want_marry"}],
+                        [{"text": "🌐 Open the registry", "web_app": {"url": site_url}}],
+                        [
+                            {"text": "🎁 Daily points", "callback_data": "claim_points"},
+                            {"text": "🏆 Leaderboard", "callback_data": "show_leaderboard"},
+                        ],
+                        [{"text": "⭐ Support the bot", "callback_data": "show_donate"}],
+                        [{"text": "💡 Suggest a feature", "callback_data": "propose_idea"}],
+                        [{"text": "❌ Unsubscribe", "callback_data": "unsubscribe"}],
+                    ]
+                }
                 send_message(
                     chat_id,
-                    f"🇩🇿 الشعب الجزائري عنده {total} شنقلة فدار!\n(حسب {users_count} شخص سجّلوا رقمهم لحد الآن)",
+                    "Welcome to Betrothed 💍\n"
+                    "Tap the button below to add your name to the registry of people ready for marriage 😄",
+                    keyboard,
                 )
-    except Exception as e:
-        print(f"[Webhook] خطأ غير متوقع: {e}")
+
+        elif text in ("/count",):
+            send_message(chat_id, f"People registered so far: {get_count()} 💍")
+
+        elif text in ("/support", "/donate"):
+            send_message(
+                chat_id,
+                "You can support the bot with Telegram Stars ⭐ pick the amount that suits you:",
+                donation_keyboard(),
+            )
+
+        elif text in ("/donations",):
+            count, total = get_donations_stats()
+            send_message(
+                chat_id,
+                f"Number of gifts received: {count}\nTotal Stars received: {total} ⭐️",
+            )
+
+        elif text in ("/suggest",):
+            send_suggestion_invoice(chat_id)
+
+        elif text in ("/suggestions",) and str(chat_id) == str(ADMIN_CHAT_ID):
+            send_message(chat_id, f"Suggestions received so far: {get_suggestions_count()} 💡")
+
+        elif text in ("/points",):
+            send_message(chat_id, f"Your total points: {get_user_points(user_id)} ⭐")
+
+        elif text in ("/leaderboard",):
+            send_message(chat_id, build_leaderboard_text())
+
+        elif text in ("/unsubscribe",):
+            if is_registered(user_id):
+                send_message(
+                    chat_id,
+                    "Are you sure you want to leave the marriage registry?",
+                    unsubscribe_confirm_keyboard(),
+                )
+            else:
+                send_message(chat_id, "You're not on the registry to begin with 🙂")
+
+    # Button press (Callback Query)
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        sender = cq.get("from", {})
+        user_id = sender["id"]
+        chat_id = cq["message"]["chat"]["id"]
+        callback_id = cq["id"]
+        data_key = cq.get("data", "")
+
+        upsert_user(user_id, username=sender.get("username"), first_name=sender.get("first_name"))
+
+        if data_key == "want_marry":
+            if is_registered(user_id):
+                answer_callback(callback_id, "You're already registered 😄")
+            else:
+                added = register_user(user_id)
+                if added:
+                    answer_callback(callback_id, "You're registered! Congratulations in advance 🎉")
+                    send_message(
+                        chat_id,
+                        f"You're registered ✅\nPeople ready for marriage so far: {get_count()} 💍",
+                    )
+                else:
+                    answer_callback(callback_id, "Something went wrong, please try again 🙏")
+
+        elif data_key == "show_donate":
+            answer_callback(callback_id, "")
+            send_message(
+                chat_id,
+                "You can support the bot with Telegram Stars ⭐ pick the amount that suits you:",
+                donation_keyboard(),
+            )
+
+        elif data_key.startswith("donate_"):
+            try:
+                amount = int(data_key.split("_")[1])
+            except (IndexError, ValueError):
+                amount = 0
+            if amount in DONATION_AMOUNTS:
+                answer_callback(callback_id, f"Preparing an invoice for {amount} Stars ⭐")
+                send_donation_invoice(chat_id, amount)
+            else:
+                answer_callback(callback_id, "That's not a valid amount 🙏")
+
+        elif data_key == "propose_idea":
+            answer_callback(callback_id, f"Preparing an invoice for {SUGGESTION_PRICE} Stars ⭐")
+            send_suggestion_invoice(chat_id)
+
+        elif data_key == "claim_points":
+            success, total = claim_daily_points(user_id)
+            if success:
+                answer_callback(callback_id, f"🎁 +{DAILY_POINTS} points!")
+                send_message(
+                    chat_id,
+                    f"You've claimed {DAILY_POINTS} points today 🎁\nYour total is now: {total} ⭐\nCome back tomorrow for more!",
+                )
+            else:
+                answer_callback(
+                    callback_id,
+                    "You've already claimed your points today, come back tomorrow 🙏",
+                    show_alert=True,
+                )
+
+        elif data_key == "show_leaderboard":
+            answer_callback(callback_id, "")
+            send_message(chat_id, build_leaderboard_text())
+
+        elif data_key == "unsubscribe":
+            answer_callback(callback_id, "")
+            if is_registered(user_id):
+                send_message(
+                    chat_id,
+                    "Are you sure you want to leave the marriage registry?",
+                    unsubscribe_confirm_keyboard(),
+                )
+            else:
+                send_message(chat_id, "You're not on the registry to begin with 🙂")
+
+        elif data_key == "confirm_unsubscribe":
+            removed = unregister_user(user_id)
+            if removed:
+                answer_callback(callback_id, "You've been unsubscribed ✅")
+                send_message(
+                    chat_id,
+                    f"You've been removed from the registry 👋\nPeople ready for marriage now: {get_count()} 💍",
+                )
+            else:
+                answer_callback(callback_id, "You weren't registered to begin with 🙂")
+
+        elif data_key == "cancel_unsubscribe":
+            answer_callback(callback_id, "Understood, no changes made 👍")
 
     return jsonify({"ok": True})
 
-# ───────────────────────── تفعيل الويب هوك ─────────────────────────
+
+# ───────────────────────── automatic webhook setup ─────────────────────────
 def set_webhook():
     domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     if not domain or not BOT_TOKEN:
-        print("[Webhook] BOT_TOKEN أو RAILWAY_PUBLIC_DOMAIN غير موجودين.")
+        print("BOT_TOKEN or RAILWAY_PUBLIC_DOMAIN is missing, skipping automatic webhook setup.")
         return
     url = f"https://{domain}/webhook/{BOT_TOKEN}"
     try:
         r = requests.get(
             f"{TELEGRAM_API}/setWebhook",
-            params={"url": url, "allowed_updates": json.dumps(["message", "callback_query"])},
+            params={
+                "url": url,
+                "allowed_updates": json.dumps(
+                    ["message", "callback_query", "pre_checkout_query"]
+                ),
+            },
             timeout=10,
         )
-        print(f"[Webhook] set to: {url} -> {r.json()}")
+        print(f"Webhook set to: {url} -> {r.json()}")
     except Exception as e:
-        print(f"[Webhook] فشل: {e}")
+        print(f"Failed to set the webhook: {e}")
 
-# تشغيل التهيئة
+
+# Runs when the module is imported (works with both gunicorn and running it directly)
 init_db()
 set_webhook()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
