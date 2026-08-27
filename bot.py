@@ -2,8 +2,10 @@ import os
 import json
 import hmac
 import hashlib
+import time
 import requests
 import psycopg2
+from psycopg2 import pool
 from urllib.parse import parse_qsl
 from flask import Flask, request, jsonify, render_template_string
 
@@ -31,8 +33,41 @@ DAILY_POINTS = 100
 
 
 # ───────────────────────── data layer (PostgreSQL) ─────────────────────────
+# FIX: use a connection pool instead of opening/closing a brand-new TCP+TLS
+# connection to Postgres on every single call. This was the main source of
+# slowness / occasional failures to load (each API call could add hundreds of
+# ms to seconds of pure connection-setup latency, on top of the query itself).
+db_pool = None
+
+
+def init_pool():
+    global db_pool
+    if not DATABASE_URL:
+        print("DATABASE_URL is not set, skipping pool creation.")
+        return
+    try:
+        db_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+        print("Database connection pool ready.")
+    except Exception as e:
+        print(f"Failed to create the database pool: {e}")
+
+
 def get_connection():
-    return psycopg2.connect(DATABASE_URL)
+    if db_pool is None:
+        # fallback so the app doesn't crash if the pool failed to init,
+        # though this path will be slow (same as before)
+        return psycopg2.connect(DATABASE_URL)
+    return db_pool.getconn()
+
+
+def release_connection(conn):
+    try:
+        if db_pool is None:
+            conn.close()
+        else:
+            db_pool.putconn(conn)
+    except Exception as e:
+        print(f"release_connection error: {e}")
 
 
 def init_db():
@@ -40,6 +75,7 @@ def init_db():
     if not DATABASE_URL:
         print("DATABASE_URL is not set, skipping database connection.")
         return
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -116,14 +152,17 @@ def init_db():
 
         conn.commit()
         cur.close()
-        conn.close()
         print("Database is ready.")
     except Exception as e:
         print(f"Failed to set up the database: {e}")
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def upsert_user(user_id, username=None, first_name=None):
     """Saves/updates the last known name for anyone who has interacted with the bot."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -140,41 +179,50 @@ def upsert_user(user_id, username=None, first_name=None):
         )
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"upsert_user error: {e}")
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_count():
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM registrations")
         count = cur.fetchone()[0]
         cur.close()
-        conn.close()
         return count
     except Exception as e:
         print(f"get_count error: {e}")
         return 0
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def is_registered(user_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM registrations WHERE user_id = %s", (user_id,))
         exists = cur.fetchone() is not None
         cur.close()
-        conn.close()
         return exists
     except Exception as e:
         print(f"is_registered error: {e}")
         return False
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def register_user(user_id):
     """Registers the user, returns True if it succeeded, False if already registered."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -185,15 +233,18 @@ def register_user(user_id):
         added = cur.rowcount > 0
         conn.commit()
         cur.close()
-        conn.close()
         return added
     except Exception as e:
         print(f"register_user error: {e}")
         return False
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def record_donation(user_id, amount, charge_id):
     """Records a successful support payment in the donations table."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -206,26 +257,31 @@ def record_donation(user_id, amount, charge_id):
         )
         conn.commit()
         cur.close()
-        conn.close()
         return True
     except Exception as e:
         print(f"record_donation error: {e}")
         return False
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_donations_stats():
     """Returns (number of donations, total stars) from the donations table."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM donations")
         count, total = cur.fetchone()
         cur.close()
-        conn.close()
         return count, total
     except Exception as e:
         print(f"get_donations_stats error: {e}")
         return 0, 0
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_registered_users_with_donations():
@@ -233,6 +289,7 @@ def get_registered_users_with_donations():
     Returns the list of registered members with each one's display name
     (from the users table) and total stars donated, ordered by registration date.
     """
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -252,7 +309,6 @@ def get_registered_users_with_donations():
         )
         rows = cur.fetchall()
         cur.close()
-        conn.close()
         return [
             {"user_id": row[0], "name": row[1], "donated": int(row[2])}
             for row in rows
@@ -260,6 +316,9 @@ def get_registered_users_with_donations():
     except Exception as e:
         print(f"get_registered_users_with_donations error: {e}")
         return []
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def mask_name(name):
@@ -277,6 +336,7 @@ def mask_name(name):
 
 # ───────────────────────── idea suggestions ─────────────────────────
 def set_pending_action(user_id, action, charge_id=None):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -293,12 +353,15 @@ def set_pending_action(user_id, action, charge_id=None):
         )
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"set_pending_action error: {e}")
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_pending_action(user_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -308,28 +371,34 @@ def get_pending_action(user_id):
         )
         row = cur.fetchone()
         cur.close()
-        conn.close()
         if row:
             return {"action": row[0], "charge_id": row[1]}
         return None
     except Exception as e:
         print(f"get_pending_action error: {e}")
         return None
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def clear_pending_action(user_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM pending_actions WHERE user_id = %s", (user_id,))
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"clear_pending_action error: {e}")
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def record_suggestion(user_id, content, charge_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -342,30 +411,36 @@ def record_suggestion(user_id, content, charge_id):
         )
         conn.commit()
         cur.close()
-        conn.close()
         return True
     except Exception as e:
         print(f"record_suggestion error: {e}")
         return False
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_suggestions_count():
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM suggestions")
         count = cur.fetchone()[0]
         cur.close()
-        conn.close()
         return count
     except Exception as e:
         print(f"get_suggestions_count error: {e}")
         return 0
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 # ───────────────────────── unsubscribing (opting out) ─────────────────────────
 def unregister_user(user_id):
     """Deletes the user from the registrations table. Returns True if they were removed."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -373,11 +448,13 @@ def unregister_user(user_id):
         removed = cur.rowcount > 0
         conn.commit()
         cur.close()
-        conn.close()
         return removed
     except Exception as e:
         print(f"unregister_user error: {e}")
         return False
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 # ───────────────────────── daily points system ─────────────────────────
@@ -387,6 +464,7 @@ def claim_daily_points(user_id):
     Returns (True, new_total) if this is the first claim today.
     Returns (False, current_total) if they already claimed today.
     """
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -406,7 +484,6 @@ def claim_daily_points(user_id):
         if row:
             conn.commit()
             cur.close()
-            conn.close()
             return True, row[0]
 
         # Nothing was updated, meaning they already claimed today - fetch their current total
@@ -414,29 +491,35 @@ def claim_daily_points(user_id):
         existing = cur.fetchone()
         conn.commit()
         cur.close()
-        conn.close()
         return False, (existing[0] if existing else 0)
     except Exception as e:
         print(f"claim_daily_points error: {e}")
         return False, 0
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_user_points(user_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT total_points FROM user_points WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         cur.close()
-        conn.close()
         return row[0] if row else 0
     except Exception as e:
         print(f"get_user_points error: {e}")
         return 0
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 def get_leaderboard(limit=10):
     """Returns the top point earners (name + total points)."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -456,11 +539,13 @@ def get_leaderboard(limit=10):
         )
         rows = cur.fetchall()
         cur.close()
-        conn.close()
         return [{"user_id": r[0], "name": r[1], "points": r[2]} for r in rows]
     except Exception as e:
         print(f"get_leaderboard error: {e}")
         return []
+    finally:
+        if conn is not None:
+            release_connection(conn)
 
 
 # ───────────────────────── Telegram helpers ─────────────────────────
@@ -1210,6 +1295,56 @@ def api_create_invoice():
     return jsonify({"ok": True, "link": link})
 
 
+# ───────────────────────── diagnostics ─────────────────────────
+@app.route("/health")
+def health_check():
+    """
+    Diagnostic endpoint: tells you exactly where the slowness/failure comes from
+    (the database, the Telegram API, or neither). Open it in a browser at
+    https://<your-domain>/health
+    """
+    result = {"app": "ok"}
+
+    # Test the database connection and measure how long it takes
+    if DATABASE_URL:
+        conn = None
+        try:
+            start = time.time()
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+            result["database"] = {
+                "status": "ok",
+                "latency_ms": round((time.time() - start) * 1000, 1),
+                "pool_active": db_pool is not None,
+            }
+        except Exception as e:
+            result["database"] = {"status": "error", "error": str(e)}
+        finally:
+            if conn is not None:
+                release_connection(conn)
+    else:
+        result["database"] = {"status": "missing DATABASE_URL"}
+
+    # Test the connection to the Telegram API
+    if BOT_TOKEN:
+        try:
+            start = time.time()
+            r = requests.get(f"{TELEGRAM_API}/getMe", timeout=5)
+            result["telegram"] = {
+                "status": "ok" if r.ok else "error",
+                "latency_ms": round((time.time() - start) * 1000, 1),
+            }
+        except Exception as e:
+            result["telegram"] = {"status": "error", "error": str(e)}
+    else:
+        result["telegram"] = {"status": "missing BOT_TOKEN"}
+
+    return jsonify(result)
+
+
 # ───────────────────────── webhook (receives bot updates) ─────────────────────────
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -1450,6 +1585,7 @@ def set_webhook():
 
 
 # Runs when the module is imported (works with both gunicorn and running it directly)
+init_pool()
 init_db()
 set_webhook()
 
