@@ -11,32 +11,44 @@ from flask import Flask, request, jsonify, render_template_string
 from functools import wraps
 from datetime import datetime
 import logging
+import sys
 
 # ───────────────────────── Configuration & Logging ─────────────────────────
 app = Flask(__name__)
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
 
 # Constants
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+
+# Validate critical vars
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN not set!")
+if not DATABASE_URL:
+    logger.error("❌ DATABASE_URL not set!")
 
 DONATION_AMOUNTS = [100, 200, 500, 1000]
 SUGGESTION_PRICE = 100
 DAILY_POINTS = 100
 
 # Timeouts (in seconds)
-DB_TIMEOUT = 5
-TELEGRAM_TIMEOUT = 8
-REQUEST_TIMEOUT = 10
+DB_TIMEOUT = 10
+TELEGRAM_TIMEOUT = 12
+REQUEST_TIMEOUT = 15
 
 # Retry configuration
 MAX_RETRIES = 3
-RETRY_DELAY = 0.5
+RETRY_DELAY = 1.0
 
 # ───────────────────────── Retry Decorator ─────────────────────────
 def retry_on_error(max_attempts=MAX_RETRIES, delay=RETRY_DELAY):
@@ -70,24 +82,36 @@ def init_pool():
         return
     try:
         db_pool = pool.SimpleConnectionPool(
-            1, 20, DATABASE_URL,
+            2, 50,
+            DATABASE_URL,
             connect_timeout=DB_TIMEOUT
         )
-        logger.info("Database connection pool ready.")
+        logger.info("✅ Database connection pool ready.")
     except Exception as e:
-        logger.error(f"Failed to create the database pool: {e}")
+        logger.error(f"❌ Failed to create the database pool: {e}")
         db_pool = None
 
 def get_connection(timeout=DB_TIMEOUT):
-    """Get a connection from the pool with timeout handling"""
+    """Get a valid connection from the pool with validation"""
     if db_pool is None:
         try:
-            return psycopg2.connect(DATABASE_URL, connect_timeout=timeout)
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=timeout)
+            return conn
         except Exception as e:
             logger.error(f"Failed to create fallback connection: {e}")
             raise
+    
     try:
-        return db_pool.getconn()
+        conn = db_pool.getconn()
+        # Validate connection is alive
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+        except:
+            conn.close()
+            conn = db_pool.getconn()
+        return conn
     except pool.PoolError as e:
         logger.error(f"Pool exhausted: {e}")
         raise
@@ -204,9 +228,9 @@ def init_db():
 
         conn.commit()
         cur.close()
-        logger.info("Database is ready.")
+        logger.info("✅ Database is ready.")
     except Exception as e:
-        logger.error(f"Failed to set up the database: {e}")
+        logger.error(f"❌ Failed to set up the database: {e}")
     finally:
         if conn:
             release_connection(conn)
@@ -263,6 +287,7 @@ def register_user(user_id):
     if not user_id:
         return False
     
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -405,7 +430,7 @@ def record_suggestion(user_id, content, charge_id):
         return False
     
     try:
-        content = str(content)[:5000]  # Limit content length
+        content = str(content)[:5000]
         execute_db_query("""
             INSERT INTO suggestions (user_id, content, telegram_payment_charge_id)
             VALUES (%s, %s, %s)
@@ -434,6 +459,7 @@ def unregister_user(user_id):
     if not user_id:
         return False
     
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -456,6 +482,7 @@ def claim_daily_points(user_id):
     if not user_id:
         return False, 0
     
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -536,7 +563,7 @@ def send_message(chat_id, text, reply_markup=None):
     try:
         payload = {
             "chat_id": int(chat_id),
-            "text": str(text)[:4096]  # Telegram limit
+            "text": str(text)[:4096]
         }
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
@@ -754,7 +781,7 @@ def validate_init_data(init_data: str, bot_token: str):
         return None
 
 # ───────────────────────── Mini App HTML ─────────────────────────
-MINI_APP_PAGE = """
+MINI_APP_PAGE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1435,9 +1462,14 @@ def health_check():
     return jsonify(result)
 
 # ───────────────────────── Webhook ─────────────────────────
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def webhook():
+@app.route(f"/webhook/<bot_token>", methods=["POST"])
+def webhook(bot_token):
     """Telegram webhook endpoint"""
+    # Verify token matches
+    if bot_token != BOT_TOKEN:
+        logger.warning(f"Invalid bot token in webhook: {bot_token[:10]}...")
+        return jsonify({"ok": False}), 403
+
     try:
         update = request.get_json(force=True, silent=True) or {}
     except Exception as e:
@@ -1497,7 +1529,7 @@ def webhook():
                     keyboard = {
                         "inline_keyboard": [
                             [{"text": "✅ I'm ready to marry", "callback_data": "want_marry"}],
-                            [{"text": "🌐 Open the registry", "web_app": {"url": f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'example.com')}"}}],
+                            [{"text": "🌐 Open the registry", "web_app": {"url": f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else "https://example.com"}}],
                             [
                                 {"text": "🎁 Daily points", "callback_data": "claim_points"},
                                 {"text": "🏆 Leaderboard", "callback_data": "show_leaderboard"},
@@ -1608,12 +1640,13 @@ def webhook():
 # ───────────────────────── Startup ─────────────────────────
 def set_webhook():
     """Configure Telegram webhook"""
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-    if not domain or not BOT_TOKEN:
-        logger.warning("Missing domain or BOT_TOKEN")
+    if not RAILWAY_DOMAIN or not BOT_TOKEN:
+        logger.warning(f"⚠️  Missing domain or BOT_TOKEN for webhook setup")
+        logger.warning(f"   RAILWAY_PUBLIC_DOMAIN: {RAILWAY_DOMAIN or 'NOT SET'}")
+        logger.warning(f"   BOT_TOKEN: {'SET' if BOT_TOKEN else 'NOT SET'}")
         return
 
-    url = f"https://{domain}/webhook/{BOT_TOKEN}"
+    url = f"https://{RAILWAY_DOMAIN}/webhook/{BOT_TOKEN}"
     try:
         r = requests.get(
             f"{TELEGRAM_API}/setWebhook",
@@ -1623,15 +1656,22 @@ def set_webhook():
             },
             timeout=TELEGRAM_TIMEOUT,
         )
-        logger.info(f"Webhook set: {url} -> {r.status_code}")
+        if r.ok:
+            logger.info(f"✅ Webhook set: {url} -> {r.status_code}")
+        else:
+            logger.error(f"❌ Webhook error: {r.status_code} - {r.text}")
     except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
+        logger.error(f"❌ Failed to set webhook: {e}")
 
 # Initialize on startup
+logger.info("========== Initializing Bot ==========")
 init_pool()
 init_db()
 set_webhook()
+logger.info("✅ Bot initialization complete!")
 
+# Application entry point
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🚀 Starting Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
