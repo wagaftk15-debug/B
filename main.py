@@ -10,6 +10,9 @@ HashChain - سلسلة بلوكات حقيقية (Proof of Work) + موقع وي
     DB_PATH       اختياري. إن أضفت Volume يُستخدم تلقائياً (RAILWAY_VOLUME_MOUNT_PATH أو /data)
     WEB_APP_URL   اختياري. يُكتشف تلقائياً من RAILWAY_PUBLIC_DOMAIN
     ALLOW_GUEST   1 للسماح بالدخول من المتصفح بدون تيليجرام (الافتراضي 1)
+    ADMIN_IDS     معرّفات تيليجرام للأدمن مفصولة بفاصلة (احصل على معرّفك من @userinfobot)
+    UNLOCK_STARS  سعر فتح التعدين بنجوم تيليجرام (الافتراضي 1000، والأدمن يغيّره من اللوحة؛ 0 = مجاني)
+    SUPPORT_CONTACT نص دعم الدفع الذي يظهر عند /paysupport (يشترطه تيليجرام)
 Start Command:       python main.py
 
 الحماية من 20 خطأ محتمل (ابحث عن [FIX-n] في الكود):
@@ -71,6 +74,9 @@ DB_PATH = _pick_db_path()
 ALLOW_GUEST = os.environ.get("ALLOW_GUEST", "1").strip() == "1"
 _dom = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or os.environ.get("RAILWAY_STATIC_URL", "").replace("https://", "")
 WEB_APP_URL = (os.environ.get("WEB_APP_URL") or (f"https://{_dom}" if _dom else "")).strip().rstrip("/")
+ADMIN_IDS = {x for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.isdigit()}
+UNLOCK_STARS_DEFAULT = _env_int("UNLOCK_STARS", 1000)
+SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "").strip() or "لأي مشكلة في الدفع تواصل مع مالك البوت وأرسل له معرّف الدفعة."
 
 COIN = "HASH"
 TARGET_BLOCK_TIME = 10          # ثواني لكل بلوك (تعديل الصعوبة تلقائي)
@@ -89,7 +95,7 @@ TICK_BUDGET = 0.30              # [FIX-13] أقصى زمن (ثانية) يقضي
 MAX_USER_TICK = 60000           # سقف الهاشات الاسمية لكل مستخدم في الدورة
 MAX_BODY = 4096                 # [FIX-6]
 INITDATA_MAX_AGE = 3 * 86400    # [FIX-10]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 GENESIS_PREV = "0" * 64
 
 STOP = threading.Event()
