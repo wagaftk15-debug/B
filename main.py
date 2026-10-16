@@ -163,7 +163,7 @@ def open_db():
             return PG(DATABASE_URL)
         except psycopg2.Error as ex:
             last = ex
-            print(f"waiting for database ({i + 1}/10): {str(ex).strip()[:120]}")
+            print(f"waiting for database ({i + 1}/10): {' '.join(str(ex).split())}")
             time.sleep(3)
     print("!! تعذّر الاتصال بقاعدة البيانات:", last)
     sys.exit(1)
