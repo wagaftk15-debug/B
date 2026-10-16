@@ -2,36 +2,38 @@
 # -*- coding: utf-8 -*-
 """
 HashChain - سلسلة بلوكات حقيقية (Proof of Work) + موقع ويب + بوت تيليجرام
-ملف واحد، بدون أي مكتبات خارجية (مكتبة بايثون القياسية فقط).
+التخزين: PostgreSQL (Railway)  |  المكتبة المطلوبة: psycopg2-binary (انظر requirements.txt)
 
-التشغيل محلياً:      python main.py
-على Railway: المتغير الوحيد المطلوب هو BOT_TOKEN. الباقي يُضبط تلقائياً:
-    BOT_TOKEN     توكن البوت من @BotFather (بدونه يعمل الموقع بوضع الضيف فقط)
-    DB_PATH       اختياري. إن أضفت Volume يُستخدم تلقائياً (RAILWAY_VOLUME_MOUNT_PATH أو /data)
-    WEB_APP_URL   اختياري. يُكتشف تلقائياً من RAILWAY_PUBLIC_DOMAIN
+متغيرات البيئة:
+    DATABASE_URL  رابط Postgres. في Railway: أضف للخدمة متغيراً مرجعياً
+                  DATABASE_URL = ${{Postgres-N9bh.DATABASE_URL}}
+    ID_PREFIX     بادئة المعرّفات والجداول (الافتراضي hash). المعرّف يصبح مثل hash.123456
+                  وجداولك تصبح hash_users و hash_blocks (غيّرها لـ 01 مثلاً لبوت آخر على نفس القاعدة)
+    BOT_TOKEN     توكن البوت من @BotFather
+    ADMIN_IDS     معرّفات تيليجرام للأدمن مفصولة بفاصلة (من @userinfobot)
+    WEB_APP_URL   اختياري، يُكتشف من RAILWAY_PUBLIC_DOMAIN
     ALLOW_GUEST   1 للسماح بالدخول من المتصفح بدون تيليجرام (الافتراضي 1)
-    ADMIN_IDS     معرّفات تيليجرام للأدمن مفصولة بفاصلة (احصل على معرّفك من @userinfobot)
-    UNLOCK_STARS  سعر فتح التعدين بنجوم تيليجرام (الافتراضي 1000، والأدمن يغيّره من اللوحة؛ 0 = مجاني)
-    SUPPORT_CONTACT نص دعم الدفع الذي يظهر عند /paysupport (يشترطه تيليجرام)
-Start Command:       python main.py
 
-الحماية من 20 خطأ محتمل (ابحث عن [FIX-n] في الكود):
- 1 قفل/تلف SQLite (WAL + busy_timeout)        11 إساءة نظام الإحالات
- 2 فحص سلامة القاعدة واستعادتها عند التلف     12 ساعة النظام/NaN/دقة الأرقام
- 3 فهارس + ترقية إصدار القاعدة                13 المعدّن يحجب الـ API (ميزانية زمنية)
- 4 قراءة آمنة لمتغيرات البيئة                 14 تعارض إدخال البلوكات + إعادة المزامنة
- 5 أي استثناء لا يُسقط الخادم + ترويسات أمان  15 إعادة تشغيل الخيوط تلقائياً عند الانهيار
- 6 حجم/صيغة الطلب وقيم غير صالحة              16 أخطاء تيليجرام (401/409/429/403)
- 7 تحديد معدل الطلبات                         17 أوامر البوت: @bot، تحديثات تالفة
- 8 تحديد إنشاء حسابات الضيوف لكل IP           18 إغلاق نظيف عند SIGTERM + مهلة للاتصالات
- 9 XSS: تنظيف الأسماء (خادم + واجهة)          19 كاش + إزالة استعلامات N+1
-10 تحقق صارم من توقيع تيليجرام                20 مرونة الواجهة (شبكة/502/تكرار/تخزين)
+أوامر الأدمن في البوت (تظهر في قائمة "/" للأدمن فقط):
+    /admin                     قائمة الأوامر
+    /setblocks <id> <n>        تحديد عدد بلوكات مستخدم
+    /addblocks <id> <n>        زيادة/إنقاص عدد بلوكات مستخدم (n قد يكون سالباً)
+    /userinfo  <id>            معلومات مستخدم
+    <id> إما رقم تيليجرام (123456) أو المعرّف الكامل (hash.123456)
+
+Start Command:       python main.py
 """
-import hashlib, hmac, json, os, random, re, signal, sqlite3, sys, threading, time
+import hashlib, hmac, json, os, random, re, signal, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# حاويات البناء/التشغيل قد تعمل بترميز ASCII (LANG=C): اجعل الطباعة UTF-8 حتى لا ينهار print للعربية
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    print("!! مكتبة psycopg2 غير مثبتة. أضف psycopg2-binary إلى requirements.txt")
+    sys.exit(1)
+
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -41,7 +43,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 # ───────────────────────── الإعدادات ─────────────────────────
 def _env_int(name, default):
-    """[FIX-4] قراءة رقم من البيئة بدون انهيار إن كانت القيمة تالفة."""
     try:
         v = int(str(os.environ.get(name, default)).strip())
         return v if v > 0 else default
@@ -49,119 +50,144 @@ def _env_int(name, default):
         return default
 
 
-def _pick_db_path():
-    """اختيار مكان قاعدة البيانات تلقائياً: DB_PATH ثم Volume في Railway ثم /data ثم محلي."""
-    p = os.environ.get("DB_PATH", "").strip()
-    if not p:
-        vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-        if vol:
-            p = os.path.join(vol, "hash.db")
-        elif os.path.isdir("/data") and os.access("/data", os.W_OK):
-            p = "/data/hash.db"
-        else:
-            p = "hash.db"
-    d = os.path.dirname(os.path.abspath(p))
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError as ex:
-        print("cannot create DB dir:", ex)
-    return p
-
-
 PORT = _env_int("PORT", 8080)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'").strip()
-DB_PATH = _pick_db_path()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
 ALLOW_GUEST = os.environ.get("ALLOW_GUEST", "1").strip() == "1"
 _dom = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or os.environ.get("RAILWAY_STATIC_URL", "").replace("https://", "")
 WEB_APP_URL = (os.environ.get("WEB_APP_URL") or (f"https://{_dom}" if _dom else "")).strip().rstrip("/")
 ADMIN_IDS = {x for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.isdigit()}
-UNLOCK_STARS_DEFAULT = _env_int("UNLOCK_STARS", 1000)
-SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT", "").strip() or "لأي مشكلة في الدفع تواصل مع مالك البوت وأرسل له معرّف الدفعة."
+
+# بادئة المعرّفات والجداول: hash.<userid> وجداول hash_users / hash_blocks
+ID_PREFIX = re.sub(r"[^A-Za-z0-9_-]", "", os.environ.get("ID_PREFIX", "hash")) or "hash"
+_P = re.sub(r"[^a-z0-9_]", "_", ID_PREFIX.lower())
+U = f'"{_P}_users"'
+B = f'"{_P}_blocks"'
+
+
+def K(raw):
+    """المعرّف الكامل المخزّن في القاعدة: hash.123456"""
+    return f"{ID_PREFIX}.{raw}"
+
+
+def raw_of(key):
+    return key.split(".", 1)[1] if "." in key else key
+
 
 COIN = "HASH"
-TARGET_BLOCK_TIME = 10          # ثواني لكل بلوك (تعديل الصعوبة تلقائي)
+TARGET_BLOCK_TIME = 10
 MIN_BITS, MAX_BITS = 8, 44
 START_BITS = 14
-BASE_HASHRATE = 4000            # هاش/ثانية لكل معدّن بالوضع x1
+BASE_HASHRATE = 4000
 MAX_ENERGY = 1000
-ENERGY_REGEN = 0.5              # طاقة/ثانية (30 في الدقيقة)
-ENERGY_DRAIN = 1.0              # طاقة/ثانية × وضع التعدين
+ENERGY_REGEN = 0.5
+ENERGY_DRAIN = 1.0
 REFILL_AMOUNT, REFILL_COOLDOWN = 500, 6 * 3600
 HALVING_EVERY = 100000
 BASE_REWARD = 10.0
 REF_BONUS = 5.0
-MAX_REFS = 200                  # [FIX-11] أقصى عدد إحالات مكافأة لكل مستخدم
-TICK_BUDGET = 0.30              # [FIX-13] أقصى زمن (ثانية) يقضيه المعدّن في كل دورة
-MAX_USER_TICK = 60000           # سقف الهاشات الاسمية لكل مستخدم في الدورة
-MAX_BODY = 4096                 # [FIX-6]
-INITDATA_MAX_AGE = 3 * 86400    # [FIX-10]
-SCHEMA_VERSION = 3
+MAX_REFS = 200
+TICK_BUDGET = 0.30
+MAX_USER_TICK = 60000
+MAX_BODY = 4096
+INITDATA_MAX_AGE = 3 * 86400
 GENESIS_PREV = "0" * 64
+MAX_BLOCKS_VALUE = 10 ** 9
 
 STOP = threading.Event()
 LOCK = threading.RLock()
 
 
-# ───────────────────────── قاعدة البيانات ─────────────────────────
-def open_db(path):
-    """[FIX-1][FIX-2] فتح القاعدة بوضع WAL، وفحص سلامتها، ونقل التالفة جانباً."""
-    def connect():
-        c = sqlite3.connect(path, check_same_thread=False, timeout=15)
-        c.row_factory = sqlite3.Row
-        return c
+# ───────────────────────── قاعدة البيانات (PostgreSQL) ─────────────────────────
+class PG:
+    """غلاف رفيع حول اتصال psycopg2: يحوّل ? إلى %s، يعيد الاتصال تلقائياً، ويتراجع عند الخطأ."""
 
-    c = connect()
-    try:
-        ok = c.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-    except sqlite3.DatabaseError:
-        ok = False
-    if not ok:
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.conn = None
+        self.connect()
+
+    def connect(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = psycopg2.connect(self.dsn, connect_timeout=10,
+                                     cursor_factory=psycopg2.extras.RealDictCursor)
+        self.conn.autocommit = False
+
+    def execute(self, sql, params=()):
+        sql = sql.replace("?", "%s")
+        for attempt in (1, 2):
+            try:
+                cur = self.conn.cursor()
+                cur.execute(sql, params)
+                return cur
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                if attempt == 2:
+                    raise
+                print("db connection lost, reconnecting…")
+                self.connect()
+            except psycopg2.Error:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
         try:
-            c.close()
+            self.conn.rollback()
         except Exception:
             pass
-        bak = f"{path}.corrupt-{int(time.time())}"
+
+    def close(self):
         try:
-            os.replace(path, bak)
-            print("!! قاعدة البيانات تالفة، نُقلت إلى:", bak)
-        except OSError as ex:
-            print("!! تعذّر نقل القاعدة التالفة:", ex)
-        for ext in ("-wal", "-shm"):
-            try:
-                os.remove(path + ext)
-            except OSError:
-                pass
-        c = connect()
-    for pragma in ("journal_mode=WAL", "synchronous=NORMAL", "busy_timeout=15000"):
-        try:
-            c.execute("PRAGMA " + pragma)
-        except sqlite3.DatabaseError as ex:
-            print("pragma", pragma, "failed:", ex)
-    return c
+            self.conn.close()
+        except Exception:
+            pass
 
 
-DB = open_db(DB_PATH)
+def open_db():
+    if not DATABASE_URL:
+        print("!! DATABASE_URL غير مضبوط. في Railway أضف للخدمة المتغير:")
+        print("   DATABASE_URL = ${{Postgres-N9bh.DATABASE_URL}}")
+        sys.exit(1)
+    last = None
+    for i in range(10):          # Railway قد يشغّل الخدمتين معاً: انتظر جاهزية القاعدة
+        try:
+            return PG(DATABASE_URL)
+        except psycopg2.Error as ex:
+            last = ex
+            print(f"waiting for database ({i + 1}/10): {str(ex).strip()[:120]}")
+            time.sleep(3)
+    print("!! تعذّر الاتصال بقاعدة البيانات:", last)
+    sys.exit(1)
+
+
+DB = None
 
 
 def init_db():
-    """[FIX-3] إنشاء الجداول والفهارس وترقية الإصدار."""
     with LOCK:
-        DB.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            id TEXT PRIMARY KEY, name TEXT, balance REAL DEFAULT 0, xp REAL DEFAULT 0,
-            energy REAL DEFAULT 1000, last_ts REAL, mining INTEGER DEFAULT 0, mode INTEGER DEFAULT 1,
-            hashes INTEGER DEFAULT 0, blocks_found INTEGER DEFAULT 0, referrer TEXT,
-            last_refill REAL DEFAULT 0, created REAL);
-        CREATE TABLE IF NOT EXISTS blocks(
-            idx INTEGER PRIMARY KEY, prev TEXT, ts INTEGER, miner_id TEXT, miner_name TEXT,
-            reward REAL, bits INTEGER, nonce INTEGER, hash TEXT, found_at REAL);
-        CREATE INDEX IF NOT EXISTS idx_users_mining  ON users(mining);
-        CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC);
-        CREATE INDEX IF NOT EXISTS idx_users_ref     ON users(referrer);
-        CREATE INDEX IF NOT EXISTS idx_blocks_miner  ON blocks(miner_id);
-        """)
-        # ترحيلات مستقبلية: if ver < N: ALTER TABLE ...
-        DB.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        DB.execute(f"""CREATE TABLE IF NOT EXISTS {U}(
+            id TEXT PRIMARY KEY, tg_id TEXT, name TEXT,
+            balance DOUBLE PRECISION DEFAULT 0, xp DOUBLE PRECISION DEFAULT 0,
+            energy DOUBLE PRECISION DEFAULT 1000, last_ts DOUBLE PRECISION,
+            mining INTEGER DEFAULT 0, mode INTEGER DEFAULT 1,
+            hashes BIGINT DEFAULT 0, blocks_found INTEGER DEFAULT 0, referrer TEXT,
+            last_refill DOUBLE PRECISION DEFAULT 0, created DOUBLE PRECISION)""")
+        DB.execute(f"""CREATE TABLE IF NOT EXISTS {B}(
+            idx BIGINT PRIMARY KEY, prev TEXT, ts BIGINT, miner_id TEXT, miner_name TEXT,
+            reward DOUBLE PRECISION, bits INTEGER, nonce BIGINT, hash TEXT, found_at DOUBLE PRECISION)""")
+        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_mining" ON {U}(mining)')
+        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_balance" ON {U}(balance DESC)')
+        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_ref" ON {U}(referrer)')
+        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_bminer" ON {B}(miner_id)')
         DB.commit()
 
 
@@ -172,20 +198,18 @@ class ApiError(Exception):
         self.code, self.key = code, key
 
 
-_BAD_CHARS = re.compile(r'''[\x00-\x1f\x7f<>&"'`‪-‮⁦-⁩]''')
+_BAD_CHARS = re.compile(r'''[\x00-\x1f\x7f<>&"'`\u202a-\u202e\u2066-\u2069]''')
 REF_RE = re.compile(r"^[0-9]{1,20}$")
 GUEST_RE = re.compile(r"^[A-Za-z0-9]{8,40}$")
+ADD_BAL = "ROUND((balance+?)::numeric,8)"
 
 
 def clean_name(n, fallback="User"):
-    """[FIX-9] تنظيف الأسماء: إزالة وسوم HTML والرموز التحكمية وأحرف عكس الاتجاه."""
     n = _BAD_CHARS.sub("", str(n or "")).strip()[:32]
     return n or fallback
 
 
 class RateLimiter:
-    """[FIX-7] دلو رموز بسيط (token bucket) لكل مفتاح."""
-
     def __init__(self, rate, burst):
         self.rate, self.burst = float(rate), float(burst)
         self.b, self.lk, self.gc = {}, threading.Lock(), time.time()
@@ -205,16 +229,15 @@ class RateLimiter:
             return True
 
 
-RL_API = RateLimiter(rate=8, burst=40)              # طلبات API لكل IP
-RL_ACT = RateLimiter(rate=1, burst=10)              # أفعال (بدء/إيقاف/وضع/طاقة) لكل مستخدم
-RL_GUEST_NEW = RateLimiter(rate=20 / 3600, burst=20)  # [FIX-8] ضيوف جدد لكل IP
-RL_BOT = RateLimiter(rate=0.5, burst=5)             # أوامر البوت لكل مستخدم
+RL_API = RateLimiter(rate=8, burst=40)
+RL_ACT = RateLimiter(rate=1, burst=10)
+RL_GUEST_NEW = RateLimiter(rate=20 / 3600, burst=20)
+RL_BOT = RateLimiter(rate=0.5, burst=5)
 
 _CACHE, _CLK = {}, threading.Lock()
 
 
 def cached(key, ttl, fn):
-    """[FIX-19] كاش زمني قصير لتخفيف الضغط على القاعدة."""
     now = time.time()
     with _CLK:
         hit = _CACHE.get(key)
@@ -227,7 +250,6 @@ def cached(key, ttl, fn):
 
 
 def supervise(name, fn):
-    """[FIX-15] تشغيل خيط وإعادة تشغيله تلقائياً إن انهار."""
     def run():
         while not STOP.is_set():
             try:
@@ -269,19 +291,20 @@ class Chain:
         self.load()
 
     def load(self):
-        """تحميل حالة السلسلة من القاعدة (يُستخدم أيضاً لإعادة المزامنة بعد خطأ)."""
         with LOCK:
-            r = DB.execute("SELECT * FROM blocks ORDER BY idx DESC LIMIT 1").fetchone()
+            r = DB.execute(f"SELECT * FROM {B} ORDER BY idx DESC LIMIT 1").fetchone()
             if r is None:
                 pre = block_prefix(0, GENESIS_PREV, 1760000000, "genesis", 0.0, 1)
                 nonce = 0
                 while int(block_hash(pre, nonce), 16) >= target_for(1):
                     nonce += 1
-                DB.execute("INSERT OR IGNORE INTO blocks VALUES(0,?,?,?,?,?,?,?,?,?)",
+                DB.execute(f"INSERT INTO {B}(idx,prev,ts,miner_id,miner_name,reward,bits,nonce,hash,found_at) "
+                           "VALUES(0,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                            (GENESIS_PREV, 1760000000, "genesis", "Genesis", 0.0, 1, nonce,
                             block_hash(pre, nonce), time.time()))
                 DB.commit()
-                r = DB.execute("SELECT * FROM blocks ORDER BY idx DESC LIMIT 1").fetchone()
+                r = DB.execute(f"SELECT * FROM {B} ORDER BY idx DESC LIMIT 1").fetchone()
+            DB.commit()
             self.height = r["idx"]
             self.prev = r["hash"]
             self.bits = r["bits"] if r["idx"] > 0 else START_BITS
@@ -296,7 +319,6 @@ class Chain:
         return block_prefix(i, self.prev, self.tpl_ts, miner_id, reward_for(i), self.bits)
 
     def accept(self, miner_id, miner_name, nonce):
-        """تحقق من الحل ثم أضف البلوك. [FIX-14] أي خطأ قاعدة → تراجع وإعادة مزامنة."""
         i = self.next_idx()
         rw = reward_for(i)
         pre = block_prefix(i, self.prev, self.tpl_ts, miner_id, rw, self.bits)
@@ -305,17 +327,15 @@ class Chain:
             return False
         now = time.time()
         try:
-            DB.execute("INSERT INTO blocks VALUES(?,?,?,?,?,?,?,?,?,?)",
+            DB.execute(f"INSERT INTO {B}(idx,prev,ts,miner_id,miner_name,reward,bits,nonce,hash,found_at) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
                        (i, self.prev, self.tpl_ts, miner_id, miner_name, rw, self.bits, nonce, h, now))
-            DB.execute("UPDATE users SET balance=ROUND(balance+?,8), xp=xp+50, blocks_found=blocks_found+1 WHERE id=?",
+            DB.execute(f"UPDATE {U} SET balance={ADD_BAL}, xp=xp+50, blocks_found=blocks_found+1 WHERE id=?",
                        (rw, miner_id))
             DB.commit()
-        except sqlite3.Error as ex:
+        except psycopg2.Error as ex:
             print("accept failed, resync:", ex)
-            try:
-                DB.rollback()
-            except sqlite3.Error:
-                pass
+            DB.rollback()
             self.load()
             return False
         interval = max(0.0, now - self.last_found)
@@ -328,11 +348,11 @@ class Chain:
         return True
 
     def verify(self):
-        """التحقق من كل السلسلة على دفعات (لا يحجب القاعدة طويلاً)."""
         prev, last, count = GENESIS_PREV, -1, 0
         while True:
             with LOCK:
-                rows = DB.execute("SELECT * FROM blocks WHERE idx>? ORDER BY idx LIMIT 2000", (last,)).fetchall()
+                rows = DB.execute(f"SELECT * FROM {B} WHERE idx>? ORDER BY idx LIMIT 2000", (last,)).fetchall()
+                DB.commit()
             if not rows:
                 break
             for r in rows:
@@ -378,35 +398,38 @@ def user_hashrate(u):
 
 
 def get_user(uid, name=None, referrer=None):
-    name = clean_name(name, f"User{uid[-4:]}") if name else None
+    """uid هو المعرّف الكامل (hash.123456)."""
+    raw = raw_of(uid)
+    name = clean_name(name, f"User{raw[-4:]}") if name else None
     with LOCK:
-        u = DB.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (uid,)).fetchone()
         if not u:
             now = time.time()
-            DB.execute("INSERT OR IGNORE INTO users(id,name,energy,last_ts,created) VALUES(?,?,?,?,?)",
-                       (uid, name or f"User{uid[-4:]}", MAX_ENERGY, now, now))
-            # [FIX-11] الإحالة: مستخدمو تيليجرام فقط، لا إحالة ذاتية، سقف لكل مُحيل
+            DB.execute(f"INSERT INTO {U}(id,tg_id,name,energy,last_ts,created) VALUES(?,?,?,?,?,?) "
+                       "ON CONFLICT (id) DO NOTHING",
+                       (uid, raw, name or f"User{raw[-4:]}", MAX_ENERGY, now, now))
             ref = str(referrer or "")
-            if uid.isdigit() and REF_RE.match(ref) and ref != uid:
-                r = DB.execute("SELECT id FROM users WHERE id=?", (ref,)).fetchone()
-                n = DB.execute("SELECT COUNT(*) c FROM users WHERE referrer=?", (ref,)).fetchone()["c"]
+            if raw.isdigit() and REF_RE.match(ref) and ref != raw:
+                rk = K(ref)
+                r = DB.execute(f"SELECT id FROM {U} WHERE id=?", (rk,)).fetchone()
+                n = DB.execute(f"SELECT COUNT(*) AS c FROM {U} WHERE referrer=?", (rk,)).fetchone()["c"]
                 if r and n < MAX_REFS:
-                    DB.execute("UPDATE users SET referrer=?, balance=ROUND(balance+?,8) WHERE id=? AND referrer IS NULL",
-                               (ref, REF_BONUS, uid))
-                    DB.execute("UPDATE users SET balance=ROUND(balance+?,8) WHERE id=?", (REF_BONUS, ref))
+                    DB.execute(f"UPDATE {U} SET referrer=?, balance={ADD_BAL} WHERE id=? AND referrer IS NULL",
+                               (rk, REF_BONUS, uid))
+                    DB.execute(f"UPDATE {U} SET balance={ADD_BAL} WHERE id=?", (REF_BONUS, rk))
             DB.commit()
         elif name and u["name"] != name:
-            DB.execute("UPDATE users SET name=? WHERE id=?", (name, uid))
+            DB.execute(f"UPDATE {U} SET name=? WHERE id=?", (name, uid))
             DB.commit()
         return settle(uid)
 
 
 def settle(uid, now=None):
-    """تحديث الطاقة حسب الزمن. [FIX-12] حماية من رجوع الساعة للخلف وقيم NaN."""
     now = now or time.time()
     with LOCK:
-        u = DB.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (uid,)).fetchone()
         if u is None:
+            DB.commit()
             return None
         last = u["last_ts"] or now
         dt = now - last
@@ -422,19 +445,20 @@ def settle(uid, now=None):
         e = max(0.0, min(float(MAX_ENERGY), e))
         if mining and e <= 0:
             mining = 0
-        DB.execute("UPDATE users SET energy=?, mining=?, last_ts=? WHERE id=?", (e, mining, now, uid))
+        row = DB.execute(f"UPDATE {U} SET energy=?, mining=?, last_ts=? WHERE id=? RETURNING *",
+                         (e, mining, now, uid)).fetchone()
         DB.commit()
-        return DB.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        return row
 
 
 # ───────────────────────── المعدّن (خيط خلفي) ─────────────────────────
 def miner_tick():
-    """[FIX-13] دورة تعدين بميزانية زمنية حتى لا تحجب الـ API."""
     deadline = time.time() + TICK_BUDGET
     with LOCK:
-        rows = DB.execute("SELECT id FROM users WHERE mining=1").fetchall()
+        rows = DB.execute(f"SELECT id FROM {U} WHERE mining=1").fetchall()
         users = [x for x in (settle(r["id"]) for r in rows) if x and x["mining"]]
         if not users:
+            DB.commit()
             return
         random.shuffle(users)
         tgt = target_for(CHAIN.bits)
@@ -457,7 +481,7 @@ def miner_tick():
                     if CHAIN.accept(u["id"], u["name"], nonce):
                         found = True
                     break
-            DB.execute("UPDATE users SET hashes=hashes+?, xp=xp+? WHERE id=?", (done, done / 800.0, u["id"]))
+            DB.execute(f"UPDATE {U} SET hashes=hashes+?, xp=xp+? WHERE id=?", (done, done / 800.0, u["id"]))
             if found:
                 break
         DB.commit()
@@ -470,17 +494,13 @@ def miner_loop():
             miner_tick()
         except Exception as ex:
             print("miner error:", repr(ex))
-            try:
-                with LOCK:
-                    DB.rollback()
-            except Exception:
-                pass
+            with LOCK:
+                DB.rollback()
         STOP.wait(max(0.0, 1.0 - (time.time() - t0)))
 
 
 # ───────────────────────── واجهة API ─────────────────────────
 def check_init_data(init_data):
-    """[FIX-10] التحقق الصارم من توقيع تيليجرام Mini App."""
     if not BOT_TOKEN or not init_data or len(init_data) > 4096:
         return None
     try:
@@ -510,13 +530,15 @@ BOT_USERNAME = ""
 
 def state_for(u):
     lvl, xp_in = level_of(u["xp"])
+    raw = raw_of(u["id"])
     with LOCK:
-        online = DB.execute("SELECT xp, mode FROM users WHERE mining=1").fetchall()   # [FIX-19] بدون N+1
+        online = DB.execute(f"SELECT xp, mode FROM {U} WHERE mining=1").fetchall()
         net = sum(hashrate_of(r["xp"], r["mode"]) for r in online)
-        refs = DB.execute("SELECT COUNT(*) c FROM users WHERE referrer=?", (u["id"],)).fetchone()["c"]
-        supply = DB.execute("SELECT COALESCE(SUM(reward),0) s FROM blocks").fetchone()["s"]
-        users_total = DB.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-        rank = DB.execute("SELECT COUNT(*)+1 c FROM users WHERE balance>?", (u["balance"],)).fetchone()["c"]
+        refs = DB.execute(f"SELECT COUNT(*) AS c FROM {U} WHERE referrer=?", (u["id"],)).fetchone()["c"]
+        supply = DB.execute(f"SELECT COALESCE(SUM(reward),0) AS s FROM {B}").fetchone()["s"]
+        users_total = DB.execute(f"SELECT COUNT(*) AS c FROM {U}").fetchone()["c"]
+        rank = DB.execute(f"SELECT COUNT(*)+1 AS c FROM {U} WHERE balance>?", (u["balance"],)).fetchone()["c"]
+        DB.commit()
     nxt = CHAIN.next_idx()
     return {
         "id": u["id"], "name": u["name"], "coin": COIN,
@@ -524,7 +546,7 @@ def state_for(u):
         "energy": u["energy"], "max_energy": MAX_ENERGY, "regen": int(ENERGY_REGEN * 60),
         "mining": bool(u["mining"]), "mode": u["mode"], "hashrate": user_hashrate(u),
         "hashes": u["hashes"], "blocks_found": u["blocks_found"], "refs": refs, "rank": rank,
-        "ref_link": (f"https://t.me/{BOT_USERNAME}?start=ref_{u['id']}" if BOT_USERNAME and u["id"].isdigit() else ""),
+        "ref_link": (f"https://t.me/{BOT_USERNAME}?start=ref_{raw}" if BOT_USERNAME and raw.isdigit() else ""),
         "refill_in": max(0, int(u["last_refill"] + REFILL_COOLDOWN - time.time())),
         "net": {"height": CHAIN.height, "bits": CHAIN.bits, "difficulty": 2 ** CHAIN.bits,
                 "hashrate": net, "miners": len(online), "reward": reward_for(nxt),
@@ -535,8 +557,9 @@ def state_for(u):
 
 def recent_blocks(limit=25):
     with LOCK:
-        rows = DB.execute("SELECT b.*, COALESCE(u.xp,0) xp FROM blocks b LEFT JOIN users u ON u.id=b.miner_id "
-                          "ORDER BY idx DESC LIMIT ?", (limit,)).fetchall()
+        rows = DB.execute(f"SELECT b.*, COALESCE(u.xp,0) AS xp FROM {B} b LEFT JOIN {U} u ON u.id=b.miner_id "
+                          "ORDER BY b.idx DESC LIMIT ?", (limit,)).fetchall()
+        DB.commit()
     return [{"idx": r["idx"], "hash": r["hash"], "miner": clean_name(r["miner_name"]), "reward": r["reward"],
              "level": level_of(r["xp"])[0],
              "time": time.strftime("%d.%m.%Y, %H:%M:%S", time.localtime(r["found_at"])),
@@ -545,27 +568,27 @@ def recent_blocks(limit=25):
 
 def leaderboard(limit=100):
     with LOCK:
-        rows = DB.execute("SELECT name,balance,blocks_found,xp,mode FROM users ORDER BY balance DESC LIMIT ?",
+        rows = DB.execute(f"SELECT name,balance,blocks_found,xp,mode FROM {U} ORDER BY balance DESC LIMIT ?",
                           (limit,)).fetchall()
+        DB.commit()
     return [{"name": clean_name(r["name"]), "balance": r["balance"], "blocks": r["blocks_found"],
              "level": level_of(r["xp"])[0], "mode": r["mode"]} for r in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HashChain/1.1"
-    timeout = 15            # [FIX-18] مهلة للاتصال (يحمي من الاتصالات البطيئة/المعلّقة)
+    server_version = "HashChain/1.2"
+    timeout = 15
 
     def log_message(self, *a):
         pass
 
-    # ---- مساعدات ----
     def _send(self, code, body, ctype="application/json; charset=utf-8", head=False):
         data = body if isinstance(body, bytes) else body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")          # [FIX-5]
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         if not head:
@@ -588,22 +611,23 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(429, "rate")
 
     def _auth(self):
+        """يرجع (المعرّف الكامل، الاسم) مثل ('hash.123456', '@name')."""
         t = check_init_data(self.headers.get("X-Init-Data", ""))
         if t:
-            return t
+            return K(t[0]), t[1]
         if ALLOW_GUEST:
             g = self.headers.get("X-Guest-Id", "")
             if GUEST_RE.match(g):
-                uid = "g" + g
+                uid = K("g" + g)
                 with LOCK:
-                    known = DB.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone()
-                if not known and not RL_GUEST_NEW.allow(self._ip()):      # [FIX-8]
+                    known = DB.execute(f"SELECT 1 AS x FROM {U} WHERE id=?", (uid,)).fetchone()
+                    DB.commit()
+                if not known and not RL_GUEST_NEW.allow(self._ip()):
                     raise ApiError(429, "rate")
                 return uid, "Guest" + g[:4]
         raise ApiError(401, "auth")
 
     def _read_body(self):
-        """[FIX-6] حد أقصى للحجم + JSON آمن."""
         try:
             ln = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -620,7 +644,6 @@ class Handler(BaseHTTPRequestHandler):
         return obj if isinstance(obj, dict) else {}
 
     def _dispatch(self, fn):
-        """[FIX-5] أي استثناء يتحول إلى استجابة خطأ ولا يُسقط الخادم."""
         try:
             fn()
         except ApiError as e:
@@ -629,7 +652,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         except OSError:
-            pass                      # العميل قطع الاتصال
+            pass
         except Exception as ex:
             print("handler error:", repr(ex))
             try:
@@ -637,7 +660,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # ---- الطرق ----
     def do_GET(self):
         self._dispatch(self._get)
 
@@ -688,9 +710,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/start":
                 if u["energy"] < 5:
                     raise ApiError(400, "no_energy")
-                DB.execute("UPDATE users SET mining=1 WHERE id=?", (uid,))
+                DB.execute(f"UPDATE {U} SET mining=1 WHERE id=?", (uid,))
             elif path == "/api/stop":
-                DB.execute("UPDATE users SET mining=0 WHERE id=?", (uid,))
+                DB.execute(f"UPDATE {U} SET mining=0 WHERE id=?", (uid,))
             elif path == "/api/mode":
                 try:
                     m = int(body.get("mode", 1))
@@ -698,11 +720,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "bad_mode")
                 if m not in (1, 2, 3):
                     raise ApiError(400, "bad_mode")
-                DB.execute("UPDATE users SET mode=? WHERE id=?", (m, uid))
+                DB.execute(f"UPDATE {U} SET mode=? WHERE id=?", (m, uid))
             elif path == "/api/refill":
                 if time.time() - u["last_refill"] < REFILL_COOLDOWN:
                     raise ApiError(400, "cooldown")
-                DB.execute("UPDATE users SET energy=MIN(?,energy+?), last_refill=? WHERE id=?",
+                DB.execute(f"UPDATE {U} SET energy=LEAST(?,energy+?), last_refill=? WHERE id=?",
                            (MAX_ENERGY, REFILL_AMOUNT, time.time(), uid))
             else:
                 return self._send(404, "not found", "text/plain")
@@ -718,7 +740,6 @@ class TgError(Exception):
 
 
 def tg(method, _timeout=60, **params):
-    """[FIX-16] نداء Telegram API مع تحويل أخطاء HTTP إلى TgError."""
     req = urllib.request.Request(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
                                  data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -734,7 +755,6 @@ def tg(method, _timeout=60, **params):
 
 
 def send(chat, text, kb=None):
-    """إرسال رسالة بدون أن يوقف فشلها (مثل حظر المستخدم للبوت) الحلقة."""
     try:
         p = {"chat_id": chat, "text": text}
         if kb:
@@ -747,8 +767,68 @@ def send(chat, text, kb=None):
         print("send failed:", repr(ex))
 
 
+# ---- أوامر الأدمن ----
+ADMIN_COMMANDS = [
+    {"command": "admin", "description": "أوامر الأدمن"},
+    {"command": "setblocks", "description": "تحديد عدد بلوكات مستخدم: id عدد"},
+    {"command": "addblocks", "description": "زيادة/إنقاص بلوكات مستخدم: id عدد"},
+    {"command": "userinfo", "description": "معلومات مستخدم: id"},
+]
+ADMIN_HELP = ("🛠 أوامر الأدمن:\n"
+              "/setblocks <id> <n> — تحديد عدد بلوكات المستخدم\n"
+              "/addblocks <id> <n> — زيادة أو إنقاص (مثال: -3)\n"
+              "/userinfo <id> — معلومات المستخدم\n\n"
+              f"<id> رقم تيليجرام (123456) أو المعرّف الكامل ({ID_PREFIX}.123456)")
+
+
+def resolve_key(arg):
+    arg = (arg or "").strip()
+    if "." in arg:
+        return arg if arg.split(".", 1)[0] == ID_PREFIX and re.fullmatch(r"[A-Za-z0-9_.-]{3,80}", arg) else None
+    return K(arg) if re.fullmatch(r"[A-Za-z0-9]{1,40}", arg) else None
+
+
+def admin_cmd(cmd, args, cid):
+    if cmd == "/admin":
+        return send(cid, ADMIN_HELP)
+    if cmd in ("/setblocks", "/addblocks"):
+        if len(args) != 2:
+            return send(cid, f"الصيغة: {cmd} <id> <n>")
+        key = resolve_key(args[0])
+        try:
+            n = int(args[1])
+        except ValueError:
+            return send(cid, "العدد يجب أن يكون رقماً صحيحاً.")
+        if not key:
+            return send(cid, "معرّف غير صالح.")
+        with LOCK:
+            u = DB.execute(f"SELECT blocks_found FROM {U} WHERE id=?", (key,)).fetchone()
+            if not u:
+                DB.commit()
+                return send(cid, f"المستخدم {key} غير موجود.")
+            old = u["blocks_found"]
+            new = n if cmd == "/setblocks" else old + n
+            new = max(0, min(new, MAX_BLOCKS_VALUE))
+            DB.execute(f"UPDATE {U} SET blocks_found=? WHERE id=?", (new, key))
+            DB.commit()
+        _CACHE.clear()
+        return send(cid, f"✅ {key}\nعدد البلوكات: {old} ← {new}")
+    if cmd == "/userinfo":
+        key = resolve_key(args[0]) if args else None
+        if not key:
+            return send(cid, "الصيغة: /userinfo <id>")
+        with LOCK:
+            u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (key,)).fetchone()
+            DB.commit()
+        if not u:
+            return send(cid, f"المستخدم {key} غير موجود.")
+        lvl, _ = level_of(u["xp"])
+        return send(cid, f"👤 {u['name']} ({key})\n💰 {u['balance']:.4f} {COIN}\n"
+                         f"⛏ بلوكات: {u['blocks_found']}\n🎚 مستوى: {lvl}\n"
+                         f"⚡ طاقة: {int(u['energy'])}\n#️⃣ هاشات: {u['hashes']}")
+
+
 def handle_update(upd):
-    """[FIX-17] معالجة تحديث واحد بصرامة (حقول ناقصة، @bot، مجموعات)."""
     m = upd.get("message")
     if not isinstance(m, dict):
         return
@@ -756,16 +836,19 @@ def handle_update(upd):
     text = (m.get("text") or "").strip()
     if not text or "id" not in frm or "id" not in chat or frm.get("is_bot"):
         return
-    uid = str(frm["id"])
+    raw = str(frm["id"])
+    uid = K(raw)
     name = clean_name(("@" + frm["username"]) if frm.get("username") else frm.get("first_name"), "User")
     cid, private = chat["id"], chat.get("type") == "private"
-    cmd = text.split()[0].split("@")[0].lower()
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lower()
     if not cmd.startswith("/"):
         return
     if not RL_BOT.allow(uid):
         return
+    if raw in ADMIN_IDS and cmd in ("/admin", "/setblocks", "/addblocks", "/userinfo"):
+        return admin_cmd(cmd, parts[1:], cid)
     if cmd == "/start":
-        parts = text.split()
         ref = parts[1][4:] if len(parts) > 1 and parts[1].startswith("ref_") else None
         get_user(uid, name, ref)
         kb = {"inline_keyboard": [[{"text": "⛏ ابدأ التعدين", "web_app": {"url": WEB_APP_URL}}]]} \
@@ -785,16 +868,23 @@ def handle_update(upd):
 
 def bot_loop():
     global BOT_USERNAME
-    # تهيئة البوت تلقائياً مع إعادة المحاولة
     while not STOP.is_set():
         try:
             BOT_USERNAME = tg("getMe")["result"]["username"]
-            tg("deleteWebhook", drop_pending_updates=False)   # لازم لعمل getUpdates
-            tg("setMyCommands", commands=[
+            tg("deleteWebhook", drop_pending_updates=False)
+            user_cmds = [
                 {"command": "start", "description": "فتح تطبيق التعدين"},
                 {"command": "balance", "description": "رصيدك"},
                 {"command": "top", "description": "أفضل المعدّنين"},
-                {"command": "chain", "description": "حالة السلسلة"}])
+                {"command": "chain", "description": "حالة السلسلة"}]
+            tg("setMyCommands", commands=user_cmds)
+            # قائمة "/" الخاصة بالأدمن: تظهر له فقط (في محادثته الخاصة مع البوت)
+            for a in ADMIN_IDS:
+                try:
+                    tg("setMyCommands", commands=user_cmds + ADMIN_COMMANDS,
+                       scope={"type": "chat", "chat_id": int(a)})
+                except TgError as e:
+                    print(f"admin commands for {a} not set ({e}) — يجب أن يضغط الأدمن /start مرة أولاً")
             if WEB_APP_URL.startswith("https"):
                 tg("setChatMenuButton", menu_button={"type": "web_app", "text": "⛏ تعدين",
                                                      "web_app": {"url": WEB_APP_URL}})
@@ -825,6 +915,8 @@ def bot_loop():
                     handle_update(upd)
                 except Exception as ex:
                     print("update error:", repr(ex))
+                    with LOCK:
+                        DB.rollback()
         except TgError as e:
             if e.code == 401:
                 print("!! BOT_TOKEN غير صالح (401): تم إيقاف البوت.")
@@ -1068,7 +1160,8 @@ INDEX_BYTES = INDEX_HTML.replace("__COIN__", COIN).encode("utf-8")
 
 # ───────────────────────── التشغيل ─────────────────────────
 def main():
-    global CHAIN
+    global CHAIN, DB
+    DB = open_db()
     init_db()
     CHAIN = Chain()
     supervise("miner", miner_loop)
@@ -1082,7 +1175,6 @@ def main():
     srv.request_queue_size = 64
 
     def _term(signum, frame):
-        # [FIX-18] Railway يرسل SIGTERM عند كل إعادة نشر: أغلق بنظافة
         print(f"signal {signum}: shutting down…")
         STOP.set()
         threading.Thread(target=srv.shutdown, daemon=True).start()
@@ -1090,7 +1182,7 @@ def main():
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
 
-    print(f"HashChain running on :{PORT} | db={DB_PATH} | height={CHAIN.height} bits={CHAIN.bits}")
+    print(f"HashChain running on :{PORT} | postgres ✓ | prefix={ID_PREFIX} | height={CHAIN.height} bits={CHAIN.bits}")
     try:
         srv.serve_forever(poll_interval=0.5)
     finally:
@@ -1099,10 +1191,9 @@ def main():
         with LOCK:
             try:
                 DB.commit()
-                DB.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                DB.close()
-            except Exception as ex:
-                print("db close:", ex)
+            except Exception:
+                pass
+            DB.close()
         print("bye.")
 
 
