@@ -1629,9 +1629,9 @@ async function load(){
   const r=await Promise.all(jobs);
   S=r[0];if(tab==='mine')B=r[1].blocks;if(tab==='top')TOP=r[1];if(tab==='refs')REFS=r[1].reftop;
   draw()}
-function go(t){TEST.stop=true;tab=t;sheet=null;load().catch(e=>toast(e.message))}
+function go(t){stopBench();tab=t;sheet=null;load().catch(e=>toast(e.message))}
 function openSheet(s){sheet=s;draw()}
-function closeSheet(){TEST.stop=true;sheet=null;draw()}
+function closeSheet(){stopBench();sheet=null;draw()}
 function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
 function redeem(){const c=$('cd').value.trim();if(!c)return;
   api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
@@ -1650,6 +1650,19 @@ const TEST_SECS=10;   /* مدة اختبار كل وضع بالثواني */
 const MC={1:['gauge','#8b9098'],2:['rocket','#38b6ff'],3:['zap','#ffb02e'],4:['flame','#3ecf8e'],5:['atom','#9b7bff'],6:['orbit','#ff4fa3'],7:['radiation','#ff5252'],8:['spark','#ffd23f']};
 let TEST={run:false,stop:false,cur:0,rate:0,el:0,res:{}};
 function saveRes(){}   /* النتائج لا تُحفظ: تبدأ فارغة في كل مرة يُفتح فيها التطبيق */
+/* الاختبار يعمل داخل Web Worker (خيط منفصل) حتى لا تعلق الواجهة */
+const WSRC=`onmessage=async e=>{const par=e.data.par,ms=e.data.ms,buf=new Uint8Array(32);crypto.getRandomValues(buf);const t0=performance.now();let n=0,last=0;
+while(true){const el=performance.now()-t0;if(el>=ms)break;const j=[];for(let i=0;i<par;i++){buf[0]=(n+i)&255;buf[1]=((n+i)>>8)&255;j.push(crypto.subtle.digest('SHA-256',buf))}await Promise.all(j);n+=par;if(el-last>200){last=el;postMessage({el:el,n:n})}}
+postMessage({el:performance.now()-t0,n:n,done:1})}`;
+function stopBench(){TEST.stop=true;if(TEST.w){TEST.w.terminate();TEST.w=null;if(TEST.wres)TEST.wres({stop:1})}}
+function benchOne(par){
+  return new Promise(res=>{
+    let w;try{w=new Worker(URL.createObjectURL(new Blob([WSRC],{type:'text/javascript'})))}catch(e){return res(null)}
+    TEST.w=w;TEST.wres=res;
+    w.onmessage=ev=>{const d=ev.data;TEST.el=d.el;TEST.rate=d.n/Math.max(.001,d.el/1000);uiModes();
+      if(d.done){w.terminate();TEST.w=null;res({n:d.n,el:d.el})}};
+    w.onerror=()=>{try{w.terminate()}catch(e){}TEST.w=null;res(null)};
+    w.postMessage({par:par,ms:TEST_SECS*1000})})}
 function mSub(k){
   if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H/s</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
   if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H/s</span>`;
@@ -1665,7 +1678,7 @@ function uiModes(){
   Object.keys(S.modes).forEach(k=>{const s=$('ms'+k),b=$('mb'+k);if(s)s.innerHTML=mSub(k);if(b)b.style.width=mBar(k)+'%'});
   const r=$('rb');if(r)r.innerHTML=runLbl()}
 async function runBench(){
-  if(TEST.run){TEST.stop=true;return}
+  if(TEST.run){stopBench();return}
   if(!window.crypto||!crypto.subtle)return toast('المتصفح لا يدعم WebCrypto');
   TEST.run=true;TEST.stop=false;TEST.res={};   /* كل اختبار جديد يبدأ بنتائج فارغة */
   const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b);
@@ -1674,17 +1687,10 @@ async function runBench(){
       if(TEST.stop)break;
       TEST.cur=k;TEST.rate=0;TEST.el=0;
       const par=Math.max(1,Math.round(S.modes[k].mul));   /* درجة التوازي = مضاعف الوضع */
-      const buf=new Uint8Array(32);crypto.getRandomValues(buf);
-      const t0=performance.now(),dur=TEST_SECS*1000;let n=0,lastUI=-999;
-      while(true){
-        const el=performance.now()-t0;
-        if(el>=dur||TEST.stop)break;
-        const jobs=[];
-        for(let i=0;i<par;i++){buf[0]=(n+i)&255;buf[1]=((n+i)>>8)&255;jobs.push(crypto.subtle.digest('SHA-256',buf))}
-        await Promise.all(jobs);n+=par;
-        if(el-lastUI>200){lastUI=el;TEST.el=el;TEST.rate=n/Math.max(.001,el/1000);uiModes()}
-      }
-      if(!TEST.stop){TEST.res[k]=n/Math.max(.001,(performance.now()-t0)/1000);saveRes()}
+      const r=await benchOne(par);
+      if(TEST.stop||(r&&r.stop))break;
+      if(!r){toast('المتصفح لا يدعم الاختبار');break}
+      TEST.res[k]=r.n/Math.max(.001,r.el/1000);saveRes()
       TEST.el=0;uiModes()}
   }catch(e){toast('تعذّر تنفيذ الاختبار')}
   TEST.run=false;TEST.cur=0;uiModes()}
