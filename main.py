@@ -89,10 +89,22 @@ DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM ل
 PATRON_SECS = 86400
 MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
 
-# أوضاع التعدين: مضاعف الهاش، مضاعف استهلاك الطاقة
-MODES = {1: dict(name="عادي", mul=1.0, cost=1.0),
-         2: dict(name="تيربو", mul=2.0, cost=2.5),
-         3: dict(name="نيترو", mul=4.0, cost=6.0)}
+# أوضاع التعدين:
+#   mul   = مضاعف الهاش
+#   cost  = مضاعف استهلاك الطاقة (عدّله لتوازن اللعبة)
+#   stars = سعر فتح الوضع بنجوم تيليجرام (0 = مفتوح مجاناً)
+MODES = {1: dict(name="عادي", mul=1.0, cost=1.0, stars=0),
+         2: dict(name="تيربو", mul=1.5, cost=2.0, stars=199),
+         3: dict(name="سوبر", mul=4.0, cost=5.0, stars=499),
+         4: dict(name="نيترو", mul=6.0, cost=8.0, stars=999),
+         5: dict(name="بلازما", mul=14.0, cost=18.0, stars=1499),
+         6: dict(name="كوازار", mul=20.0, cost=26.0, stars=2499),
+         7: dict(name="نجم نابض", mul=34.0, cost=44.0, stars=3999),
+         8: dict(name="التفرد", mul=40.0, cost=52.0, stars=6999)}
+for _k, _m in MODES.items():            # كل وضع مدفوع يصبح عنصراً في المتجر
+    if _m["stars"] > 0:
+        ITEMS[f"mode_{_k}"] = dict(stars=_m["stars"], title=f"وضع {_m['name']}",
+                                   desc=f"يفتح وضع التعدين {_m['name']} (×{_m['mul']:g} هاش).")
 
 # الخوادم: hr = زيادة الهاش، cost بنقاط HASH (0 = مكافأة فقط)، mins = مدة مؤقتة
 SERVERS = {
@@ -241,7 +253,8 @@ def init_db():
                          ("hashes", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("wins", "INT NOT NULL DEFAULT 0"),
                          ("income", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
-                         ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
+                         ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                         ("modes", "TEXT NOT NULL DEFAULT '1'")])
     add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
                 "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)",
@@ -322,8 +335,19 @@ def chain_info():
 
 
 # ═══════════ 3) منطق التعدين (يُحسب كسولاً عند كل طلب) ═══════════
+def unlocked(u):
+    """الأوضاع المفتوحة للمستخدم (الوضع 1 مفتوح دائماً)."""
+    return {int(x) for x in str(u.get("modes") or "1").split(",") if x.strip().isdigit()} | {1}
+
+
+def cur_mode(u):
+    """الوضع الفعّال: إن لم يكن مفتوحاً للمستخدم يُستخدم الوضع العادي."""
+    m = u.get("mode") or 1
+    return m if (m in MODES and m in unlocked(u)) else 1
+
+
 def mode_of(u):
-    return MODES.get(u.get("mode") or 1, MODES[1])
+    return MODES[cur_mode(u)]
 
 
 def hashrate(u):
@@ -402,11 +426,11 @@ def lock_user(cur, uid):
 
 def save_user(cur, u):
     cur.execute("""UPDATE m_users SET permit=?,level=?,xp=?,balance=?,total=?,energy=?,max_energy=?,
-        regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?
+        regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?,modes=?
         WHERE id=?""",
                 (u["permit"], u["level"], u["xp"], u["balance"], u["total"], u["energy"], u["max_energy"],
                  u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], u["mode"],
-                 hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["id"]))
+                 hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["modes"], u["id"]))
 
 
 def daily_info(u):
@@ -423,7 +447,8 @@ def state(u):
     return dict(permit=bool(u["permit"]), level=u["level"], xp=int(u["xp"]), xp_need=xp_need(u["level"]),
                 balance=u["balance"], energy=u["energy"], max_energy=u.get("xmax", u["max_energy"]), regen=u["regen"],
                 mining=bool(u["mining"]), hashrate=hr, rate=hr / EARN_DIV, cost=COST * m["cost"],
-                mode=u["mode"], hashes=u["hashes"], wins=u["wins"], income=u["income"],
+                mode=cur_mode(u), unlocked=sorted(unlocked(u)),
+                hashes=u["hashes"], wins=u["wins"], income=u["income"],
                 patron_left=max(0, int(u["patron"] - time.time())), srv=u["srv"], tier=tier(hr),
                 day_idx=streak % 7, daily_wait=wait)
 
@@ -448,6 +473,10 @@ def apply_payment(uid, key, charge, stars):
             u["energy"] = max(u["energy"], u.get("xmax", u["max_energy"]))
         elif key == "patron":
             u["patron"] = max(time.time(), u["patron"]) + PATRON_SECS
+        elif key.startswith("mode_"):
+            s = unlocked(u)
+            s.add(int(key[5:]))
+            u["modes"] = ",".join(map(str, sorted(s)))
         save_user(cur, u)
     return True
 
@@ -597,7 +626,7 @@ def act_me(tg, b):
     return dict(**state(u), refs=refs, online=a["n"], total_hr=a["h"], difficulty=a["h"] * 0.2,
                 block_reward=BLOCK_REWARD * (2 if u["patron"] > now else 1), next_block=last_block + 1,
                 ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_active=ref_active, daily=DAILY, dex=dex_info(), chain=chain_info(), servers=servers, temps=temps,
-                modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"]) for k, v in MODES.items()},
+                modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"], stars=v["stars"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
                 tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
                 channel=TASK_CHANNEL, prices={k: v["stars"] for k, v in ITEMS.items()})
@@ -632,6 +661,8 @@ def act_mode(tg, b):
         raise Err("وضع غير صحيح")
     with cursor() as cur:
         u = touch(cur, tg)
+        if m not in unlocked(u):
+            raise Err("افتح هذا الوضع أولاً")
         u["mode"] = m
         save_user(cur, u)
     return {}
@@ -803,6 +834,14 @@ async def act_invoice(tg, b):
                 return cur.fetchone()["permit"]
         if await asyncio.to_thread(has):
             raise Err("لديك تصريح بالفعل")
+    if key.startswith("mode_"):
+        def has_mode():
+            with cursor() as cur:
+                ensure_user(cur, tg["id"], tg["name"], tg["username"], tg["ref"])
+                cur.execute("SELECT modes FROM m_users WHERE id=?", (tg["id"],))
+                return int(key[5:]) in unlocked(cur.fetchone())
+        if await asyncio.to_thread(has_mode):
+            raise Err("هذا الوضع مفتوح لديك بالفعل")
     link = await MAIN_APP.bot.create_invoice_link(
         title=it["title"], description=it["desc"], payload=f"{key}:{tg['id']}", provider_token="",
         currency="XTR", prices=[LabeledPrice(it["title"], stars)])
@@ -957,6 +996,13 @@ def _mark_refunded(p):
             u["energy"] = min(u["energy"], u["max_energy"])
         elif k == "patron":
             u["patron"] = max(0, u["patron"] - PATRON_SECS)
+        elif k.startswith("mode_"):
+            mid = int(k[5:])
+            s = unlocked(u)
+            s.discard(mid)
+            u["modes"] = ",".join(map(str, sorted(s)))
+            if u["mode"] == mid:
+                u["mode"] = 1
         save_user(cur, u)
 
 
@@ -1443,6 +1489,35 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .em{display:flex;flex-direction:column;align-items:center;gap:15px;padding:38px 26px 42px;text-align:center;color:#8b9098;font-size:13px;line-height:1.65}
 .emi{width:38px;height:38px;border:1px solid #3a3d41;border-radius:9px;display:grid;place-items:center;background:#25282b;color:#9aa0a6}
 .rcn{color:#8b9098;display:grid;place-items:center}
+/* ── أوضاع التعدين ── */
+.grid.ctl{grid-template-columns:1.12fr 1fr;margin:0;gap:10px}
+.sbtn{display:flex;align-items:center;justify-content:center;gap:10px;margin:0;padding:8px 12px;min-height:52px}
+.pbx{width:34px;height:34px;border-radius:9px;background:#3b2a1a;color:#ffa861;display:grid;place-items:center;flex:none}
+.mdb{display:flex;align-items:center;gap:9px;margin:0;padding:8px 12px;min-height:52px;background:#2c2f32;border:1px solid #44484c;text-align:start}
+.mdi{width:34px;height:34px;border:1px solid #4a4e53;border-radius:9px;display:grid;place-items:center;color:var(--mut);flex:none}
+.mdt{flex:1;min-width:0;text-align:start}
+.mdt small{display:block;font:400 11px var(--mono);color:var(--mut);line-height:1.2}
+.mdt b{display:block;font:700 15px var(--disp);color:var(--tx);line-height:1.3}
+.mdx{font:700 11px var(--mono);color:var(--mut);align-self:flex-start;direction:ltr}
+.mdb>svg{color:var(--mut);flex:none}
+.runb{display:flex;align-items:center;justify-content:center;gap:8px;background:#4a3320;color:#ffd9b8;border:1px solid #6e4c32}
+.ov.mid{align-items:center;padding:14px}
+.shw{position:relative;width:100%;max-width:560px}
+.ov.mid .sh{border-radius:20px;max-height:86vh;padding:46px 14px 16px}
+.xb{position:absolute;top:10px;right:10px;z-index:3;width:34px;height:34px;margin:0;padding:0;display:grid;place-items:center;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--mut)}
+.mc{position:relative;display:flex;align-items:center;gap:12px;padding:14px 12px;margin-top:10px;border:1px solid var(--line);border-radius:14px;background:#25282b;overflow:hidden;cursor:pointer}
+.mc.act{border-color:#b9702f;background:#3a342f}
+.mi{width:42px;height:42px;border:1px solid var(--mc);border-radius:10px;display:grid;place-items:center;color:var(--mc);background:color-mix(in srgb,var(--mc) 12%,transparent);flex:none}
+.mt{flex:1;min-width:0}.mt b{font:700 15px var(--disp);color:#f4f4f4}
+.mt em{font:700 11px var(--mono);color:var(--mc);font-style:normal;margin-inline-start:6px;direction:ltr;display:inline-block}
+.ms{font:400 11.5px var(--mono);color:var(--mut);margin-top:3px}
+.ms .lt{direction:ltr;display:inline-block}
+.mbtn{display:flex;align-items:center;gap:5px;flex:none;padding:6px 12px;border-radius:9px;font:700 12px var(--mono);direction:ltr}
+.mbtn.pr{background:#ffa861;color:#1e1307}
+.mbtn.on{border:1px solid #4a4e53;color:#c3c6c9}
+.mbtn.ok{border:1px solid var(--line);color:var(--tx)}
+.mbar{position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--mc);transition:width .25s linear}
+.mnote{font-size:11.5px;line-height:1.7;color:var(--mut);margin:14px 2px 0}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1549,9 +1624,9 @@ async function load(){
   const r=await Promise.all(jobs);
   S=r[0];if(tab==='mine')B=r[1].blocks;if(tab==='top')TOP=r[1];if(tab==='refs')REFS=r[1].reftop;
   draw()}
-function go(t){tab=t;sheet=null;load().catch(e=>toast(e.message))}
+function go(t){TEST.stop=true;tab=t;sheet=null;load().catch(e=>toast(e.message))}
 function openSheet(s){sheet=s;draw()}
-function closeSheet(){sheet=null;draw()}
+function closeSheet(){TEST.stop=true;sheet=null;draw()}
 function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
 function redeem(){const c=$('cd').value.trim();if(!c)return;
   api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
@@ -1564,6 +1639,61 @@ function donate(){const n=parseInt($('sp').value);if(!n||n<1)return toast('أد�
 function fmtDate(t){return new Date(t*1000).toLocaleString('en-GB',{hour12:false}).replace(',','')}
 function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
 function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
+
+/* ═══ أوضاع التعدين + اختبار السرعة ═══ */
+const TEST_SECS=30;   /* مدة اختبار كل وضع بالثواني */
+const MC={1:['gauge','#8b9098'],2:['rocket','#38b6ff'],3:['zap','#ffb02e'],4:['flame','#3ecf8e'],5:['atom','#9b7bff'],6:['orbit','#ff4fa3'],7:['radiation','#ff5252'],8:['spark','#ffd23f']};
+let TEST={run:false,stop:false,cur:0,rate:0,el:0,res:{}};
+try{TEST.res=JSON.parse(localStorage.getItem('th_bench')||'{}')||{}}catch(e){}
+function saveRes(){try{localStorage.setItem('th_bench',JSON.stringify(TEST.res))}catch(e){}}
+function mSub(k){
+  if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H/s</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
+  if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H/s</span>`;
+  return 'شغّل الاختبار'}
+function mBar(k){
+  if(TEST.run&&TEST.cur==k)return Math.min(100,TEST.el/(TEST_SECS*1000)*100);
+  return TEST.res[k]!=null?100:0}
+function runLbl(){return TEST.run?ic('stop',14)+'إيقاف الاختبار':ic('play',14)+'اختبار السرعة'}
+function uiModes(){
+  if(sheet!=='modes'||!S)return;
+  Object.keys(S.modes).forEach(k=>{const s=$('ms'+k),b=$('mb'+k);if(s)s.innerHTML=mSub(k);if(b)b.style.width=mBar(k)+'%'});
+  const r=$('rb');if(r)r.innerHTML=runLbl()}
+async function runBench(){
+  if(TEST.run){TEST.stop=true;return}
+  if(!window.crypto||!crypto.subtle)return toast('المتصفح لا يدعم WebCrypto');
+  TEST.run=true;TEST.stop=false;
+  const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b);
+  try{
+    for(const k of ks){
+      if(TEST.stop)break;
+      TEST.cur=k;TEST.rate=0;TEST.el=0;
+      const par=Math.max(1,Math.round(S.modes[k].mul));   /* درجة التوازي = مضاعف الوضع */
+      const buf=new Uint8Array(32);crypto.getRandomValues(buf);
+      const t0=performance.now(),dur=TEST_SECS*1000;let n=0,lastUI=-999;
+      while(true){
+        const el=performance.now()-t0;
+        if(el>=dur||TEST.stop)break;
+        const jobs=[];
+        for(let i=0;i<par;i++){buf[0]=(n+i)&255;buf[1]=((n+i)>>8)&255;jobs.push(crypto.subtle.digest('SHA-256',buf))}
+        await Promise.all(jobs);n+=par;
+        if(el-lastUI>200){lastUI=el;TEST.el=el;TEST.rate=n/Math.max(.001,el/1000);uiModes()}
+      }
+      if(!TEST.stop){TEST.res[k]=n/Math.max(.001,(performance.now()-t0)/1000);saveRes()}
+      TEST.el=0;uiModes()}
+  }catch(e){toast('تعذّر تنفيذ الاختبار')}
+  TEST.run=false;TEST.cur=0;uiModes()}
+function modeClick(k){
+  if(S.unlocked.includes(+k)){if(S.mode!=k)act('mode',{mode:+k})}
+  else buy('mode_'+k)}
+function modeCard(k){
+  const m=S.modes[k],c=MC[k]||MC[1],un=S.unlocked.includes(+k),on=S.mode==k;
+  const btn=on?`<span class="mbtn on">${ic('check',13)}نشط</span>`:
+    un?`<span class="mbtn ok">اختر</span>`:
+    `<span class="mbtn pr">${ic('lock',13)}${m.stars}${ic('star',13)}</span>`;
+  return `<div class="mc ${on?'act':''}" style="--mc:${c[1]}" onclick="modeClick(${k})">
+    <span class="mi">${ic(c[0],21)}</span>
+    <div class="mt"><b>${esc(m.name)}</b><em>×${m.mul}</em><div class="ms" id="ms${k}">${mSub(k)}</div></div>${btn}
+    <i class="mbar" id="mb${k}" style="width:${mBar(k)}%"></i></div>`}
 
 function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN VAULT</div>
   <div class="row" style="margin-top:6px"><span>إجمالي الرصيد · HASH</span>${badge(S.tier)}</div>
@@ -1595,16 +1725,16 @@ function vMine(){
     h+=`<div class="card"><h2>🔑 تصريح التعدين</h2><p class="h">لبدء التعدين تحتاج تصريحاً بدفعة واحدة.<br>النقاط افتراضية داخل اللعبة.</p>
     <button class="pri" onclick="buy('permit')">⭐ ادفع ${S.prices.permit} نجمة</button></div>`;
   }else{
-    const m=S.modes[S.mode],nx=S.mode%3+1;
+    const m=S.modes[S.mode],mc=MC[S.mode]||MC[1];
     h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">⛏ تعدين</b>${S.mining?'<span class="live">قيد التشغيل</span>':'<span class="off">متوقف</span>'}</div>
     <div class="grid" style="margin:12px 0 0"><div class="cell"><span class="h">معدل الهاش</span><b>${fk(S.hashrate)} H/s</b></div>
     <div class="cell"><span class="h">هاش</span><b id="hs">${fk(S.hashes)}</b></div>
     <div class="cell"><span class="h">أسهم</span><b>${fi(S.wins)}</b></div>
     <div class="cell"><span class="h">الدخل</span><b>${f(S.income,1)} #</b></div></div>
-    <div class="grid" style="margin:0">${S.mining?'<button class="stop" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
-      '<button class="pri" '+((S.chain.started&&!S.chain.done)?'':'disabled ')+'onclick="act(\'mining\',{on:true})">▶ بدء التعدين</button>'}
-    <button onclick="act('mode',{mode:${nx}})">الوضع: ${m.name} ×${m.mul}<br><small class="h">طاقة ×${m.cost}/ث</small></button></div>
-    <button onclick="openSheet('servers')">🖥 مركز إدارة الخوادم</button></div>`;
+    <div class="grid ctl" style="margin-top:0">${S.mining?'<button class="stop sbtn" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
+      '<button class="pri sbtn" '+((S.chain.started&&!S.chain.done)?'':'disabled ')+'onclick="act(\'mining\',{on:true})"><span class="pbx">'+ic('play',16)+'</span>بدء التعدين</button>'}
+    <button class="mdb" onclick="openSheet('modes')"><span class="mdi">${ic(mc[0],18)}</span><span class="mdt"><small>الوضع</small><b>${esc(m.name)}</b></span><span class="mdx">×${m.mul}</span>${ic('sliders',17)}</button></div>
+    <button class="runb" onclick="openSheet('servers')">${ic('server',16)}مركز إدارة الخوادم</button></div>`;
   }
   h+=`<div class="card"><h3>آخر 25 كتلة</h3>`+(B.length?B.map(b=>`<div class="blk"><div class="row" style="color:var(--tx)"><b>كتلة <span class="tag">#${fi(b.id)}</span></b><span class="tag">+${f(b.reward,1)} #</span></div>
   <div style="margin-top:4px">${av(b.miner)} <b>${esc(b.miner)}</b> <span class="h">مستوى ${b.level} · ${fi(b.miners)} معدّن</span></div>
@@ -1647,6 +1777,21 @@ const ICO={trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline poi
 Object.assign(ICO,{copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
  send:'<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>',
  spark:'<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>'});
+Object.assign(ICO,{
+ gauge:'<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+ zap:'<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+ flame:'<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
+ atom:'<circle cx="12" cy="12" r="1"/><path d="M20.2 20.2c2.04-2.03.02-7.36-4.5-11.9-4.54-4.52-9.87-6.54-11.9-4.5-2.04 2.03-.02 7.36 4.5 11.9 4.54 4.52 9.87 6.54 11.9 4.5Z"/><path d="M15.7 15.7c4.52-4.54 6.54-9.87 4.5-11.9-2.03-2.04-7.36-.02-11.9 4.5-4.52 4.54-6.54 9.87-4.5 11.9 2.03 2.04 7.36.02 11.9-4.5Z"/>',
+ orbit:'<circle cx="12" cy="12" r="3"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><path d="M10.4 21.9a10 10 0 0 0 9.941-15.416"/><path d="M13.5 2.1a10 10 0 0 0-9.841 15.416"/>',
+ radiation:'<path d="M12 12h.01"/><path d="M7.5 4.2c-.3-.5-.9-.7-1.3-.4C3.9 5.5 2.3 8.1 2 11c-.1.5.4 1 1 1h5c0-1.5.8-2.8 2-3.4-1.1-1.9-2-3.5-2.5-4.4z"/><path d="M21 12.1c.6 0 1.1-.5 1-1-.3-2.9-1.8-5.5-4.1-7.1-.4-.3-1.1-.2-1.3.3-.6.9-1.5 2.5-2.6 4.3 1.2.7 2 2 2 3.5h5z"/><path d="M7.5 19.8c-.3.5-.1 1.1.4 1.3 2.6 1.2 5.6 1.2 8.2 0 .5-.2.7-.8.4-1.3-.5-.9-1.4-2.5-2.5-4.3-1.2.7-2.8.7-4 0-1.1 1.8-2 3.4-2.5 4.3z"/>',
+ lock:'<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+ star:'<path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z" fill="currentColor"/>',
+ check:'<path d="M20 6 9 17l-5-5"/>',
+ play:'<polygon points="6 3 20 12 6 21 6 3"/>',
+ stop:'<rect width="14" height="14" x="5" y="5" rx="2"/>',
+ x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+ sliders:'<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>',
+ server:'<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/>'});
 const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
 const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
@@ -1708,7 +1853,14 @@ function sheetHTML(){
     <input id="dxi" class="inp" type="number" inputmode="decimal" placeholder="0" value="${esc(dxVal)}" oninput="dxVal=this.value;$('dxp').textContent=dxPrev()">
     <p class="h" id="dxp" style="text-align:center;margin:8px 0 0">${dxPrev()}</p>
     <button class="pri" onclick="dxGo()">${dxSide==='buy'?'شراء':'بيع'}</button>`;
-  }
+  }else if(sheet==='modes'){
+    const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b),mins=Math.max(1,Math.round(ks.length*TEST_SECS/60));
+    b=`<div class="cap cap2" style="direction:ltr;justify-content:flex-end"><i class="dot"></i>MINING · MODES</div><h2>أوضاع التعدين</h2>
+    <p class="h">كل مستوى يستخدم طريقة بحث هاش مختلفة — درجات متفاوتة من توازي WebCrypto. أداء موحد على الجوال والكمبيوتر.</p>`+
+    ks.map(k=>modeCard(k)).join('')+
+    `<button class="runb" id="rb" onclick="runBench()">${runLbl()}</button>
+    <p class="mnote">يستغرق الاختبار نحو ${mins} ${mins<3?'دقيقتين':'دقائق'} (${TEST_SECS} ث لكل وضع). لا تستخدم الجهاز خلال الاختبار للحصول على أدق نتيجة.</p>`;
+    return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><button class="xb" onclick="closeSheet()">${ic('x',16)}</button><div class="sh">${b}</div></div></div>`}
   return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="sh"><button class="sm" style="float:left;margin:0" onclick="closeSheet()">✕</button>${b}</div></div>`}
 
 const V={mine:vMine,refs:vRefs,tasks:vTasks,top:vTop,wallet:vWallet};
@@ -1725,7 +1877,7 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
-setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
+setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&sheet!=='modes'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
 setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
