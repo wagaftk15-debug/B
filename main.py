@@ -1,3 +1,14 @@
+# ── تثبيت تلقائي للمكتبات الناقصة (يعمل حتى لو لم يقرأ Railway ملف requirements.txt) ──
+import subprocess as _sp, sys as _sys
+for _mod, _pkg in (("aiohttp", "aiohttp==3.10.5"), ("telegram", "python-telegram-bot==21.6"),
+                   ("psycopg2", "psycopg2-binary==2.9.9")):
+    try:
+        __import__(_mod)
+    except ImportError:
+        for _flags in ([], ["--break-system-packages"]):
+            if _sp.call([_sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", _pkg, *_flags]) == 0:
+                break
+
 import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
