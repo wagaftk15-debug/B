@@ -32,7 +32,7 @@ if _todo:
     if _missing():
         raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
-import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random
+import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random, re, datetime
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
@@ -104,6 +104,12 @@ SERVERS = {
 DEX_BASE = 0.008        # سعر طاقة واحدة بنقاط HASH
 DEX_FEE = 0.03          # عمولة البيع
 TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
+try:
+    TZ_OFFSET = float(os.environ.get("TZ_OFFSET", "1"))    # فرق التوقيت عن UTC لتواريخ الأدمن (الجزائر = 1)
+except ValueError:
+    TZ_OFFSET = 1.0
+DEFAULT_BLOCKS = 20_000_000                                # عدد الكتل الافتراضي (الإصدار = الكتل × مكافأة الكتلة)
+CHAIN = dict(start=0.0, blocks=DEFAULT_BLOCKS, done=False)  # يضبطها الأدمن بـ /setstart و /setblocks
 DEFAULT_TITLE = "TotalHash"   # عنوان المقدمة الافتراضي (يتغير بالأمر /settitle)
 TITLE = DEFAULT_TITLE
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
@@ -246,7 +252,70 @@ def init_db():
         r = cur.fetchone()
         if r and r["v"]:
             TITLE = r["v"]
+    st = get_setting("start_ts")
+    if st is None:                      # أول تشغيل: البداية = الآن
+        st = time.time()
+        set_setting("start_ts", st)
+    CHAIN["start"] = float(st)
+    try:
+        CHAIN["blocks"] = max(1, int(float(get_setting("blocks_total", DEFAULT_BLOCKS))))
+    except ValueError:
+        CHAIN["blocks"] = DEFAULT_BLOCKS
+    CHAIN["done"] = blocks_mined() >= CHAIN["blocks"]
     log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
+
+
+def get_setting(k, default=None):
+    with cursor() as cur:
+        cur.execute("SELECT v FROM m_settings WHERE k=?", (k,))
+        r = cur.fetchone()
+    return r["v"] if r and r["v"] is not None else default
+
+
+def set_setting(k, v):
+    with cursor() as cur:
+        cur.execute("INSERT INTO m_settings(k,v) VALUES(?,?) ON CONFLICT (k) DO UPDATE SET v=excluded.v",
+                    (k, str(v)))
+
+
+def blocks_mined():
+    with cursor() as cur:
+        cur.execute("SELECT MAX(id) AS m FROM m_blocks")
+        return (cur.fetchone() or {}).get("m") or 0
+
+
+def _local(ts):
+    return datetime.datetime.fromtimestamp(ts + TZ_OFFSET * 3600, datetime.timezone.utc)
+
+
+def fmt_dt(ts):
+    return _local(ts).strftime("%H:%M %d.%m.%Y")
+
+
+def fmt_d(ts):
+    return _local(ts).strftime("%d.%m.%Y")
+
+
+def parse_start(args):
+    """'12.00 11.11.2026' أو '11.11.2026 12:00' ← طابع زمني UTC (بحسب TZ_OFFSET)"""
+    d = t = None
+    for a in args:
+        parts = re.split(r"[.:/-]", a)
+        if len(parts) == 3 and len(parts[2]) == 4:
+            d = (int(parts[0]), int(parts[1]), int(parts[2]))
+        elif len(parts) == 2:
+            t = (int(parts[0]), int(parts[1]))
+    if not d:
+        raise ValueError("no date")
+    h, m = t or (0, 0)
+    dt = datetime.datetime(d[2], d[1], d[0], h, m, tzinfo=datetime.timezone.utc)
+    return dt.timestamp() - TZ_OFFSET * 3600
+
+
+def chain_info():
+    now = time.time()
+    return dict(start=CHAIN["start"], started=now >= CHAIN["start"], done=CHAIN["done"],
+                start_txt=fmt_dt(CHAIN["start"]), blocks=CHAIN["blocks"])
 
 
 # ═══════════ 3) منطق التعدين (يُحسب كسولاً عند كل طلب) ═══════════
@@ -277,6 +346,8 @@ def xp_need(level):
 
 def settle(u):
     now = time.time()
+    if u["mining"] and (now < CHAIN["start"] or CHAIN["done"]):
+        u["mining"] = 0                  # قبل موعد البداية أو بعد اكتمال الكتل لا يوجد تعدين
     dt = max(0.0, now - u["last_tick"])
     if u["mining"]:
         cost = COST * mode_of(u)["cost"]
@@ -383,6 +454,8 @@ def apply_payment(uid, key, charge, stars):
 def make_block():
     """كتلة كل 5 ثوانٍ؛ الفائز بالقرعة موزونة بقوة الهاش بين المعدّنين النشطين فعلاً."""
     now = time.time()
+    if now < CHAIN["start"] or CHAIN["done"]:
+        return
     with cursor() as cur:
         cur.execute("DELETE FROM m_servers WHERE expires>0 AND expires<?", (now,))
         cur.execute("SELECT id,name,level,hr,patron FROM m_users WHERE " + SQL_ACTIVE + " LIMIT 3000", (now,))
@@ -397,6 +470,9 @@ def make_block():
         cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,thr,created_at) "
                     "VALUES(?,?,?,?,?,?,?)", (w["id"], w["name"], w["level"], rew, len(ms), total, int(now)))
         cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
+        cur.execute("SELECT MAX(id) AS m FROM m_blocks")
+        if ((cur.fetchone() or {}).get("m") or 0) >= CHAIN["blocks"]:
+            CHAIN["done"] = True
 
 
 # ═══════════ 3.1) DEX: تبادل HASH ↔ طاقة ═══════════
@@ -517,7 +593,7 @@ def act_me(tg, b):
                for k, v in SERVERS.items() if v["cost"] > 0]
     return dict(**state(u), refs=refs, online=a["n"], total_hr=a["h"], difficulty=a["h"] * 0.2,
                 block_reward=BLOCK_REWARD * (2 if u["patron"] > now else 1), next_block=last_block + 1,
-                ref_bonus=REF_BONUS, daily=DAILY, dex=dex_info(), servers=servers, temps=temps,
+                ref_bonus=REF_BONUS, daily=DAILY, dex=dex_info(), chain=chain_info(), servers=servers, temps=temps,
                 modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
                 tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
@@ -528,6 +604,10 @@ def act_mining(tg, b):
     with cursor() as cur:
         u = touch(cur, tg)
         if b.get("on"):
+            if time.time() < CHAIN["start"]:
+                raise Err("يبدأ التعدين في " + fmt_dt(CHAIN["start"]))
+            if CHAIN["done"]:
+                raise Err("اكتمل تعدين جميع الكتل")
             if not u["permit"]:
                 raise Err("تحتاج تصريح التعدين أولاً")
             if u["energy"] < 1:
@@ -639,13 +719,20 @@ def act_top(tg, b):
     with cursor() as cur:
         cur.execute("SELECT id,name,level,total,hr FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
         rows = cur.fetchall()
-        cur.execute("SELECT total FROM m_users WHERE id=?", (tg["id"],))
-        mine = (cur.fetchone() or {}).get("total", 0)
-        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (mine,))
+        cur.execute("SELECT name,level,total,hr FROM m_users WHERE id=?", (tg["id"],))
+        me = cur.fetchone() or dict(name=tg["name"], level=1, total=0, hr=BASE_HR)
+        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (me["total"],))
         rank = cur.fetchone()["r"]
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE total>0")
+        holders = cur.fetchone()["n"]
+    mined = blocks_mined()
     return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], tier=tier(r["hr"]),
                          me=r["id"] == tg["id"]) for r in rows],
-            "rank": rank, "mytotal": mine}
+            "rank": rank, "mytotal": me["total"],
+            "mine": dict(name=me["name"], level=me["level"], total=me["total"], tier=tier(me["hr"])),
+            "chain": dict(holders=holders, emission=CHAIN["blocks"] * BLOCK_REWARD,
+                          pct=min(100.0, mined / CHAIN["blocks"] * 100), mined=mined, blocks=CHAIN["blocks"],
+                          start_date=fmt_d(CHAIN["start"]))}
 
 
 def act_redeem(tg, b):
@@ -1034,6 +1121,70 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ تم تغيير العنوان إلى: <b>{html.escape(new)}</b>\nيظهر في مقدمة التطبيق عند الفتح القادم.")
 
 
+async def cmd_setstart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setstart 12.00 11.11.2026   |   /setstart now"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    a = context.args
+    if not a:
+        await update.message.reply_text(
+            f"🚀 موعد بدء التعدين الحالي: <b>{fmt_dt(CHAIN['start'])}</b> (UTC{TZ_OFFSET:+g})\n\n"
+            "لتغييره:\n<code>/setstart 12.00 11.11.2026</code>\nللبدء فوراً:\n<code>/setstart now</code>")
+        return
+    try:
+        ts = time.time() - 1 if a[0].lower() == "now" else parse_start(a)
+    except (ValueError, OverflowError):
+        await update.message.reply_text("❌ صيغة غير صحيحة. مثال: <code>/setstart 12.00 11.11.2026</code>")
+        return
+    await asyncio.to_thread(set_setting, "start_ts", ts)
+    CHAIN["start"] = ts
+    left = ts - time.time()
+    note = "التعدين يعمل الآن ✅" if left <= 0 else f"بعد {int(left // 86400)} يوم و{int(left % 86400 // 3600)} ساعة"
+    await update.message.reply_text(f"✅ موعد البدء: <b>{fmt_dt(ts)}</b>\n{note}")
+
+
+async def cmd_setblocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setblocks 100000   (يقبل K و M)"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"🧱 عدد الكتل الحالي: <b>{CHAIN['blocks']:,}</b>\nالإصدار = الكتل × {BLOCK_REWARD}\n\n"
+            "لتغييره: <code>/setblocks 100000</code> أو <code>/setblocks 5m</code>")
+        return
+    try:
+        n = int(parse_amt(context.args[0]))
+    except ValueError:
+        await update.message.reply_text("❌ قيمة غير صحيحة")
+        return
+    if n < 1:
+        await update.message.reply_text("❌ يجب أن يكون الرقم 1 أو أكثر")
+        return
+
+    def work():
+        set_setting("blocks_total", n)
+        CHAIN["blocks"] = n
+        m = blocks_mined()
+        CHAIN["done"] = m >= n
+        return m
+    m = await asyncio.to_thread(work)
+    await update.message.reply_text(
+        f"✅ عدد الكتل: <b>{n:,}</b>\n💎 الإصدار: {n * BLOCK_REWARD:,}\n⛏ المُعدَّن حتى الآن: {m:,}"
+        + ("\n🏁 الكتل اكتملت، التعدين متوقف." if CHAIN["done"] else ""))
+
+
+async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    m = await asyncio.to_thread(blocks_mined)
+    st = "🏁 اكتملت" if CHAIN["done"] else ("⏳ لم تبدأ" if time.time() < CHAIN["start"] else "✅ تعمل")
+    await update.message.reply_text(
+        f"⛓ <b>حالة السلسلة</b>: {st}\n🚀 البداية: {fmt_dt(CHAIN['start'])}\n"
+        f"🧱 الكتل: {m:,} / {CHAIN['blocks']:,} ({m / CHAIN['blocks'] * 100:.2f}%)\n"
+        f"💎 الإصدار: {CHAIN['blocks'] * BLOCK_REWARD:,}\n\n"
+        "/setstart · /setblocks")
+
+
 async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
@@ -1091,6 +1242,9 @@ async def post_init(app: Application):
                                       BotCommand("delcode", "🗑 حذف كود"),
                                       BotCommand("payments", "🧾 عرض الدفعات"),
                                       BotCommand("settitle", "✏️ تغيير عنوان البوت"),
+                                      BotCommand("setstart", "🚀 موعد بدء التعدين"),
+                                      BotCommand("setblocks", "🧱 عدد الكتل"),
+                                      BotCommand("chain", "⛓ حالة السلسلة"),
                                       BotCommand("refund", "💸 استرجاع دفعة")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
@@ -1168,6 +1322,26 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
 .sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
 .cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
+.stc{background:var(--card);border:1px solid var(--line);border-radius:16px;margin-bottom:12px;overflow:hidden}
+.sth{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px}
+.stic{width:30px;height:30px;border:1px solid var(--line);border-radius:9px;display:grid;place-items:center;background:var(--bg);font-size:14px}
+.lb{font-size:11px;color:var(--mut);font-weight:700}
+.pct{font-size:26px;font-weight:800;color:var(--ac);direction:ltr}.pct small{font-size:13px;color:var(--mut);font-weight:700}
+.bar2{height:7px;background:#ffffff10;border-radius:7px;overflow:hidden;margin-top:10px}.bar2 i{display:block;height:100%;background:var(--ac);border-radius:7px}
+.st3{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line)}
+.st3>div{padding:11px 12px;border-inline-start:1px solid var(--line);min-width:0}.st3>div:first-child{border:0}
+.st3 b{display:block;font-size:14px;direction:ltr;text-align:right;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rb{margin-inline-start:auto;border:1px solid var(--ac);color:var(--ac);border-radius:8px;padding:2px 10px;font-weight:700;font-size:12px;direction:ltr}
+.mebody{padding:14px;display:flex;align-items:center;gap:12px;background:#ffa45b0d}
+.avs{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-weight:800;font-size:14px;color:#fff;flex:none}
+.lr{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}.lr:last-child{border:0}
+.lr.me{background:#ffa45b0d}
+.lrk{width:30px;height:30px;border:1px solid var(--line);border-radius:8px;display:grid;place-items:center;font:700 12px ui-monospace,Menlo,monospace;color:var(--mut);flex:none}
+.lrk.tp{border-color:#ffa45b66;color:var(--ac);background:#ffa45b12}
+.lv{font:11px ui-monospace,Menlo,monospace;color:var(--mut)}
+.coin{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:4px;background:var(--ac);color:#1e1307;font-size:10px;font-weight:800;margin-inline-end:6px;vertical-align:middle}
+.amt{font-weight:700;font-size:14px;direction:ltr;display:inline-block;vertical-align:middle}.amt small{font-size:10px;color:var(--mut);font-weight:400}
+.nm{min-width:0;flex:1}.nm b{font-size:15px}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1300,6 +1474,8 @@ function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN 
 
 function vMine(){
   let h=walletCard();
+  if(!S.chain.started)h+=`<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">ينطلق في <b>${esc(S.chain.start_txt)}</b></p><div class="big" id="cdn" style="font-size:30px;text-align:center;margin-top:10px">--:--:--</div></div>`;
+  else if(S.chain.done)h+=`<div class="card"><h2>🏁 اكتمل التعدين</h2><p class="h">تم تعدين جميع الكتل (${fi(S.chain.blocks)}).</p></div>`;
   const D=S.dex;
   h+=`<div class="grid"><div class="card mini" onclick="openSheet('dex')"><b>DEX β</b>
     <span class="h">1 ⚡ ≈ ${f(D.price,5)} #</span><br><span class="${D.change>=0?'up':'dn'}" style="direction:ltr;display:inline-block">${D.change>=0?'▲':'▼'} ${f(Math.abs(D.change))}%</span><br><span class="h">اشترِ، بِع ← فتح</span></div>
@@ -1323,7 +1499,7 @@ function vMine(){
     <div class="cell"><span class="h">أسهم</span><b>${fi(S.wins)}</b></div>
     <div class="cell"><span class="h">الدخل</span><b>${f(S.income,1)} #</b></div></div>
     <div class="grid" style="margin:0">${S.mining?'<button class="stop" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
-      '<button class="pri" onclick="act(\'mining\',{on:true})">▶ بدء التعدين</button>'}
+      '<button class="pri" '+((S.chain.started&&!S.chain.done)?'':'disabled ')+'onclick="act(\'mining\',{on:true})">▶ بدء التعدين</button>'}
     <button onclick="act('mode',{mode:${nx}})">الوضع: ${m.name} ×${m.mul}<br><small class="h">طاقة ×${m.cost}/ث</small></button></div>
     <button onclick="openSheet('servers')">🖥 مركز إدارة الخوادم</button></div>`;
   }
@@ -1349,11 +1525,22 @@ function vTasks(){
   ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
   return h}
 
+function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:hsl(${h},55%,48%)">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
+function amt(n){const s=f(n,4);return '<span class="coin">#</span><span class="amt">'+s.slice(0,-3)+'<small>'+s.slice(-3)+'</small></span>'}
 function vTop(){
   if(!TOP)return '<p class="h">…</p>';
-  return `<div class="card"><h2>🏆 أفضل 100 معدّن</h2><p class="h">ترتيبك: #${TOP.rank} · ${f(TOP.mytotal,2)}</p></div><div class="card">`+
-  (TOP.top.length?TOP.top.map((r,i)=>`<div class="rk ${r.me?'me':''}"><i>${i+1}</i>${av(r.name)}<span class="n">${esc(r.name)}${badge(r.tier)}<span class="h">Lv${r.level}</span></span><span class="tag">${f(r.total,1)}</span></div>`).join(''):'<p class="h">لا أحد بعد.</p>')+'</div>'}
-
+  const C=TOP.chain,M=TOP.mine;
+  return `<div class="stc"><div class="sth"><span class="stic">📈</span>إحصائيات البلوكشين</div>
+  <div style="padding:14px"><div class="row"><span class="lb">إجمالي المُعدَّن</span><span class="pct">${f(C.pct)}<small>%</small></span></div>
+  <div class="bar2"><i style="width:${Math.min(100,C.pct)}%"></i></div></div>
+  <div class="st3"><div><span class="lb">👥 الحائزون</span><b>${fi(C.holders)}</b></div>
+  <div><span class="lb">🚀 الإصدار</span><b>${fi(C.emission)}</b></div>
+  <div><span class="lb">📅 البداية</span><b>${esc(C.start_date)}</b></div></div></div>
+  <div class="stc"><div class="sth"><span class="stic">🏆</span>ترتيبي<span class="rb">#${fi(TOP.rank)}</span></div>
+  <div class="mebody">${avs(M.name)}<div class="nm"><b>${esc(M.name)}</b>${badge(M.tier)} <span class="lv">مستوى ${M.level}</span><div>${amt(M.total)}</div></div></div></div>
+  <div class="stc"><div class="sth"><span class="stic">🏆</span>أفضل 100 معدّن</div>`+
+  (TOP.top.length?TOP.top.map((r,i)=>`<div class="lr ${r.me?'me':''}"><span class="lrk ${i<3?'tp':''}">${String(i+1).padStart(2,'0')}</span>${avs(r.name)}
+  <div class="nm"><b>${esc(r.name)}</b>${badge(r.tier)} <span class="lv">مستوى ${r.level}</span><div>${amt(r.total)}</div></div></div>`).join(''):'<p class="h" style="padding:14px">لا أحد بعد.</p>')+'</div>'}
 function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${bal(S.balance)}</div></div>
   <div class="card"><h3>🎁 لديك كود؟</h3>
   <input id="cd" class="inp" placeholder="TH-XXXXXXXX" autocapitalize="characters" autocomplete="off">
@@ -1415,6 +1602,10 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
 setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
+setInterval(()=>{if(!S||!S.chain||S.chain.started)return;
+  let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
+  const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
+  if(e)e.textContent=(d?d+'ي ':'')+p(h)+':'+p(m)+':'+p(s)},1000);
 if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
 else load().catch(e=>{$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
@@ -1436,6 +1627,9 @@ def main():
         fallbacks=[CommandHandler("cancel", refund_cancel)], allow_reentry=True))
     app.add_handler(CommandHandler("payments", cmd_payments))
     app.add_handler(CommandHandler("settitle", cmd_settitle))
+    app.add_handler(CommandHandler("setstart", cmd_setstart))
+    app.add_handler(CommandHandler("setblocks", cmd_setblocks))
+    app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("gencode", cmd_gencode))
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("delcode", cmd_delcode))
