@@ -109,7 +109,8 @@ try:
 except ValueError:
     TZ_OFFSET = 1.0
 DEFAULT_BLOCKS = 20_000_000                                # عدد الكتل الافتراضي (الإصدار = الكتل × مكافأة الكتلة)
-CHAIN = dict(start=0.0, blocks=DEFAULT_BLOCKS, done=False)  # يضبطها الأدمن بـ /setstart و /setblocks
+NOT_SCHEDULED = 4102444800.0                               # = لم يُحدَّد موعد بعد (سنة 2100)
+CHAIN = dict(start=NOT_SCHEDULED, blocks=DEFAULT_BLOCKS, done=False)  # يضبطها الأدمن بـ /setstart و /setblocks
 DEFAULT_TITLE = "TotalHash"   # عنوان المقدمة الافتراضي (يتغير بالأمر /settitle)
 TITLE = DEFAULT_TITLE
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
@@ -253,8 +254,8 @@ def init_db():
         if r and r["v"]:
             TITLE = r["v"]
     st = get_setting("start_ts")
-    if st is None:                      # أول تشغيل: البداية = الآن
-        st = time.time()
+    if st is None:                      # أول تشغيل: لا تعدين حتى يحدد الأدمن الموعد بـ /setstart
+        st = NOT_SCHEDULED
         set_setting("start_ts", st)
     CHAIN["start"] = float(st)
     try:
@@ -289,11 +290,11 @@ def _local(ts):
 
 
 def fmt_dt(ts):
-    return _local(ts).strftime("%H:%M %d.%m.%Y")
+    return "غير محدد" if ts >= NOT_SCHEDULED else _local(ts).strftime("%H:%M %d.%m.%Y")
 
 
 def fmt_d(ts):
-    return _local(ts).strftime("%d.%m.%Y")
+    return "—" if ts >= NOT_SCHEDULED else _local(ts).strftime("%d.%m.%Y")
 
 
 def parse_start(args):
@@ -315,6 +316,7 @@ def parse_start(args):
 def chain_info():
     now = time.time()
     return dict(start=CHAIN["start"], started=now >= CHAIN["start"], done=CHAIN["done"],
+                scheduled=CHAIN["start"] < NOT_SCHEDULED,
                 start_txt=fmt_dt(CHAIN["start"]), blocks=CHAIN["blocks"])
 
 
@@ -605,7 +607,8 @@ def act_mining(tg, b):
         u = touch(cur, tg)
         if b.get("on"):
             if time.time() < CHAIN["start"]:
-                raise Err("يبدأ التعدين في " + fmt_dt(CHAIN["start"]))
+                raise Err("يبدأ التعدين في " + fmt_dt(CHAIN["start"]) if CHAIN["start"] < NOT_SCHEDULED
+                          else "لم يبدأ التعدين بعد")
             if CHAIN["done"]:
                 raise Err("اكتمل تعدين جميع الكتل")
             if not u["permit"]:
@@ -919,7 +922,10 @@ def _mark_refunded(p):
     """تعليم الدفعة كمُرجعة وسحب أثرها من حساب المستخدم."""
     with cursor() as cur:
         cur.execute("UPDATE m_payments SET refunded=1 WHERE charge_id=?", (p["charge_id"],))
-        u = lock_user(cur, p["user_id"])
+        try:
+            u = lock_user(cur, p["user_id"])
+        except Err:                      # المستخدم محذوف (بعد /resetall): لا أثر لسحبه
+            return
         k = p["item"]
         if k == "permit":
             u["permit"], u["mining"] = 0, 0
@@ -1122,25 +1128,63 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setstart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setstart 12.00 11.11.2026   |   /setstart now"""
+    """/setstart 12.00 11.11.2026   |   /setstart now   |   /setstart off"""
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
     a = context.args
     if not a:
         await update.message.reply_text(
             f"🚀 موعد بدء التعدين الحالي: <b>{fmt_dt(CHAIN['start'])}</b> (UTC{TZ_OFFSET:+g})\n\n"
-            "لتغييره:\n<code>/setstart 12.00 11.11.2026</code>\nللبدء فوراً:\n<code>/setstart now</code>")
+            "لتغييره:\n<code>/setstart 12.00 11.11.2026</code>\nللبدء فوراً:\n<code>/setstart now</code>\n"
+            "لإيقاف التعدين وإلغاء الموعد:\n<code>/setstart off</code>")
         return
     try:
-        ts = time.time() - 1 if a[0].lower() == "now" else parse_start(a)
+        if a[0].lower() == "now":
+            ts = time.time() - 1
+        elif a[0].lower() in ("off", "stop", "إيقاف"):
+            ts = NOT_SCHEDULED
+        else:
+            ts = parse_start(a)
     except (ValueError, OverflowError):
         await update.message.reply_text("❌ صيغة غير صحيحة. مثال: <code>/setstart 12.00 11.11.2026</code>")
         return
     await asyncio.to_thread(set_setting, "start_ts", ts)
     CHAIN["start"] = ts
+    if ts >= NOT_SCHEDULED:
+        await update.message.reply_text("⏸ تم إلغاء الموعد. التعدين متوقف حتى تحدد موعداً جديداً.")
+        return
     left = ts - time.time()
     note = "التعدين يعمل الآن ✅" if left <= 0 else f"بعد {int(left // 86400)} يوم و{int(left % 86400 // 3600)} ساعة"
     await update.message.reply_text(f"✅ موعد البدء: <b>{fmt_dt(ts)}</b>\n{note}")
+
+
+async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resetall  ← يشرح ما سيُحذف   |   /resetall تأكيد  ← ينفّذ"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or context.args[0].lower() not in ("تأكيد", "تاكيد", "confirm"):
+        await update.message.reply_text(
+            "⚠️ <b>سيتم حذف كل بيانات اللعبة:</b>\nالمستخدمون وأرصدتهم، الكتل، الخوادم، المهام، "
+            "الأكواد واستردادها، وتُلغى بداية التعدين.\n\n"
+            "✅ لا يُحذف: سجل الدفعات (لتبقى قادراً على الاسترجاع)، العنوان، وعدد الكتل.\n\n"
+            "للتنفيذ أرسل:\n<code>/resetall تأكيد</code>")
+        return
+
+    def wipe():
+        with cursor() as cur:
+            for t in ("m_users", "m_tasks", "m_servers", "m_redeems", "m_codes"):
+                cur.execute(f"DELETE FROM {t}")
+            if USE_PG:
+                cur.execute("TRUNCATE m_blocks RESTART IDENTITY")
+            else:
+                cur.execute("DELETE FROM m_blocks")
+                cur.execute("DELETE FROM sqlite_sequence WHERE name='m_blocks'")
+        set_setting("start_ts", NOT_SCHEDULED)
+        CHAIN["start"], CHAIN["done"] = NOT_SCHEDULED, False
+    await asyncio.to_thread(wipe)
+    await update.message.reply_text(
+        "🗑 تم حذف كل شيء. اللعبة الآن في حالة «لم تبدأ».\n\nلتحديد الموعد: <code>/setstart 12.00 11.11.2026</code>\n"
+        "أو للبدء فوراً: <code>/setstart now</code>")
 
 
 async def cmd_setblocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1243,6 +1287,7 @@ async def post_init(app: Application):
                                       BotCommand("payments", "🧾 عرض الدفعات"),
                                       BotCommand("settitle", "✏️ تغيير عنوان البوت"),
                                       BotCommand("setstart", "🚀 موعد بدء التعدين"),
+                                      BotCommand("resetall", "🗑 حذف كل البيانات"),
                                       BotCommand("setblocks", "🧱 عدد الكتل"),
                                       BotCommand("chain", "⛓ حالة السلسلة"),
                                       BotCommand("refund", "💸 استرجاع دفعة")]
@@ -1274,8 +1319,10 @@ WEB_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#17191c;--card:#202327;--line:#31353b;--ac:#ffa45b;--tx:#eceef0;--mut:#8b9098;--red:#d94848;--grn:#3ecf8e;--blue:#38b6ff;--pur:#9b7bff}
+:root{--mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;--disp:"Space Grotesk",system-ui,-apple-system,"Segoe UI","Noto Sans Arabic",Tahoma,sans-serif;--bg:#1a1c1e;--card:#282b2e;--line:#33363a;--ac:#ffa45b;--tx:#eceef0;--mut:#8b9098;--red:#d94848;--grn:#3ecf8e;--blue:#38b6ff;--pur:#9b7bff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",Tahoma,sans-serif;padding-bottom:calc(84px + env(safe-area-inset-bottom))}
 .w{max-width:560px;margin:0 auto;padding:14px}
@@ -1304,9 +1351,13 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .day.on{border-color:var(--ac);color:var(--ac)}.day b{display:block;color:var(--tx);font-size:15px}
 .day.wide{grid-column:1/-1}
 .kv{background:var(--bg);border:1px dashed var(--line);border-radius:12px;padding:10px;word-break:break-all;direction:ltr;text-align:left;font-size:12px;font-family:ui-monospace,Menlo,monospace}
-.nav{position:fixed;inset:auto 0 0 0;display:flex;background:var(--bg);border-top:1px solid var(--line);padding:6px 8px calc(6px + env(safe-area-inset-bottom));z-index:5}
-.nav div{flex:1;text-align:center;padding:6px 2px;color:var(--mut);font-size:12px;font-weight:700;cursor:pointer}
-.nav div.on{color:var(--ac)}.nav span{display:block;font-size:22px}
+.nav{position:fixed;inset:auto 0 0 0;display:flex;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;border-top:1px solid #33363a;padding:9px 6px calc(8px + env(safe-area-inset-bottom));z-index:5}
+.nav div{position:relative;flex:1;text-align:center;padding:5px 2px 3px;color:#8b9098;font:600 10px var(--mono);letter-spacing:.03em;cursor:pointer}
+.nav div.on{color:var(--ac)}
+.nav div.on::before{content:"";position:absolute;top:-10px;left:50%;width:36px;margin-left:-18px;height:2px;border-radius:2px;background:var(--ac)}
+.nav span{display:block;height:22px;margin-bottom:3px}.nav svg{width:20px;height:20px}
+.earn{position:absolute;top:-15px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:3px;font:700 9px var(--mono);font-style:normal;letter-spacing:.06em;color:#3ecf8e;background:#1e3a30;border:1px solid #2c5a47;border-radius:10px;padding:2px 5px 2px 7px;z-index:2}
+.earn b{width:11px;height:11px;border-radius:50%;background:#38b6ff;margin-left:-3px;border:1px solid #1e3a30}.earn b+b{background:#3ecf8e}
 .rk{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}.rk:last-child{border:0}
 .rk i{width:30px;height:30px;border-radius:9px;background:var(--bg);border:1px solid var(--line);display:grid;place-items:center;font-style:normal;font-size:13px;font-weight:800}
 .rk .n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:700}
@@ -1322,26 +1373,36 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
 .sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
 .cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
-.stc{background:var(--card);border:1px solid var(--line);border-radius:16px;margin-bottom:12px;overflow:hidden}
-.sth{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px}
-.stic{width:30px;height:30px;border:1px solid var(--line);border-radius:9px;display:grid;place-items:center;background:var(--bg);font-size:14px}
-.lb{font-size:11px;color:var(--mut);font-weight:700}
-.pct{font-size:26px;font-weight:800;color:var(--ac);direction:ltr}.pct small{font-size:13px;color:var(--mut);font-weight:700}
-.bar2{height:7px;background:#ffffff10;border-radius:7px;overflow:hidden;margin-top:10px}.bar2 i{display:block;height:100%;background:var(--ac);border-radius:7px}
-.st3{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line)}
-.st3>div{padding:11px 12px;border-inline-start:1px solid var(--line);min-width:0}.st3>div:first-child{border:0}
-.st3 b{display:block;font-size:14px;direction:ltr;text-align:right;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rb{margin-inline-start:auto;border:1px solid var(--ac);color:var(--ac);border-radius:8px;padding:2px 10px;font-weight:700;font-size:12px;direction:ltr}
-.mebody{padding:14px;display:flex;align-items:center;gap:12px;background:#ffa45b0d}
-.avs{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-weight:800;font-size:14px;color:#fff;flex:none}
-.lr{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}.lr:last-child{border:0}
-.lr.me{background:#ffa45b0d}
-.lrk{width:30px;height:30px;border:1px solid var(--line);border-radius:8px;display:grid;place-items:center;font:700 12px ui-monospace,Menlo,monospace;color:var(--mut);flex:none}
-.lrk.tp{border-color:#ffa45b66;color:var(--ac);background:#ffa45b12}
-.lv{font:11px ui-monospace,Menlo,monospace;color:var(--mut)}
-.coin{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:4px;background:var(--ac);color:#1e1307;font-size:10px;font-weight:800;margin-inline-end:6px;vertical-align:middle}
-.amt{font-weight:700;font-size:14px;direction:ltr;display:inline-block;vertical-align:middle}.amt small{font-size:10px;color:var(--mut);font-weight:400}
-.nm{min-width:0;flex:1}.nm b{font-size:15px}
+.stc{position:relative;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;border:1px solid #33363a;border-radius:14px;margin-bottom:12px;overflow:hidden}
+.stc::before,.nav::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent);z-index:1}
+.sth{display:flex;align-items:center;gap:8px;padding:9px 12px;min-height:43px;border-bottom:1px solid #303337;font:700 13px var(--disp);letter-spacing:-.02em;color:#f0f0f0}
+.stic{width:24px;height:24px;border:1px solid #3a3d41;border-radius:7px;display:grid;place-items:center;color:#8b9098;background:#ffffff05;flex:none}
+.stic.or{border-color:#6e4c32;background:#3e3833;color:#ffa861}
+.tmb{padding:16px 16px 15px}.tr{display:flex;justify-content:space-between;align-items:center}
+.mlb{font:400 11px var(--mono);letter-spacing:.04em;color:#8b9098}
+.pc{font:700 20px var(--mono);color:#ffa861;direction:ltr}.pc small{font-size:13px;color:#8b9098;font-weight:400}
+.pb{height:6px;background:#483e35;border-radius:6px;overflow:hidden;margin-top:13px}.pb i{display:block;height:100%;background:#ffa861;border-radius:6px}
+.st3{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid #303337}
+.st3>div{padding:11px 12px 10px;border-inline-start:1px solid #303337;min-width:0}.st3>div:first-child{border:0}
+.fl{display:flex;align-items:center;gap:5px;font:600 11px var(--disp);color:#8b9098}
+.fv{font:700 13px var(--mono);color:#f4f4f4;direction:ltr;text-align:right;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rb{margin-inline-start:auto;font:700 12px var(--mono);color:#ffa861;background:#3e3833;border:1px solid #7a5535;border-radius:7px;padding:4px 10px;direction:ltr}
+.mb{display:flex;align-items:center;gap:12px;padding:13px 14px;background:#333231}
+.avs{width:32px;height:32px;border-radius:7px;display:grid;place-items:center;font:700 13px var(--disp);color:#fff;text-shadow:0 1px 2px #0005;flex:none}
+.lr{display:flex;align-items:center;gap:10px;padding:10px 12px;min-height:60px;border-bottom:1px solid #333536}.lr:last-child{border:0}
+.lr .avs{width:28px;height:28px;font-size:12px;border-radius:6px}
+.lr.me{background:#333231}
+.lrk{width:28px;height:28px;border:1px solid #3d4044;border-radius:7px;display:grid;place-items:center;font:700 12px var(--mono);color:#8b9098;flex:none}
+.lrk.tp{border-color:#6e4c32;background:#3a342f;color:#ffa861}
+.nm{min-width:0;flex:1}.nl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.nl b{font:700 15px var(--disp);letter-spacing:-.01em;color:#f4f4f4}
+.lv{font:400 11px var(--mono);color:#8b9098}
+.am{display:flex;align-items:center;gap:5px;margin-top:6px;direction:ltr;justify-content:flex-end}
+.cn{width:10px;height:10px;border-radius:3px;background:linear-gradient(#ffb674,#ff9a4a);color:#fff;font:700 7px var(--mono);display:grid;place-items:center;font-style:normal;flex:none}
+.amt{font:700 15px var(--mono);color:#f4f4f4}.amt small{font-size:10px;color:#8b9098;font-weight:400}
+.lr .amt{font-size:13px;font-weight:400;color:#c3c6c9}
+.bdg{font:700 10px var(--mono);letter-spacing:.06em;border:1px solid;border-radius:5px;padding:1px 6px;margin:0;line-height:1.5}
+.turbo{color:#38b6ff;background:#38b6ff1f;border-color:#38b6ffb0}.nitro{color:#3ecf8e;background:#3ecf8e1f;border-color:#3ecf8eb0}.super{color:#ffa45b;background:#ffa45b1f;border-color:#ffa45bb0}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1474,7 +1535,8 @@ function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN 
 
 function vMine(){
   let h=walletCard();
-  if(!S.chain.started)h+=`<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">ينطلق في <b>${esc(S.chain.start_txt)}</b></p><div class="big" id="cdn" style="font-size:30px;text-align:center;margin-top:10px">--:--:--</div></div>`;
+  if(!S.chain.started)h+=S.chain.scheduled?`<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">ينطلق في <b>${esc(S.chain.start_txt)}</b></p><div class="big" id="cdn" style="font-size:30px;text-align:center;margin-top:10px">--:--:--</div></div>`:
+    `<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">سيُعلن عن موعد الانطلاق قريباً.</p></div>`;
   else if(S.chain.done)h+=`<div class="card"><h2>🏁 اكتمل التعدين</h2><p class="h">تم تعدين جميع الكتل (${fi(S.chain.blocks)}).</p></div>`;
   const D=S.dex;
   h+=`<div class="grid"><div class="card mini" onclick="openSheet('dex')"><b>DEX β</b>
@@ -1525,22 +1587,33 @@ function vTasks(){
   ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
   return h}
 
-function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:hsl(${h},55%,48%)">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
-function amt(n){const s=f(n,4);return '<span class="coin">#</span><span class="amt">'+s.slice(0,-3)+'<small>'+s.slice(-3)+'</small></span>'}
+const ICO={trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+ trophy:'<path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/>',
+ users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+ rocket:'<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>',
+ cal:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+ pick:'<path d="M14.531 12.469 6.619 20.38a1 1 0 1 1-3-3l7.912-7.912"/><path d="M15.686 4.314A12.5 12.5 0 0 0 5.461 2.958 1 1 0 0 0 5.58 4.71a22 22 0 0 1 6.318 3.393"/><path d="M17.7 3.7a1 1 0 0 0-1.4 0l-4.6 4.6a1 1 0 0 0 0 1.4l2.6 2.6a1 1 0 0 0 1.4 0l4.6-4.6a1 1 0 0 0 0-1.4z"/><path d="M19.686 8.314a12.501 12.501 0 0 1 1.356 10.225 1 1 0 0 1-1.751-.119 22 22 0 0 0-3.393-6.319"/>',
+ list:'<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+ bars:'<path d="M3 21h18"/><path d="M7 21V12"/><path d="M12 21V5"/><path d="M17 21v-9"/>',
+ wallet:'<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>'};
+const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
+const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
+function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
+function amt(n){const s=f(n,4);return '<i class="cn">#</i><span class="amt">'+s.slice(0,-3)+'<small>'+s.slice(-3)+'</small></span>'}
+function who(name,lv,t,tot){return `<div class="nm"><div class="nl"><b>${esc(name)}</b>${badge(t)}<span class="lv">مستوى ${lv}</span></div><div class="am">${amt(tot)}</div></div>`}
 function vTop(){
   if(!TOP)return '<p class="h">…</p>';
   const C=TOP.chain,M=TOP.mine;
-  return `<div class="stc"><div class="sth"><span class="stic">📈</span>إحصائيات البلوكشين</div>
-  <div style="padding:14px"><div class="row"><span class="lb">إجمالي المُعدَّن</span><span class="pct">${f(C.pct)}<small>%</small></span></div>
-  <div class="bar2"><i style="width:${Math.min(100,C.pct)}%"></i></div></div>
-  <div class="st3"><div><span class="lb">👥 الحائزون</span><b>${fi(C.holders)}</b></div>
-  <div><span class="lb">🚀 الإصدار</span><b>${fi(C.emission)}</b></div>
-  <div><span class="lb">📅 البداية</span><b>${esc(C.start_date)}</b></div></div></div>
-  <div class="stc"><div class="sth"><span class="stic">🏆</span>ترتيبي<span class="rb">#${fi(TOP.rank)}</span></div>
-  <div class="mebody">${avs(M.name)}<div class="nm"><b>${esc(M.name)}</b>${badge(M.tier)} <span class="lv">مستوى ${M.level}</span><div>${amt(M.total)}</div></div></div></div>
-  <div class="stc"><div class="sth"><span class="stic">🏆</span>أفضل 100 معدّن</div>`+
-  (TOP.top.length?TOP.top.map((r,i)=>`<div class="lr ${r.me?'me':''}"><span class="lrk ${i<3?'tp':''}">${String(i+1).padStart(2,'0')}</span>${avs(r.name)}
-  <div class="nm"><b>${esc(r.name)}</b>${badge(r.tier)} <span class="lv">مستوى ${r.level}</span><div>${amt(r.total)}</div></div></div>`).join(''):'<p class="h" style="padding:14px">لا أحد بعد.</p>')+'</div>'}
+  return `<div class="stc"><div class="sth"><span class="stic">${ic('trend',14)}</span>إحصائيات البلوكشين</div>
+  <div class="tmb"><div class="tr"><span class="mlb">إجمالي المُعدَّن</span><span class="pc">${f(C.pct)}<small>%</small></span></div>
+  <div class="pb"><i style="width:${Math.min(100,C.pct)}%"></i></div></div>
+  <div class="st3"><div><div class="fl">${ic('users',12)}الحائزون</div><div class="fv">${fi(C.holders)}</div></div>
+  <div><div class="fl">${ic('rocket',12)}الإصدار</div><div class="fv">${fi(C.emission)}</div></div>
+  <div><div class="fl">${ic('cal',12)}البداية</div><div class="fv">${esc(C.start_date)}</div></div></div></div>
+  <div class="stc"><div class="sth"><span class="stic or">${ic('trophy',14)}</span>ترتيبي<span class="rb">#${fi(TOP.rank)}</span></div>
+  <div class="mb">${avs(M.name)}${who(M.name,M.level,M.tier,M.total)}</div></div>
+  <div class="stc"><div class="sth"><span class="stic">${ic('trophy',14)}</span>أفضل 100 معدّن</div>`+
+  (TOP.top.length?TOP.top.map((r,i)=>`<div class="lr ${r.me?'me':''}"><span class="lrk ${i<3?'tp':''}">${String(i+1).padStart(2,'0')}</span>${avs(r.name)}${who(r.name,r.level,r.tier,r.total)}</div>`).join(''):'<p class="h" style="padding:14px">لا أحد بعد.</p>')+'</div>'}
 function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${bal(S.balance)}</div></div>
   <div class="card"><h3>🎁 لديك كود؟</h3>
   <input id="cd" class="inp" placeholder="TH-XXXXXXXX" autocapitalize="characters" autocomplete="off">
@@ -1589,7 +1662,7 @@ function sheetHTML(){
 
 const V={mine:vMine,refs:vRefs,tasks:vTasks,top:vTop,wallet:vWallet};
 function draw(){
-  $('nav').innerHTML=TABS.map(t=>`<div class="${t[0]===tab?'on':''}" onclick="go('${t[0]}')"><span>${t[1]}</span>${t[2]}</div>`).join('');
+  $('nav').innerHTML=TABS.map(t=>`<div class="${t[0]===tab?'on':''}" onclick="go('${t[0]}')">${t[0]==='tasks'?'<i class="earn">EARN<b></b><b></b></i>':''}<span>${ic(NI[t[0]])}</span>${t[2]}</div>`).join('');
   $('app').innerHTML='<div class="w" style="padding:0">'+V[tab]()+'</div>';
   $('sh').innerHTML=sheetHTML()}
 setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
@@ -1602,7 +1675,7 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
 setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
-setInterval(()=>{if(!S||!S.chain||S.chain.started)return;
+setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
   if(e)e.textContent=(d?d+'ي ':'')+p(h)+':'+p(m)+':'+p(s)},1000);
@@ -1628,6 +1701,7 @@ def main():
     app.add_handler(CommandHandler("payments", cmd_payments))
     app.add_handler(CommandHandler("settitle", cmd_settitle))
     app.add_handler(CommandHandler("setstart", cmd_setstart))
+    app.add_handler(CommandHandler("resetall", cmd_resetall))
     app.add_handler(CommandHandler("setblocks", cmd_setblocks))
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("gencode", cmd_gencode))
