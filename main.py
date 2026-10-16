@@ -82,7 +82,8 @@ XP_DIV = 1000           # خبرة بالثانية = معدل الهاش / هذ
 EASY_LEVELS = 10        # عدد المستويات السهلة
 XP_GROWTH = 1.10        # نسبة زيادة الصعوبة بعد المستويات السهلة (10% لكل مستوى)
 SUPPORT_MAX = 10000     # أقصى مبلغ دعم بالنجوم
-BLOCK_REWARD = 50       # مكافأة الكتلة (كل 5 ثوانٍ، تُسحب بالقرعة حسب قوة الهاش)
+BLOCK_REWARD = 50       # إجمالي مكافأة الكتلة (كل 5 ثوانٍ)
+WINNER_PCT = 0.4        # حصة المعدّن الفائز بالقرعة من الكتلة (40%)؛ الباقي (60%) يُوزَّع على كل المعدّنين النشطين بنسبة هاشهم
 REF_ENERGY = 1000        # +طاقة قصوى لكل مُحال يملك أكثر من REF_MIN نقطة حالياً (تُسحب إن نزل رصيده)
 REF_MIN = 1000
 DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
@@ -252,6 +253,9 @@ def init_db():
             id {pk}, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
             expires DOUBLE PRECISION NOT NULL DEFAULT 0)""")
         cur.execute("CREATE TABLE IF NOT EXISTS m_settings(k TEXT PRIMARY KEY, v TEXT)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS m_block_rewards(
+            block_id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            PRIMARY KEY(block_id, user_id))""")
     add_cols("m_users", [("mode", "INT NOT NULL DEFAULT 1"),
                          ("hr", "DOUBLE PRECISION NOT NULL DEFAULT 1000"),
                          ("hashes", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
@@ -259,7 +263,11 @@ def init_db():
                          ("income", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("modes", "TEXT NOT NULL DEFAULT '1'")])
-    add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
+    add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                          ("bhash", "TEXT NOT NULL DEFAULT ''"),
+                          ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
+                          ("miner_mode", "INT NOT NULL DEFAULT 1"),
+                          ("shared", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
                 "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)",
                 "CREATE INDEX IF NOT EXISTS ix_m_srv ON m_servers (user_id)"):
@@ -487,33 +495,55 @@ def apply_payment(uid, key, charge, stars):
 
 
 def make_block():
-    """كتلة كل 5 ثوانٍ؛ الفائز بالقرعة موزونة بقوة الهاش بين المعدّنين النشطين فعلاً."""
+    """كتلة كل 5 ثوانٍ. الفائز بالقرعة (موزونة بالهاش) يأخذ WINNER_PCT من المكافأة،
+    والباقي (المكافأة المشتركة) يُوزَّع على كل المعدّنين النشطين بنسبة هاش كل واحد منهم."""
     now = time.time()
     if now < CHAIN["start"] or CHAIN["done"]:
         return
     with cursor() as cur:
         cur.execute("DELETE FROM m_servers WHERE expires>0 AND expires<?", (now,))
-        cur.execute("SELECT id,name,level,hr,patron FROM m_users WHERE " + SQL_ACTIVE + " LIMIT 3000", (now,))
+        cur.execute("SELECT id,name,level,hr,patron FROM m_users WHERE " + SQL_ACTIVE + " LIMIT 20000", (now,))
         ms = cur.fetchall()
         if not ms:
             return
-        total = sum(m["hr"] for m in ms)
+        total = sum(max(m["hr"], 1.0) for m in ms)
         w = random.choices(ms, weights=[max(m["hr"], 1.0) for m in ms])[0]
+        pool = BLOCK_REWARD * (1 - WINNER_PCT)             # المكافأة المشتركة
+        k = pool / total                                   # حصة كل 1 هاش
+        win = BLOCK_REWARD * WINNER_PCT * (2 if w["patron"] > now else 1)   # مكافأة المعدّن (الراعي ×2)
+        cur.execute("SELECT bhash FROM m_blocks ORDER BY id DESC LIMIT 1")
+        prev = (cur.fetchone() or {}).get("bhash") or "0" * 64
+        bh = "00000" + hashlib.sha256(
+            f"{prev}|{w['id']}|{win}|{now}|{secrets.token_hex(4)}".encode()).hexdigest()[5:]
+        cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,thr,created_at,"
+                    "bhash,prev_hash,miner_mode,shared) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (w["id"], w["name"], w["level"], win, len(ms), total, int(now), bh, prev, 1, pool))
+        cur.execute("SELECT MAX(id) AS m FROM m_blocks")
+        bid = (cur.fetchone() or {}).get("m") or 0
+        # سجل حصة كل معدّن في هذه الكتلة (ليظهر في «مكافأتك»)
+        cur.execute("INSERT INTO m_block_rewards(block_id,user_id,amount) "
+                    "SELECT ?, id, hr*?*(CASE WHEN patron>? THEN 2 ELSE 1 END) FROM m_users WHERE "
+                    + SQL_ACTIVE, (bid, k, now, now))
+        # توزيع المكافأة المشتركة على الجميع دفعة واحدة
+        x = "hr*?*(CASE WHEN patron>? THEN 2 ELSE 1 END)"
+        cur.execute(f"UPDATE m_users SET balance=balance+{x}, total=total+{x}, income=income+{x} WHERE "
+                    + SQL_ACTIVE, (k, now, k, now, k, now, now))
+        # مكافأة الفائز (بعد التوزيع كي لا تُكتب فوق رصيده)
         try:
-            u = lock_user(cur, w["id"])          # تحديث الفائز لحظياً (المستوى/الرصيد/الطاقة) قبل تسجيل الكتلة
+            u = lock_user(cur, w["id"])
         except Err:
             return
-        rew = BLOCK_REWARD * (2 if u["patron"] > now else 1)
-        u["balance"] += rew
-        u["total"] += rew
+        u["balance"] += win
+        u["total"] += win
         u["wins"] += 1
-        u["income"] += rew
+        u["income"] += win
         save_user(cur, u)
-        cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,thr,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)", (u["id"], u["name"], u["level"], rew, len(ms), total, int(now)))
-        cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
-        cur.execute("SELECT MAX(id) AS m FROM m_blocks")
-        if ((cur.fetchone() or {}).get("m") or 0) >= CHAIN["blocks"]:
+        cur.execute("UPDATE m_blocks SET miner_level=?, miner_mode=? WHERE id=?", (u["level"], cur_mode(u), bid))
+        cur.execute("UPDATE m_block_rewards SET amount=amount+? WHERE block_id=? AND user_id=?",
+                    (win, bid, w["id"]))
+        cur.execute("DELETE FROM m_blocks WHERE id < ?", (bid - 200,))
+        cur.execute("DELETE FROM m_block_rewards WHERE block_id < ?", (bid - 200,))
+        if bid >= CHAIN["blocks"]:
             CHAIN["done"] = True
 
 
@@ -830,8 +860,23 @@ def act_blocks(tg, b):
     with cursor() as cur:
         cur.execute("SELECT * FROM m_blocks ORDER BY id DESC LIMIT 25")
         rows = cur.fetchall()
-    return {"blocks": [dict(id=r["id"], miner=r["miner_name"], level=r["miner_level"], reward=r["reward"],
-                            t=r["created_at"], miners=r["miners"]) for r in rows]}
+        mine = {}
+        if rows:
+            ids = [r["id"] for r in rows]
+            cur.execute("SELECT block_id, amount FROM m_block_rewards WHERE user_id=? AND block_id IN ("
+                        + ",".join("?" * len(ids)) + ")", (tg["id"], *ids))
+            mine = {r["block_id"]: r["amount"] for r in cur.fetchall()}
+    out = []
+    for r in rows:
+        my = mine.get(r["id"])
+        if my is None:                      # كتل قديمة قبل نظام التوزيع
+            my = r["reward"] if r["miner_id"] == tg["id"] else 0
+        out.append(dict(id=r["id"], miner=r["miner_name"], level=r["miner_level"], reward=r["reward"],
+                        t=r["created_at"], miners=r["miners"], thr=r.get("thr") or 0,
+                        shared=r.get("shared") or 0, prev=r.get("prev_hash") or "",
+                        tier=tier(r.get("miner_mode")), my=my,
+                        rare=r["reward"] > BLOCK_REWARD * WINNER_PCT))
+    return {"blocks": out}
 
 
 def act_top(tg, b):
@@ -1324,7 +1369,7 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def wipe():
         with cursor() as cur:
-            for t in ("m_users", "m_tasks", "m_servers", "m_redeems", "m_codes"):
+            for t in ("m_users", "m_tasks", "m_servers", "m_redeems", "m_codes", "m_block_rewards"):
                 cur.execute(f"DELETE FROM {t}")
             if USE_PG:
                 cur.execute("TRUNCATE m_blocks RESTART IDENTITY")
@@ -1611,6 +1656,55 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .mbtn.ok{border:1px solid #3a3d41;color:var(--tx)}
 .mbar{position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--mc);border-radius:0 3px 3px 0;transition:width .25s linear}
 .mnote{font-size:11px;line-height:1.6;color:var(--mut);margin:12px 2px 0}
+/* ── بطاقات الكتل ── */
+.bkc{background:#25282b;border:1px solid #33363a;border-radius:12px;padding:13px 14px 12px;margin-bottom:12px;cursor:pointer}
+.bkc:active{background:#2a2d30}
+.bkh{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.bkn{font:400 11px var(--mono);letter-spacing:.12em;color:#8b9098;direction:ltr;white-space:nowrap}
+.bkn b{font:700 15px var(--mono);letter-spacing:0;color:#ffa861;margin-inline-start:8px}
+.bkr{display:flex;align-items:center;gap:8px;color:#8b9098}
+.rwp{display:flex;align-items:center;gap:6px;border:1px solid #3a3d41;border-radius:8px;background:#2b2e31;padding:3px 9px;font:400 10.5px var(--mono);color:#8b9098;white-space:nowrap}
+.rwp .rv{direction:ltr;font:700 10.5px var(--mono);color:#c3c6c9}.rwp .rv small{font-size:8.5px;color:#6b7178;font-weight:400}
+.cx{display:inline-grid;place-items:center;width:var(--s,12px);height:var(--s,12px);border-radius:calc(var(--s,12px)*.28);background:linear-gradient(#ffb674,#ff9a4a);color:#fff;font:800 calc(var(--s,12px)*.7) var(--mono);font-style:normal;flex:none;line-height:1}
+.bkm{display:flex;align-items:center;gap:8px;margin-top:11px;min-width:0}
+.bkl{color:#8b9098;font-size:13px;flex:none}
+.bkm .avs{width:22px;height:22px;font-size:10px;border-radius:6px}
+.bkm b{font:700 14px var(--disp);color:#f4f4f4;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lvp{font:400 11px var(--mono);color:#8b9098;border:1px solid #3a3d41;border-radius:6px;padding:0 7px;background:#2b2e31;white-space:nowrap;direction:ltr;flex:none}
+.bkf{display:flex;justify-content:space-between;align-items:flex-end;gap:8px;margin-top:9px}
+.bkd{font:400 11px var(--mono);color:#8b9098;direction:ltr}
+.rar{font:700 10px var(--mono);letter-spacing:.08em;border:1px solid #4a4e53;border-radius:5px;padding:2px 10px;color:#9aa0a6;background:#ffffff08;white-space:nowrap}
+.rar.gr{color:#3ecf8e;border-color:#3ecf8eb0;background:#3ecf8e1f}
+/* ── نافذة تفاصيل الكتلة ── */
+.bm{position:relative;border:1px solid #3a3d41;border-radius:16px;overflow:hidden;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;max-height:86vh;overflow-y:auto}
+.bm::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent)}
+.bmh{display:flex;justify-content:space-between;align-items:flex-start;padding:16px 16px 12px;gap:10px}
+.bml{font:400 11px var(--mono);letter-spacing:.1em;color:#8b9098}
+.bmn{font:700 24px var(--disp);color:#f4f4f4;direction:ltr;text-align:start;margin-top:4px}
+.bmr{display:flex;align-items:center;gap:8px}
+.bmd{display:flex;align-items:center;gap:8px;border:1px solid #3a3d41;border-radius:9px;background:#25282b;padding:6px 10px;color:#8b9098;direction:ltr}
+.bmd b{display:block;font:700 12px var(--mono);color:#f4f4f4;line-height:1.3}.bmd small{display:block;font:400 11px var(--mono);color:#8b9098;line-height:1.3}
+.bmx{width:26px;height:26px;margin:0;padding:0;display:grid;place-items:center;border:1px solid #3a3d41;border-radius:7px;background:#25282b;color:#9aa0a6}
+.bmy{margin:0 16px 14px;border:1px solid #33363a;border-radius:11px;background:#1f2225;padding:14px 16px}
+.bmv{display:flex;align-items:center;gap:10px;margin-top:10px;direction:ltr;justify-content:flex-start}
+.bmv span{font:700 34px var(--mono);color:#f4f4f4;line-height:1}.bmv span small{font-size:20px;color:#6b7178;font-weight:700}
+.bmv span.z{color:#8b9098}
+.bmg{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid #33363a;border-bottom:1px solid #33363a}
+.bmc2{padding:14px 16px;min-width:0}
+.bmc2:nth-child(1),.bmc2:nth-child(2){border-bottom:1px solid #33363a}
+.bmc2:nth-child(odd){border-inline-end:1px solid #33363a}
+.bmcl{display:flex;align-items:center;gap:8px;font:600 11px var(--disp);color:#8b9098}
+.bmi{width:26px;height:26px;border:1px solid;border-radius:7px;display:grid;place-items:center;flex:none}
+.bmi.o{color:#ffa861;background:#3e3833;border-color:#6e4c32}
+.bmi.t{color:#38b6ff;background:#38b6ff1f;border-color:#38b6ff66}
+.bmi.g{color:#3ecf8e;background:#3ecf8e1f;border-color:#3ecf8e66}
+.bmi.y{color:#ffc23f;background:#ffc23f1f;border-color:#ffc23f66}
+.bmcv{margin-top:10px;font:700 17px var(--mono);color:#f4f4f4;direction:ltr;text-align:start;display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bmcv small{font-size:12px;color:#6b7178;font-weight:400}
+.bmf{padding:14px 16px 16px}
+.bmfr{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}
+.bmc{display:flex;align-items:center;gap:6px;width:auto;margin:0;padding:6px 12px;border:1px solid #4a4e53;border-radius:8px;background:#25282b;font:600 12px var(--disp);color:#e6e8ea}
+.bmhash{font:400 12px/1.6 var(--mono);color:#e6e8ea;background:#1f2225;border:1px solid #33363a;border-radius:9px;padding:12px;word-break:break-all;direction:ltr;text-align:left}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1693,7 +1787,9 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 <div class="nav" id="nav"></div><div id="sh"></div><div id="toast"></div>
 <script>
 const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
-let S=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
+try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
+function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
+let S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
 const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
@@ -1719,9 +1815,9 @@ async function load(){
   const r=await Promise.all(jobs);
   S=r[0];if(tab==='mine')B=r[1].blocks;if(tab==='top')TOP=r[1];if(tab==='refs')REFS=r[1].reftop;
   draw()}
-function go(t){stopBench();tab=t;sheet=null;load().catch(e=>toast(e.message))}
-function openSheet(s){sheet=s;draw()}
-function closeSheet(){stopBench();sheet=null;draw()}
+function go(t){stopBench();tab=t;sheet=null;bb();load().catch(e=>toast(e.message))}
+function openSheet(s){sheet=s;draw();bb()}
+function closeSheet(){stopBench();sheet=null;draw();bb()}
 function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
 function redeem(){const c=$('cd').value.trim();if(!c)return;
   api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
@@ -1818,6 +1914,30 @@ function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN 
   <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
   <button class="pri" onclick="openSheet('energy')">⚡ احصل على طاقة</button></div>`}
 
+function dparts(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
+  return [p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear(),p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())]}
+function openBlk(i){BK=B[i];openSheet('blk')}
+function cpHash(){if(BK&&BK.prev)navigator.clipboard.writeText(BK.prev).then(()=>toast('تم النسخ')).catch(()=>toast('تعذّر النسخ'))}
+function blkCard(b,i){const d=dparts(b.t);
+  return `<div class="bkc" onclick="openBlk(${i})">
+  <div class="bkh"><span class="bkn">BLOCK<b>#${fi(b.id)}</b></span>
+   <span class="bkr"><span class="rwp">مكافأتك<i class="cx" style="--s:11px">#</i><span class="rv">${bal(b.my)}</span></span>${ic('chev',14)}</span></div>
+  <div class="bkm"><span class="bkl">المعدّن:</span>${avs(b.miner)}<b>${esc(b.miner)}</b>${badge(b.tier)}<span class="lvp">Lv ${b.level}</span></div>
+  <div class="bkf"><span class="bkd">أُنشئت: ${d[0]}, ${d[1]}</span><span class="rar ${b.rare?'gr':''}">${b.rare?'غير عادي':'عادي'}</span></div></div>`}
+function blkModal(){const b=BK;if(!b)return '';const d=dparts(b.t);
+  const cell=(c,icn,l,v)=>`<div class="bmc2"><div class="bmcl"><span class="bmi ${c}">${ic(icn,13)}</span><span>${l}</span></div><div class="bmcv">${v}</div></div>`;
+  return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><div class="bm">
+  <div class="bmh"><div><div class="bml">الكتلة</div><div class="bmn">#${fi(b.id)}</div></div>
+   <div class="bmr"><div class="bmd">${ic('cal',14)}<div><b>${d[0]}</b><small>${d[1]}</small></div></div><button class="bmx" onclick="closeSheet()">${ic('x',14)}</button></div></div>
+  <div class="bmy"><div class="bml">مكافأتك</div><div class="bmv"><i class="cx" style="--s:26px">#</i><span class="${b.my>0?'':'z'}">${bal(b.my)}</span></div></div>
+  <div class="bmg">`+
+   cell('o','user','المعدّن',esc(b.miner))+
+   cell('t','users','عدد المعدّنين',fi(b.miners))+
+   cell('g','link','مكافأة المعدّن','<i class="cx" style="--s:16px">#</i>'+bal(b.reward))+
+   cell('y','share','المكافأة المشتركة','<i class="cx" style="--s:16px">#</i>'+bal(b.shared))+
+  `</div><div class="bmf"><div class="bmfr"><span class="bml">هاش الكتلة السابقة</span><button class="bmc" onclick="cpHash()">${ic('copy',13)}نسخ</button></div>
+  <div class="bmhash">${esc(b.prev||'—')}</div></div></div></div></div>`}
+
 function vMine(){
   let h=walletCard();
   if(!S.chain.started)h+=S.chain.scheduled?`<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">ينطلق في <b>${esc(S.chain.start_txt)}</b></p><div class="big" id="cdn" style="font-size:30px;text-align:center;margin-top:10px">--:--:--</div></div>`:
@@ -1850,9 +1970,7 @@ function vMine(){
     <button class="mdb" onclick="openSheet('modes')"><span class="mdi">${ic(mc[0],18)}</span><span class="mdt"><small>الوضع</small><b>${esc(m.name)}</b></span><span class="mdx">×${m.mul}</span>${ic('sliders',17)}</button></div>
     <button class="runb" onclick="openSheet('servers')">${ic('server',16)}مركز إدارة الخوادم</button></div>`;
   }
-  h+=`<div class="card"><h3>آخر 25 كتلة</h3>`+(B.length?B.map(b=>`<div class="blk"><div class="row" style="color:var(--tx)"><b>كتلة <span class="tag">#${fi(b.id)}</span></b><span class="tag">+${f(b.reward,1)} #</span></div>
-  <div style="margin-top:4px">${av(b.miner)} <b>${esc(b.miner)}</b> <span class="h">مستوى ${b.level} · ${fi(b.miners)} معدّن</span></div>
-  <div class="h" style="direction:ltr;text-align:right">${fmtDate(b.t)}</div></div>`).join(''):'<p class="h">لا توجد كتل بعد.</p>')+'</div>';
+  h+=`<h3 style="margin:4px 2px 10px">آخر 25 كتلة</h3>`+(B.length?B.map(blkCard).join(''):'<div class="card"><p class="h">لا توجد كتل بعد.</p></div>');
   return h}
 
 function vRefs(){
@@ -1906,6 +2024,9 @@ Object.assign(ICO,{
  x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
  sliders:'<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>',
  server:'<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/>'});
+Object.assign(ICO,{share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98"/><path d="m15.41 6.51-6.82 3.98"/>',chev:'<path d="m15 18-6-6 6-6"/>',
+ user:'<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+ link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>'});
 const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
 const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
@@ -1941,6 +2062,7 @@ function vWallet(){return `<div class="card"><div class="row"><span>الرصيد
 
 function sheetHTML(){
   if(!sheet)return '';
+  if(sheet==='blk')return blkModal();
   let b='';
   if(sheet==='energy'){
     b=`<div class="cap">ENERGY · UPGRADE</div><h2>زيادة الطاقة القصوى</h2>
@@ -1991,7 +2113,7 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
-setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&sheet!=='modes'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
+setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&sheet!=='modes'&&sheet!=='blk'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
 setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
