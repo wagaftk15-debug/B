@@ -1137,22 +1137,23 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 </style></head><body>
 <canvas id="intro"></canvas>
 <script>
-/* مقدمة المربعات: 4 ثوانٍ على كامل الصفحة، كثافة أعلى في الأسفل وتتلاشى نحو الأعلى */
+/* مقدمة المربعات (مطابقة لشاشة التحميل): شبكة 16px، مربع 11px، تبدأ من منتصف الشاشة تقريباً وتزداد نحو الأسفل، مدتها 4 ثوانٍ */
 (function(){
   const cv=document.getElementById('intro');
   try{
-    const cx=cv.getContext('2d'),DUR=4000,CELL=22,SZ=12,dpr=Math.min(2,window.devicePixelRatio||1);
+    const cx=cv.getContext('2d'),DUR=4000,CELL=16,SZ=11,START=.46,RAMP=.16,dpr=Math.min(2,window.devicePixelRatio||1);
     let W=0,H=0,cells=[];
     function init(){
       const r=cv.getBoundingClientRect();W=Math.max(1,Math.round(r.width));H=Math.max(1,Math.round(r.height));
       cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);cells=[];
       const cols=Math.ceil(W/CELL)+1,rows=Math.ceil(H/CELL)+1;
-      for(let r2=0;r2<rows;r2++)for(let c=0;c<cols;c++){
-        const y=Math.min(1,r2*CELL/H);
-        cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,d:.28+.72*Math.pow(y,1.1),k:Math.random(),
-          o:Math.random()<.32,p:Math.random()*6.28,s:1.4+Math.random()*2.8,dr:.4+Math.random()*1.2})}}
+      for(let r2=0;r2<rows;r2++){
+        const yf=r2*CELL/H;if(yf<START)continue;
+        const ramp=Math.min(1,(yf-START)/RAMP);
+        for(let c=0;c<cols;c++)cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,ramp:ramp,
+          o:Math.random()<.3,p:Math.random()*6.28,s:1.2+Math.random()*2.6,pw:3+Math.random()*3})}}
     init();
-    function sq(x,y){if(cx.roundRect){cx.beginPath();cx.roundRect(x,y,SZ,SZ,3);cx.fill()}else cx.fillRect(x,y,SZ,SZ)}
+    function sq(x,y){if(cx.roundRect){cx.beginPath();cx.roundRect(x,y,SZ,SZ,2.5);cx.fill()}else cx.fillRect(x,y,SZ,SZ)}
     let t=0,last=0,fading=false;
     function frame(now){
       const dt=last?Math.min(50,now-last):16;last=now;t+=dt;   /* لا يحسب وقت التوقف أو التحميل */
@@ -1163,10 +1164,9 @@ button.sm{width:auto;margin:0;padding:8px 14px}
       cx.clearRect(0,0,W,H);
       const g=Math.min(1,t/300);
       for(const c of cells){
-        const k=(c.k+t/9000*c.dr)%1;if(k>c.d)continue;
-        const w=Math.pow(.5+.5*Math.sin(t/1000*c.s+c.p),1.4);
-        const a=w*g*(.4+.6*c.d);
-        cx.fillStyle=c.o?`rgba(255,164,91,${(a*.95).toFixed(3)})`:`rgba(150,130,115,${(a*.6).toFixed(3)})`;
+        const w=.5+.5*Math.sin(t/1000*c.s+c.p);
+        const a=c.ramp*g*(.1+.9*Math.pow(w,c.pw));      /* أغلبها خافت وبعضها يومض بقوة */
+        cx.fillStyle=c.o?`rgba(228,150,85,${(a*.95).toFixed(3)})`:`rgba(122,112,90,${(a*.7).toFixed(3)})`;
         sq(c.x,c.y)}
       requestAnimationFrame(frame)}
     requestAnimationFrame(frame);
