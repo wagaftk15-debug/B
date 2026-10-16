@@ -65,6 +65,7 @@ if _raw.startswith("http://"):
 elif _raw and not _raw.startswith("https://"):
     _raw = "https://" + _raw
 WEBAPP_URL = _raw
+APP_URL = f"{WEBAPP_URL}/app?v={int(time.time())}" if WEBAPP_URL else ""   # يمنع كاش تيليجرام للصفحة القديمة
 
 # اللعبة (كلها نقاط افتراضية داخل البوت)
 ITEMS = {
@@ -772,7 +773,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = ("👋 أهلاً بك في <b>TotalHash</b>!\n\nلعبة تعدين افتراضية: اجمع النقاط، طوّر معدّنك، "
             "وتصدّر القائمة.\nℹ️ النقاط داخل اللعبة فقط ولا تمثل عملة رقمية حقيقية ولا يمكن سحبها.")
     if WEBAPP_URL:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app"))]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=APP_URL))]])
         await update.message.reply_text(text, reply_markup=kb)
     else:
         await update.message.reply_text(text)
@@ -1057,7 +1058,7 @@ async def post_init(app: Application):
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
-                text="⛏ تعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app")))
+                text="⛏ تعدين", web_app=WebAppInfo(url=APP_URL)))
     except Exception as e:
         log.warning("setup failed: %s", e)
     BG.append(asyncio.create_task(block_loop()))
@@ -1130,9 +1131,49 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
 .sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
 .cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
+#intro{position:fixed;inset:0;width:100%;height:100%;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none}
 #toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
 #toast.on{opacity:1}
 </style></head><body>
+<canvas id="intro"></canvas>
+<script>
+/* مقدمة المربعات: 4 ثوانٍ على كامل الصفحة، كثافة أعلى في الأسفل وتتلاشى نحو الأعلى */
+(function(){
+  const cv=document.getElementById('intro');
+  try{
+    const cx=cv.getContext('2d'),DUR=4000,CELL=22,SZ=12,dpr=Math.min(2,window.devicePixelRatio||1);
+    let W=0,H=0,cells=[];
+    function init(){
+      const r=cv.getBoundingClientRect();W=Math.max(1,Math.round(r.width));H=Math.max(1,Math.round(r.height));
+      cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);cells=[];
+      const cols=Math.ceil(W/CELL)+1,rows=Math.ceil(H/CELL)+1;
+      for(let r2=0;r2<rows;r2++)for(let c=0;c<cols;c++){
+        const y=Math.min(1,r2*CELL/H);
+        cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,d:.28+.72*Math.pow(y,1.1),k:Math.random(),
+          o:Math.random()<.32,p:Math.random()*6.28,s:1.4+Math.random()*2.8,dr:.4+Math.random()*1.2})}}
+    init();
+    function sq(x,y){if(cx.roundRect){cx.beginPath();cx.roundRect(x,y,SZ,SZ,3);cx.fill()}else cx.fillRect(x,y,SZ,SZ)}
+    let t=0,last=0,fading=false;
+    function frame(now){
+      const dt=last?Math.min(50,now-last):16;last=now;t+=dt;   /* لا يحسب وقت التوقف أو التحميل */
+      if(t>=DUR){cv.remove();return}
+      const r=cv.getBoundingClientRect();
+      if(Math.round(r.width)!==W||Math.round(r.height)!==H)init();
+      if(!fading&&t>DUR-600){fading=true;cv.style.opacity='0'}
+      cx.clearRect(0,0,W,H);
+      const g=Math.min(1,t/300);
+      for(const c of cells){
+        const k=(c.k+t/9000*c.dr)%1;if(k>c.d)continue;
+        const w=Math.pow(.5+.5*Math.sin(t/1000*c.s+c.p),1.4);
+        const a=w*g*(.4+.6*c.d);
+        cx.fillStyle=c.o?`rgba(255,164,91,${(a*.95).toFixed(3)})`:`rgba(150,130,115,${(a*.6).toFixed(3)})`;
+        sq(c.x,c.y)}
+      requestAnimationFrame(frame)}
+    requestAnimationFrame(frame);
+    setTimeout(()=>{if(cv.parentNode)cv.remove()},DUR+6000);   /* أمان: لا يعلق أبداً */
+  }catch(e){cv.remove()}
+})();
+</script>
 <div class="w" id="app"><p class="h" style="text-align:center;margin-top:40vh">…</p></div>
 <div class="nav" id="nav"></div><div id="sh"></div><div id="toast"></div>
 <script>
