@@ -1500,24 +1500,29 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .mdt b{display:block;font:700 15px var(--disp);color:var(--tx);line-height:1.3}
 .mdx{font:700 11px var(--mono);color:var(--mut);align-self:flex-start;direction:ltr}
 .mdb>svg{color:var(--mut);flex:none}
-.runb{display:flex;align-items:center;justify-content:center;gap:8px;background:#4a3320;color:#ffd9b8;border:1px solid #6e4c32}
+.runb{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:12px;padding:11px 14px;border-radius:9px;font-size:13px;background:#4a3320;color:#ffd9b8;border:1px solid #5d4128}
 .ov.mid{align-items:center;padding:14px}
 .shw{position:relative;width:100%;max-width:560px}
-.ov.mid .sh{border-radius:20px;max-height:86vh;padding:46px 14px 16px}
-.xb{position:absolute;top:10px;right:10px;z-index:3;width:34px;height:34px;margin:0;padding:0;display:grid;place-items:center;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--mut)}
-.mc{position:relative;display:flex;align-items:center;gap:12px;padding:14px 12px;margin-top:10px;border:1px solid var(--line);border-radius:14px;background:#25282b;overflow:hidden;cursor:pointer}
+.ov.mid .sh{border-radius:16px;max-height:86vh;padding:22px 20px 18px;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;scrollbar-width:thin;scrollbar-color:#4a4e53 transparent}
+.sh.lt{direction:ltr;text-align:left}
+.sh.lt .cap{text-align:left}
+.sh.lt h2{margin:8px 0 6px;font:700 20px var(--disp)}
+.sh.lt .h{font-size:12.5px;line-height:1.6}
+.xb{position:absolute;top:8px;right:12px;z-index:3;width:24px;height:24px;margin:0;padding:0;display:grid;place-items:center;border:1px solid #3a3d41;border-radius:6px;background:#25282b;color:#9aa0a6}
+.mc{position:relative;display:flex;align-items:center;gap:12px;padding:12px;margin-top:8px;border:1px solid #33363a;border-radius:10px;background:#25282b;overflow:hidden;cursor:pointer}
+.sh.lt .h+.mc{margin-top:14px}
 .mc.act{border-color:#b9702f;background:#3a342f}
-.mi{width:42px;height:42px;border:1px solid var(--mc);border-radius:10px;display:grid;place-items:center;color:var(--mc);background:color-mix(in srgb,var(--mc) 12%,transparent);flex:none}
-.mt{flex:1;min-width:0}.mt b{font:700 15px var(--disp);color:#f4f4f4}
-.mt em{font:700 11px var(--mono);color:var(--mc);font-style:normal;margin-inline-start:6px;direction:ltr;display:inline-block}
-.ms{font:400 11.5px var(--mono);color:var(--mut);margin-top:3px}
+.mi{width:36px;height:36px;border:1px solid var(--mc);border-radius:8px;display:grid;place-items:center;color:var(--mc);background:color-mix(in srgb,var(--mc) 14%,transparent);flex:none}
+.mt{flex:1;min-width:0}.mt b{font:700 14px var(--disp);color:#f4f4f4;line-height:1.3}
+.mt em{font:700 10px var(--mono);color:var(--mc);font-style:normal;margin-inline-start:6px;direction:ltr;display:inline-block}
+.ms{font:400 11px var(--mono);color:var(--mut);margin-top:3px;line-height:1.2}
 .ms .lt{direction:ltr;display:inline-block}
-.mbtn{display:flex;align-items:center;gap:5px;flex:none;padding:6px 12px;border-radius:9px;font:700 12px var(--mono);direction:ltr}
+.mbtn{display:flex;align-items:center;gap:4px;flex:none;padding:4px 9px;border-radius:6px;font:700 11px var(--mono);direction:ltr;line-height:1.5}
 .mbtn.pr{background:#ffa861;color:#1e1307}
 .mbtn.on{border:1px solid #4a4e53;color:#c3c6c9}
-.mbtn.ok{border:1px solid var(--line);color:var(--tx)}
-.mbar{position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--mc);transition:width .25s linear}
-.mnote{font-size:11.5px;line-height:1.7;color:var(--mut);margin:14px 2px 0}
+.mbtn.ok{border:1px solid #3a3d41;color:var(--tx)}
+.mbar{position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--mc);border-radius:0 3px 3px 0;transition:width .25s linear}
+.mnote{font-size:11px;line-height:1.6;color:var(--mut);margin:12px 2px 0}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1651,8 +1656,10 @@ function mSub(k){
   if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H/s</span>`;
   return 'شغّل الاختبار'}
 function mBar(k){
-  if(TEST.run&&TEST.cur==k)return Math.min(100,TEST.el/(TEST_SECS*1000)*100);
-  return TEST.res[k]!=null?100:0}
+  if(TEST.run&&TEST.cur==k)return Math.min(100,TEST.el/(TEST_SECS*1000)*100);   /* أثناء اختبار هذا الوضع: تقدّم الوقت */
+  if(TEST.res[k]==null)return 0;
+  const mx=Math.max(...Object.values(TEST.res).map(Number));                      /* بعد الانتهاء: نسبة النتيجة إلى أعلى نتيجة */
+  return mx>0?TEST.res[k]/mx*100:0}
 function runLbl(){return TEST.run?ic('stop',14)+'إيقاف الاختبار':ic('play',14)+'اختبار السرعة'}
 function uiModes(){
   if(sheet!=='modes'||!S)return;
@@ -1687,11 +1694,11 @@ function modeClick(k){
   else buy('mode_'+k)}
 function modeCard(k){
   const m=S.modes[k],c=MC[k]||MC[1],un=S.unlocked.includes(+k),on=S.mode==k;
-  const btn=on?`<span class="mbtn on">${ic('check',13)}نشط</span>`:
+  const btn=on?`<span class="mbtn on">${ic('check',12)}نشط</span>`:
     un?`<span class="mbtn ok">اختر</span>`:
-    `<span class="mbtn pr">${ic('lock',13)}${m.stars}${ic('star',13)}</span>`;
+    `<span class="mbtn pr">${ic('lock',12)}${m.stars}${ic('star',12)}</span>`;
   return `<div class="mc ${on?'act':''}" style="--mc:${c[1]}" onclick="modeClick(${k})">
-    <span class="mi">${ic(c[0],21)}</span>
+    <span class="mi">${ic(c[0],18)}</span>
     <div class="mt"><b>${esc(m.name)}</b><em>×${m.mul}</em><div class="ms" id="ms${k}">${mSub(k)}</div></div>${btn}
     <i class="mbar" id="mb${k}" style="width:${mBar(k)}%"></i></div>`}
 
@@ -1855,12 +1862,12 @@ function sheetHTML(){
     <button class="pri" onclick="dxGo()">${dxSide==='buy'?'شراء':'بيع'}</button>`;
   }else if(sheet==='modes'){
     const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b),mins=Math.max(1,Math.round(ks.length*TEST_SECS/60));
-    b=`<div class="cap cap2" style="direction:ltr;justify-content:flex-end"><i class="dot"></i>MINING · MODES</div><h2>أوضاع التعدين</h2>
+    b=`<div class="cap cap2"><i class="dot"></i>MINING · MODES</div><h2>أوضاع التعدين</h2>
     <p class="h">كل مستوى يستخدم طريقة بحث هاش مختلفة — درجات متفاوتة من توازي WebCrypto. أداء موحد على الجوال والكمبيوتر.</p>`+
     ks.map(k=>modeCard(k)).join('')+
     `<button class="runb" id="rb" onclick="runBench()">${runLbl()}</button>
     <p class="mnote">يستغرق الاختبار نحو ${mins} ${mins<3?'دقيقتين':'دقائق'} (${TEST_SECS} ث لكل وضع). لا تستخدم الجهاز خلال الاختبار للحصول على أدق نتيجة.</p>`;
-    return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><button class="xb" onclick="closeSheet()">${ic('x',16)}</button><div class="sh">${b}</div></div></div>`}
+    return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><button class="xb" onclick="closeSheet()">${ic('x',16)}</button><div class="sh lt">${b}</div></div></div>`}
   return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="sh"><button class="sm" style="float:left;margin:0" onclick="closeSheet()">✕</button>${b}</div></div>`}
 
 const V={mine:vMine,refs:vRefs,tasks:vTasks,top:vTop,wallet:vWallet};
