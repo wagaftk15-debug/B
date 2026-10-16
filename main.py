@@ -1,1200 +1,713 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-HashChain - سلسلة بلوكات حقيقية (Proof of Work) + موقع ويب + بوت تيليجرام
-التخزين: PostgreSQL (Railway)  |  المكتبة المطلوبة: psycopg2-binary (انظر requirements.txt)
+import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html
+from contextlib import contextmanager
+from urllib.parse import parse_qsl
 
-متغيرات البيئة:
-    DATABASE_URL  رابط Postgres. في Railway: أضف للخدمة متغيراً مرجعياً
-                  DATABASE_URL = ${{Postgres-N9bh.DATABASE_URL}}
-    ID_PREFIX     بادئة المعرّفات والجداول (الافتراضي hash). المعرّف يصبح مثل hash.123456
-                  وجداولك تصبح hash_users و hash_blocks (غيّرها لـ 01 مثلاً لبوت آخر على نفس القاعدة)
-    BOT_TOKEN     توكن البوت من @BotFather
-    ADMIN_IDS     معرّفات تيليجرام للأدمن مفصولة بفاصلة (من @userinfobot)
-    WEB_APP_URL   اختياري، يُكتشف من RAILWAY_PUBLIC_DOMAIN
-    ALLOW_GUEST   1 للسماح بالدخول من المتصفح بدون تيليجرام (الافتراضي 1)
+from aiohttp import web
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool, PoolError
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
+                      WebAppInfo, MenuButtonWebApp, BotCommand)
+from telegram.constants import ParseMode
+from telegram.ext import (Application, CommandHandler, MessageHandler, PreCheckoutQueryHandler,
+                          ContextTypes, Defaults, filters)
 
-أوامر الأدمن في البوت (تظهر في قائمة "/" للأدمن فقط):
-    /admin                     قائمة الأوامر
-    /setblocks <id> <n>        تحديد عدد بلوكات مستخدم
-    /addblocks <id> <n>        زيادة/إنقاص عدد بلوكات مستخدم (n قد يكون سالباً)
-    /userinfo  <id>            معلومات مستخدم
-    <id> إما رقم تيليجرام (123456) أو المعرّف الكامل (hash.123456)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("miner-bot")
 
-Start Command:       python main.py
-"""
-import hashlib, hmac, json, os, random, re, signal, sys, threading, time
-import urllib.error, urllib.parse, urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
+# ═══════════ 1) الإعدادات ═══════════
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "0") or 0)
+DB_PATH = os.environ.get("DB_PATH", "miner.db")
+TASK_CHANNEL = os.environ.get("TASK_CHANNEL", "")          # مثال: @mychannel (اختياري)
 try:
-    import psycopg2
-    import psycopg2.extras
-except ImportError:
-    print("!! مكتبة psycopg2 غير مثبتة. أضف psycopg2-binary إلى requirements.txt")
-    sys.exit(1)
+    PORT = int(os.environ.get("PORT", "8080") or 8080)
+except ValueError:
+    PORT = 8080
+_raw = (os.environ.get("WEBAPP_URL") or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")).strip().rstrip("/")
+if _raw.startswith("http://"):
+    _raw = "https://" + _raw[7:]
+elif _raw and not _raw.startswith("https://"):
+    _raw = "https://" + _raw
+WEBAPP_URL = _raw
 
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-
-# ───────────────────────── الإعدادات ─────────────────────────
-def _env_int(name, default):
-    try:
-        v = int(str(os.environ.get(name, default)).strip())
-        return v if v > 0 else default
-    except (TypeError, ValueError):
-        return default
-
-
-PORT = _env_int("PORT", 8080)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'").strip()
-DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
-ALLOW_GUEST = os.environ.get("ALLOW_GUEST", "1").strip() == "1"
-_dom = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or os.environ.get("RAILWAY_STATIC_URL", "").replace("https://", "")
-WEB_APP_URL = (os.environ.get("WEB_APP_URL") or (f"https://{_dom}" if _dom else "")).strip().rstrip("/")
-ADMIN_IDS = {x for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.isdigit()}
-
-# بادئة المعرّفات والجداول: hash.<userid> وجداول hash_users / hash_blocks
-ID_PREFIX = re.sub(r"[^A-Za-z0-9_-]", "", os.environ.get("ID_PREFIX", "hash")) or "hash"
-_P = re.sub(r"[^a-z0-9_]", "_", ID_PREFIX.lower())
-U = f'"{_P}_users"'
-B = f'"{_P}_blocks"'
+# اللعبة (كلها نقاط افتراضية داخل البوت)
+ITEMS = {
+    "permit": dict(stars=500, title="تصريح التعدين", desc="يفتح لك التعدين في اللعبة (نقاط افتراضية)."),
+    "energy_up": dict(stars=59, title="زيادة الطاقة القصوى", desc="+2000 طاقة قصوى و +5 طاقة/دقيقة."),
+    "restore": dict(stars=32, title="استعادة الطاقة", desc="يملأ طاقتك للحد الأقصى فوراً."),
+}
+BASE_HR = 1000          # معدل الهاش الأساسي (H/s)
+COST = 1.0              # طاقة/ثانية أثناء التعدين
+BLOCK_REWARD = 50       # مكافأة الكتلة (كل 5 ثوانٍ لمعدّن نشط عشوائي)
+REF_BONUS = 500         # مكافأة المُحيل عند شراء المُحال للتصريح
+DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: +500 نقطة
+TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
 
 
-def K(raw):
-    """المعرّف الكامل المخزّن في القاعدة: hash.123456"""
-    return f"{ID_PREFIX}.{raw}"
+# ═══════════ 2) قاعدة البيانات (PostgreSQL، وإلا SQLite) ═══════════
+USE_PG, pool, sq = False, None, None
+sq_lock = threading.RLock()
 
 
-def raw_of(key):
-    return key.split(".", 1)[1] if "." in key else key
+class Cur:
+    def __init__(self, cur, pg):
+        self.cur, self.pg = cur, pg
+
+    def execute(self, sql, p=()):
+        self.cur.execute(sql.replace("?", "%s") if self.pg else sql, p)
+
+    def fetchone(self):
+        r = self.cur.fetchone()
+        return dict(r) if r is not None else None
+
+    def fetchall(self):
+        return [dict(r) for r in self.cur.fetchall()]
+
+    @property
+    def rowcount(self):
+        return self.cur.rowcount
 
 
-COIN = "HASH"
-TARGET_BLOCK_TIME = 10
-MIN_BITS, MAX_BITS = 8, 44
-START_BITS = 14
-BASE_HASHRATE = 4000
-MAX_ENERGY = 1000
-ENERGY_REGEN = 0.5
-ENERGY_DRAIN = 1.0
-REFILL_AMOUNT, REFILL_COOLDOWN = 500, 6 * 3600
-HALVING_EVERY = 100000
-BASE_REWARD = 10.0
-REF_BONUS = 5.0
-MAX_REFS = 200
-TICK_BUDGET = 0.30
-MAX_USER_TICK = 60000
-MAX_BODY = 4096
-INITDATA_MAX_AGE = 3 * 86400
-GENESIS_PREV = "0" * 64
-MAX_BLOCKS_VALUE = 10 ** 9
-
-STOP = threading.Event()
-LOCK = threading.RLock()
-
-
-# ───────────────────────── قاعدة البيانات (PostgreSQL) ─────────────────────────
-class PG:
-    """غلاف رفيع حول اتصال psycopg2: يحوّل ? إلى %s، يعيد الاتصال تلقائياً، ويتراجع عند الخطأ."""
-
-    def __init__(self, dsn):
-        self.dsn = dsn
-        self.conn = None
-        self.connect()
-
-    def connect(self):
-        if self.conn is not None:
+@contextmanager
+def cursor():
+    if USE_PG:
+        deadline = time.time() + 20
+        while True:
             try:
-                self.conn.close()
+                conn = pool.getconn()
+            except PoolError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.05)
+                continue
+            if conn.closed:
+                pool.putconn(conn, close=True)
+                continue
+            break
+        broken = False
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as c:
+                    yield Cur(c, True)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            broken = True
+            raise
+        finally:
+            try:
+                pool.putconn(conn, close=bool(conn.closed) or broken)
             except Exception:
                 pass
-        self.conn = psycopg2.connect(self.dsn, connect_timeout=10,
-                                     cursor_factory=psycopg2.extras.RealDictCursor)
-        self.conn.autocommit = False
-
-    def execute(self, sql, params=()):
-        sql = sql.replace("?", "%s")
-        for attempt in (1, 2):
-            try:
-                cur = self.conn.cursor()
-                cur.execute(sql, params)
-                return cur
-            except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                if attempt == 2:
-                    raise
-                print("db connection lost, reconnecting…")
-                self.connect()
-            except psycopg2.Error:
+    else:
+        with sq_lock:
+            with sq:
+                c = sq.cursor()
                 try:
-                    self.conn.rollback()
-                except Exception:
-                    pass
-                raise
-
-    def commit(self):
-        self.conn.commit()
-
-    def rollback(self):
-        try:
-            self.conn.rollback()
-        except Exception:
-            pass
-
-    def close(self):
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-
-def open_db():
-    if not DATABASE_URL:
-        print("!! DATABASE_URL غير مضبوط. في Railway أضف للخدمة المتغير:")
-        print("   DATABASE_URL = ${{Postgres-N9bh.DATABASE_URL}}")
-        sys.exit(1)
-    last = None
-    for i in range(10):          # Railway قد يشغّل الخدمتين معاً: انتظر جاهزية القاعدة
-        try:
-            return PG(DATABASE_URL)
-        except psycopg2.Error as ex:
-            last = ex
-            print(f"waiting for database ({i + 1}/10): {' '.join(str(ex).split())}")
-            time.sleep(3)
-    print("!! تعذّر الاتصال بقاعدة البيانات:", last)
-    sys.exit(1)
-
-
-DB = None
+                    yield Cur(c, False)
+                finally:
+                    c.close()
 
 
 def init_db():
-    with LOCK:
-        DB.execute(f"""CREATE TABLE IF NOT EXISTS {U}(
-            id TEXT PRIMARY KEY, tg_id TEXT, name TEXT,
-            balance DOUBLE PRECISION DEFAULT 0, xp DOUBLE PRECISION DEFAULT 0,
-            energy DOUBLE PRECISION DEFAULT 1000, last_ts DOUBLE PRECISION,
-            mining INTEGER DEFAULT 0, mode INTEGER DEFAULT 1,
-            hashes BIGINT DEFAULT 0, blocks_found INTEGER DEFAULT 0, referrer TEXT,
-            last_refill DOUBLE PRECISION DEFAULT 0, created DOUBLE PRECISION)""")
-        DB.execute(f"""CREATE TABLE IF NOT EXISTS {B}(
-            idx BIGINT PRIMARY KEY, prev TEXT, ts BIGINT, miner_id TEXT, miner_name TEXT,
-            reward DOUBLE PRECISION, bits INTEGER, nonce BIGINT, hash TEXT, found_at DOUBLE PRECISION)""")
-        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_mining" ON {U}(mining)')
-        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_balance" ON {U}(balance DESC)')
-        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_ref" ON {U}(referrer)')
-        DB.execute(f'CREATE INDEX IF NOT EXISTS "{_P}_ix_bminer" ON {B}(miner_id)')
-        DB.commit()
-
-
-# ───────────────────────── أدوات مساعدة ─────────────────────────
-class ApiError(Exception):
-    def __init__(self, code, key):
-        super().__init__(key)
-        self.code, self.key = code, key
-
-
-_BAD_CHARS = re.compile(r'''[\x00-\x1f\x7f<>&"'`\u202a-\u202e\u2066-\u2069]''')
-REF_RE = re.compile(r"^[0-9]{1,20}$")
-GUEST_RE = re.compile(r"^[A-Za-z0-9]{8,40}$")
-ADD_BAL = "ROUND((balance+?)::numeric,8)"
-
-
-def clean_name(n, fallback="User"):
-    n = _BAD_CHARS.sub("", str(n or "")).strip()[:32]
-    return n or fallback
-
-
-class RateLimiter:
-    def __init__(self, rate, burst):
-        self.rate, self.burst = float(rate), float(burst)
-        self.b, self.lk, self.gc = {}, threading.Lock(), time.time()
-
-    def allow(self, key, cost=1.0):
-        now = time.time()
-        with self.lk:
-            if now - self.gc > 300:
-                self.b = {k: v for k, v in self.b.items() if now - v[1] < 300}
-                self.gc = now
-            tok, ts = self.b.get(key, (self.burst, now))
-            tok = min(self.burst, tok + max(0.0, now - ts) * self.rate)
-            if tok < cost:
-                self.b[key] = (tok, now)
-                return False
-            self.b[key] = (tok - cost, now)
-            return True
-
-
-RL_API = RateLimiter(rate=8, burst=40)
-RL_ACT = RateLimiter(rate=1, burst=10)
-RL_GUEST_NEW = RateLimiter(rate=20 / 3600, burst=20)
-RL_BOT = RateLimiter(rate=0.5, burst=5)
-
-_CACHE, _CLK = {}, threading.Lock()
-
-
-def cached(key, ttl, fn):
-    now = time.time()
-    with _CLK:
-        hit = _CACHE.get(key)
-        if hit and now - hit[0] < ttl:
-            return hit[1]
-    val = fn()
-    with _CLK:
-        _CACHE[key] = (now, val)
-    return val
-
-
-def supervise(name, fn):
-    def run():
-        while not STOP.is_set():
-            try:
-                fn()
-                return
-            except Exception as ex:
-                print(f"[{name}] crashed: {ex!r} — restart in 3s")
-                STOP.wait(3)
-    t = threading.Thread(target=run, name=name, daemon=True)
-    t.start()
-    return t
-
-
-# ───────────────────────── البلوك تشين ─────────────────────────
-def block_prefix(idx, prev, ts, miner, reward, bits):
-    return f"{idx}|{prev}|{ts}|{miner}|{reward:.8f}|{bits}|"
-
-
-def block_hash(prefix, nonce):
-    return hashlib.sha256(hashlib.sha256((prefix + str(nonce)).encode()).digest()).hexdigest()
-
-
-def target_for(bits):
-    return 1 << (256 - bits)
-
-
-def reward_for(idx):
-    return BASE_REWARD / (2 ** (idx // HALVING_EVERY))
-
-
-class Chain:
-    def __init__(self):
-        self.height = 0
-        self.prev = GENESIS_PREV
-        self.bits = START_BITS
-        self.tpl_ts = int(time.time())
-        self.last_found = time.time()
-        self.last_interval = 0.0
-        self.load()
-
-    def load(self):
-        with LOCK:
-            r = DB.execute(f"SELECT * FROM {B} ORDER BY idx DESC LIMIT 1").fetchone()
-            if r is None:
-                pre = block_prefix(0, GENESIS_PREV, 1760000000, "genesis", 0.0, 1)
-                nonce = 0
-                while int(block_hash(pre, nonce), 16) >= target_for(1):
-                    nonce += 1
-                DB.execute(f"INSERT INTO {B}(idx,prev,ts,miner_id,miner_name,reward,bits,nonce,hash,found_at) "
-                           "VALUES(0,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
-                           (GENESIS_PREV, 1760000000, "genesis", "Genesis", 0.0, 1, nonce,
-                            block_hash(pre, nonce), time.time()))
-                DB.commit()
-                r = DB.execute(f"SELECT * FROM {B} ORDER BY idx DESC LIMIT 1").fetchone()
-            DB.commit()
-            self.height = r["idx"]
-            self.prev = r["hash"]
-            self.bits = r["bits"] if r["idx"] > 0 else START_BITS
-            self.tpl_ts = int(r["found_at"])
-            self.last_found = r["found_at"]
-
-    def next_idx(self):
-        return self.height + 1
-
-    def template(self, miner_id):
-        i = self.next_idx()
-        return block_prefix(i, self.prev, self.tpl_ts, miner_id, reward_for(i), self.bits)
-
-    def accept(self, miner_id, miner_name, nonce):
-        i = self.next_idx()
-        rw = reward_for(i)
-        pre = block_prefix(i, self.prev, self.tpl_ts, miner_id, rw, self.bits)
-        h = block_hash(pre, nonce)
-        if int(h, 16) >= target_for(self.bits):
-            return False
-        now = time.time()
-        try:
-            DB.execute(f"INSERT INTO {B}(idx,prev,ts,miner_id,miner_name,reward,bits,nonce,hash,found_at) "
-                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       (i, self.prev, self.tpl_ts, miner_id, miner_name, rw, self.bits, nonce, h, now))
-            DB.execute(f"UPDATE {U} SET balance={ADD_BAL}, xp=xp+50, blocks_found=blocks_found+1 WHERE id=?",
-                       (rw, miner_id))
-            DB.commit()
-        except psycopg2.Error as ex:
-            print("accept failed, resync:", ex)
-            DB.rollback()
-            self.load()
-            return False
-        interval = max(0.0, now - self.last_found)
-        self.last_interval = interval
-        if interval < TARGET_BLOCK_TIME / 2:
-            self.bits = min(MAX_BITS, self.bits + 1)
-        elif interval > TARGET_BLOCK_TIME * 2:
-            self.bits = max(MIN_BITS, self.bits - 1)
-        self.height, self.prev, self.last_found, self.tpl_ts = i, h, now, int(now)
-        return True
-
-    def verify(self):
-        prev, last, count = GENESIS_PREV, -1, 0
-        while True:
-            with LOCK:
-                rows = DB.execute(f"SELECT * FROM {B} WHERE idx>? ORDER BY idx LIMIT 2000", (last,)).fetchall()
-                DB.commit()
-            if not rows:
-                break
-            for r in rows:
-                if r["idx"] != last + 1 or r["prev"] != prev:
-                    return False, r["idx"]
-                pre = block_prefix(r["idx"], r["prev"], r["ts"], r["miner_id"], r["reward"], r["bits"])
-                h = block_hash(pre, r["nonce"])
-                if h != r["hash"] or int(h, 16) >= target_for(r["bits"]):
-                    return False, r["idx"]
-                prev, last, count = r["hash"], r["idx"], count + 1
-        return True, count
-
-
-CHAIN = None
-
-
-# ───────────────────────── المستخدمون ─────────────────────────
-def xp_need(level):
-    return int(100 * level ** 1.5 + 64)
-
-
-def level_of(xp):
-    try:
-        xp = float(xp)
-    except (TypeError, ValueError):
-        xp = 0.0
-    if xp != xp or xp < 0:
-        xp = 0.0
-    l = 1
-    while xp >= xp_need(l):
-        xp -= xp_need(l)
-        l += 1
-    return l, xp
-
-
-def hashrate_of(xp, mode):
-    lvl, _ = level_of(xp)
-    return int(BASE_HASHRATE * mode * (1 + 0.05 * (lvl - 1)))
-
-
-def user_hashrate(u):
-    return hashrate_of(u["xp"], u["mode"])
-
-
-def get_user(uid, name=None, referrer=None):
-    """uid هو المعرّف الكامل (hash.123456)."""
-    raw = raw_of(uid)
-    name = clean_name(name, f"User{raw[-4:]}") if name else None
-    with LOCK:
-        u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (uid,)).fetchone()
+    global USE_PG, pool, sq
+    for u in [os.environ.get("DATABASE_URL"), os.environ.get("DATABASE_PUBLIC_URL")]:
         if not u:
-            now = time.time()
-            DB.execute(f"INSERT INTO {U}(id,tg_id,name,energy,last_ts,created) VALUES(?,?,?,?,?,?) "
-                       "ON CONFLICT (id) DO NOTHING",
-                       (uid, raw, name or f"User{raw[-4:]}", MAX_ENERGY, now, now))
-            ref = str(referrer or "")
-            if raw.isdigit() and REF_RE.match(ref) and ref != raw:
-                rk = K(ref)
-                r = DB.execute(f"SELECT id FROM {U} WHERE id=?", (rk,)).fetchone()
-                n = DB.execute(f"SELECT COUNT(*) AS c FROM {U} WHERE referrer=?", (rk,)).fetchone()["c"]
-                if r and n < MAX_REFS:
-                    DB.execute(f"UPDATE {U} SET referrer=?, balance={ADD_BAL} WHERE id=? AND referrer IS NULL",
-                               (rk, REF_BONUS, uid))
-                    DB.execute(f"UPDATE {U} SET balance={ADD_BAL} WHERE id=?", (REF_BONUS, rk))
-            DB.commit()
-        elif name and u["name"] != name:
-            DB.execute(f"UPDATE {U} SET name=? WHERE id=?", (name, uid))
-            DB.commit()
-        return settle(uid)
+            continue
+        try:
+            pool = ThreadedConnectionPool(2, 30, u, connect_timeout=8, keepalives=1,
+                                          keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+            USE_PG = True
+            log.info("Connected to PostgreSQL")
+            break
+        except Exception as e:
+            log.warning("PostgreSQL failed: %s", str(e).strip()[:150])
+    if not USE_PG:
+        sq = sqlite3.connect(DB_PATH, check_same_thread=False)
+        sq.row_factory = sqlite3.Row
+        log.warning("Using SQLite: %s", os.path.abspath(DB_PATH))
+    pk = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS m_users(
+            id BIGINT PRIMARY KEY, name TEXT, username TEXT,
+            permit INT NOT NULL DEFAULT 0, level INT NOT NULL DEFAULT 1,
+            xp DOUBLE PRECISION NOT NULL DEFAULT 0, balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+            total DOUBLE PRECISION NOT NULL DEFAULT 0,
+            energy DOUBLE PRECISION NOT NULL DEFAULT 1000, max_energy INT NOT NULL DEFAULT 1000,
+            regen INT NOT NULL DEFAULT 30, mining INT NOT NULL DEFAULT 0,
+            last_tick DOUBLE PRECISION NOT NULL DEFAULT 0, streak INT NOT NULL DEFAULT 0,
+            last_daily DOUBLE PRECISION NOT NULL DEFAULT 0, referrer BIGINT, created_at BIGINT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS m_payments(
+            charge_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, item TEXT NOT NULL,
+            stars INT NOT NULL, refunded INT NOT NULL DEFAULT 0, created_at BIGINT)""")
+        cur.execute("CREATE TABLE IF NOT EXISTS m_tasks(user_id BIGINT, task TEXT, PRIMARY KEY(user_id, task))")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS m_blocks(
+            id {pk}, miner_id BIGINT, miner_name TEXT, miner_level INT,
+            reward DOUBLE PRECISION, miners INT, created_at BIGINT)""")
+    for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
+                "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)"):
+        with cursor() as cur:
+            cur.execute(ddl)
+    log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
 
 
-def settle(uid, now=None):
-    now = now or time.time()
-    with LOCK:
-        u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (uid,)).fetchone()
-        if u is None:
-            DB.commit()
-            return None
-        last = u["last_ts"] or now
-        dt = now - last
-        if dt != dt or dt < 0:
-            dt = 0.0
-        dt = min(dt, 86400.0)
-        e, mining = u["energy"], u["mining"]
-        if e is None or e != e:
-            e = 0.0
-        e += ENERGY_REGEN * dt
-        if mining:
-            e -= ENERGY_DRAIN * u["mode"] * dt
-        e = max(0.0, min(float(MAX_ENERGY), e))
-        if mining and e <= 0:
-            mining = 0
-        row = DB.execute(f"UPDATE {U} SET energy=?, mining=?, last_ts=? WHERE id=? RETURNING *",
-                         (e, mining, now, uid)).fetchone()
-        DB.commit()
-        return row
+# ═══════════ 3) منطق التعدين (يُحسب كسولاً عند كل طلب) ═══════════
+def hashrate(u):
+    return BASE_HR * (1 + 0.05 * (u["level"] - 1))
 
 
-# ───────────────────────── المعدّن (خيط خلفي) ─────────────────────────
-def miner_tick():
-    deadline = time.time() + TICK_BUDGET
-    with LOCK:
-        rows = DB.execute(f"SELECT id FROM {U} WHERE mining=1").fetchall()
-        users = [x for x in (settle(r["id"]) for r in rows) if x and x["mining"]]
-        if not users:
-            DB.commit()
+def xp_need(level):
+    return 150 + 144 * level
+
+
+def settle(u):
+    now = time.time()
+    dt = max(0.0, now - u["last_tick"])
+    if u["mining"]:
+        run = min(dt, u["energy"] / COST)
+        earned = run * hashrate(u) / 1e5
+        u["energy"] = max(0.0, u["energy"] - run * COST)
+        u["balance"] += earned
+        u["total"] += earned
+        u["xp"] += earned * 5
+        while u["xp"] >= xp_need(u["level"]):
+            u["xp"] -= xp_need(u["level"])
+            u["level"] += 1
+        if u["energy"] <= 0.01 or run < dt:
+            u["mining"] = 0
+    elif u["energy"] < u["max_energy"]:
+        u["energy"] = min(u["max_energy"], u["energy"] + u["regen"] / 60 * dt)
+    u["last_tick"] = now
+
+
+class Err(Exception):
+    pass
+
+
+def ensure_user(cur, uid, name, username, ref=None):
+    ref_ok = None
+    if ref and ref != uid:
+        cur.execute("SELECT id FROM m_users WHERE id=?", (ref,))
+        if cur.fetchone():
+            ref_ok = ref
+    cur.execute("""INSERT INTO m_users(id,name,username,referrer,last_tick,created_at) VALUES(?,?,?,?,?,?)
+        ON CONFLICT (id) DO UPDATE SET name=excluded.name, username=excluded.username""",
+                (uid, name, username, ref_ok, time.time(), int(time.time())))
+
+
+def lock_user(cur, uid):
+    cur.execute("SELECT * FROM m_users WHERE id=?" + (" FOR UPDATE" if USE_PG else ""), (uid,))
+    u = cur.fetchone()
+    if not u:
+        raise Err("user")
+    settle(u)
+    return u
+
+
+def save_user(cur, u):
+    cur.execute("""UPDATE m_users SET permit=?,level=?,xp=?,balance=?,total=?,energy=?,max_energy=?,
+        regen=?,mining=?,last_tick=?,streak=?,last_daily=? WHERE id=?""",
+                (u["permit"], u["level"], u["xp"], u["balance"], u["total"], u["energy"], u["max_energy"],
+                 u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], u["id"]))
+
+
+def daily_info(u):
+    now, last = time.time(), u["last_daily"]
+    streak = u["streak"] if last and now - last < 172800 else 0
+    wait = max(0, int(last + 86400 - now)) if last else 0
+    return streak, wait
+
+
+def state(u):
+    streak, wait = daily_info(u)
+    return dict(permit=bool(u["permit"]), level=u["level"], xp=int(u["xp"]), xp_need=xp_need(u["level"]),
+                balance=u["balance"], energy=u["energy"], max_energy=u["max_energy"], regen=u["regen"],
+                mining=bool(u["mining"]), hashrate=hashrate(u), rate=hashrate(u) / 1e5, cost=COST,
+                day_idx=streak % 7, daily_wait=wait)
+
+
+def add_points(cur, uid, pts):
+    cur.execute("UPDATE m_users SET balance=balance+?, total=total+? WHERE id=?", (pts, pts, uid))
+
+
+def apply_payment(uid, key, charge, stars):
+    with cursor() as cur:
+        cur.execute("INSERT INTO m_payments(charge_id,user_id,item,stars,created_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT DO NOTHING", (charge, uid, key, stars, int(time.time())))
+        if cur.rowcount != 1:
+            return False
+        u = lock_user(cur, uid)
+        if key == "permit":
+            u["permit"] = 1
+            cur.execute("SELECT referrer FROM m_users WHERE id=?", (uid,))
+            ref = (cur.fetchone() or {}).get("referrer")
+            if ref:
+                add_points(cur, ref, REF_BONUS)
+        elif key == "energy_up":
+            u["max_energy"] += 2000
+            u["regen"] += 5
+        elif key == "restore":
+            u["energy"] = max(u["energy"], u["max_energy"])
+        save_user(cur, u)
+    return True
+
+
+def make_block():
+    """كتلة كل 5 ثوانٍ، مكافأتها لمعدّن نشط عشوائي."""
+    with cursor() as cur:
+        cur.execute("SELECT id,name,level FROM m_users WHERE mining=1 AND energy>1 ORDER BY random() LIMIT 1")
+        m = cur.fetchone()
+        if not m:
             return
-        random.shuffle(users)
-        tgt = target_for(CHAIN.bits)
-        sha = hashlib.sha256
-        found = False
-        for i, u in enumerate(users):
-            now = time.time()
-            slice_end = now + max(0.0, deadline - now) / (len(users) - i)
-            n = max(1, min(user_hashrate(u), MAX_USER_TICK))
-            pre = CHAIN.template(u["id"])
-            start = random.getrandbits(48)
-            done = 0
-            for k in range(n):
-                if (k & 2047) == 2047 and time.time() > slice_end:
-                    break
-                done = k + 1
-                nonce = start + k
-                h = sha(sha((pre + str(nonce)).encode()).digest()).digest()
-                if int.from_bytes(h, "big") < tgt:
-                    if CHAIN.accept(u["id"], u["name"], nonce):
-                        found = True
-                    break
-            DB.execute(f"UPDATE {U} SET hashes=hashes+?, xp=xp+? WHERE id=?", (done, done / 800.0, u["id"]))
-            if found:
-                break
-        DB.commit()
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE mining=1")
+        n = cur.fetchone()["n"]
+        add_points(cur, m["id"], BLOCK_REWARD)
+        cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,created_at) VALUES(?,?,?,?,?,?)",
+                    (m["id"], m["name"], m["level"], BLOCK_REWARD, n, int(time.time())))
+        cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
 
 
-def miner_loop():
-    while not STOP.is_set():
-        t0 = time.time()
-        try:
-            miner_tick()
-        except Exception as ex:
-            print("miner error:", repr(ex))
-            with LOCK:
-                DB.rollback()
-        STOP.wait(max(0.0, 1.0 - (time.time() - t0)))
+# ═══════════ 4) واجهة الـ API (aiohttp) ═══════════
+MAIN_APP, WEB_RUNNER, BG = None, None, []
 
 
-# ───────────────────────── واجهة API ─────────────────────────
-def check_init_data(init_data):
-    if not BOT_TOKEN or not init_data or len(init_data) > 4096:
-        return None
+def verify_init_data(init_data, max_age=86400):
     try:
-        pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
-        got = pairs.pop("hash", "")
-        if not got or "user" not in pairs:
-            return None
-        dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        d = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = d.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, got):
+        if not got or not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), got):
             return None
-        auth_date = int(pairs.get("auth_date", 0))
-        now = time.time()
-        if auth_date <= 0 or now - auth_date > INITDATA_MAX_AGE or auth_date - now > 300:
+        if time.time() - int(d.get("auth_date", "0")) > max_age:
             return None
-        usr = json.loads(pairs["user"])
-        uid = int(usr["id"])
-        name = ("@" + usr["username"]) if usr.get("username") else (usr.get("first_name") or "User")
-        return str(uid), clean_name(name)
-    except (ValueError, KeyError, TypeError):
+        u = json.loads(d.get("user", "{}"))
+        if not u.get("id"):
+            return None
+        sp = d.get("start_param", "")
+        return dict(id=int(u["id"]), username=u.get("username") or "",
+                    name=" ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or "Miner",
+                    ref=int(sp[4:]) if sp.startswith("ref_") and sp[4:].isdigit() else None)
+    except Exception:
         return None
 
 
-BOT_USERNAME = ""
+def touch(cur, tg):
+    ensure_user(cur, tg["id"], tg["name"], tg["username"], tg["ref"])
+    return lock_user(cur, tg["id"])
 
 
-def state_for(u):
-    lvl, xp_in = level_of(u["xp"])
-    raw = raw_of(u["id"])
-    with LOCK:
-        online = DB.execute(f"SELECT xp, mode FROM {U} WHERE mining=1").fetchall()
-        net = sum(hashrate_of(r["xp"], r["mode"]) for r in online)
-        refs = DB.execute(f"SELECT COUNT(*) AS c FROM {U} WHERE referrer=?", (u["id"],)).fetchone()["c"]
-        supply = DB.execute(f"SELECT COALESCE(SUM(reward),0) AS s FROM {B}").fetchone()["s"]
-        users_total = DB.execute(f"SELECT COUNT(*) AS c FROM {U}").fetchone()["c"]
-        rank = DB.execute(f"SELECT COUNT(*)+1 AS c FROM {U} WHERE balance>?", (u["balance"],)).fetchone()["c"]
-        DB.commit()
-    nxt = CHAIN.next_idx()
-    return {
-        "id": u["id"], "name": u["name"], "coin": COIN,
-        "balance": u["balance"], "level": lvl, "xp": xp_in, "xp_need": xp_need(lvl),
-        "energy": u["energy"], "max_energy": MAX_ENERGY, "regen": int(ENERGY_REGEN * 60),
-        "mining": bool(u["mining"]), "mode": u["mode"], "hashrate": user_hashrate(u),
-        "hashes": u["hashes"], "blocks_found": u["blocks_found"], "refs": refs, "rank": rank,
-        "ref_link": (f"https://t.me/{BOT_USERNAME}?start=ref_{raw}" if BOT_USERNAME and raw.isdigit() else ""),
-        "refill_in": max(0, int(u["last_refill"] + REFILL_COOLDOWN - time.time())),
-        "net": {"height": CHAIN.height, "bits": CHAIN.bits, "difficulty": 2 ** CHAIN.bits,
-                "hashrate": net, "miners": len(online), "reward": reward_for(nxt),
-                "supply": supply, "users": users_total, "last_interval": CHAIN.last_interval,
-                "target_time": TARGET_BLOCK_TIME, "next_block": nxt},
-    }
+def act_me(tg, b):
+    with cursor() as cur:
+        u = touch(cur, tg)
+        save_user(cur, u)
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=?", (u["id"],))
+        refs = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE mining=1")
+        online = cur.fetchone()["n"]
+        cur.execute("SELECT task FROM m_tasks WHERE user_id=?", (u["id"],))
+        done = {r["task"] for r in cur.fetchall()}
+    return dict(**state(u), refs=refs, online=online, ref_bonus=REF_BONUS, daily=DAILY,
+                ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
+                tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
+                channel=TASK_CHANNEL, prices={k: v["stars"] for k, v in ITEMS.items()})
 
 
-def recent_blocks(limit=25):
-    with LOCK:
-        rows = DB.execute(f"SELECT b.*, COALESCE(u.xp,0) AS xp FROM {B} b LEFT JOIN {U} u ON u.id=b.miner_id "
-                          "ORDER BY b.idx DESC LIMIT ?", (limit,)).fetchall()
-        DB.commit()
-    return [{"idx": r["idx"], "hash": r["hash"], "miner": clean_name(r["miner_name"]), "reward": r["reward"],
-             "level": level_of(r["xp"])[0],
-             "time": time.strftime("%d.%m.%Y, %H:%M:%S", time.localtime(r["found_at"])),
-             "nonce": r["nonce"], "bits": r["bits"]} for r in rows]
-
-
-def leaderboard(limit=100):
-    with LOCK:
-        rows = DB.execute(f"SELECT name,balance,blocks_found,xp,mode FROM {U} ORDER BY balance DESC LIMIT ?",
-                          (limit,)).fetchall()
-        DB.commit()
-    return [{"name": clean_name(r["name"]), "balance": r["balance"], "blocks": r["blocks_found"],
-             "level": level_of(r["xp"])[0], "mode": r["mode"]} for r in rows]
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "HashChain/1.2"
-    timeout = 15
-
-    def log_message(self, *a):
-        pass
-
-    def _send(self, code, body, ctype="application/json; charset=utf-8", head=False):
-        data = body if isinstance(body, bytes) else body.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        if not head:
-            self.wfile.write(data)
-
-    def _json(self, obj, code=200):
-        self._send(code, json.dumps(obj, ensure_ascii=False))
-
-    def _ip(self):
-        xri = self.headers.get("X-Real-Ip")
-        if xri:
-            return xri.strip()[:64]
-        xff = self.headers.get("X-Forwarded-For")
-        if xff:
-            return xff.split(",")[-1].strip()[:64]
-        return self.client_address[0]
-
-    def _limit(self):
-        if not RL_API.allow(self._ip()):
-            raise ApiError(429, "rate")
-
-    def _auth(self):
-        """يرجع (المعرّف الكامل، الاسم) مثل ('hash.123456', '@name')."""
-        t = check_init_data(self.headers.get("X-Init-Data", ""))
-        if t:
-            return K(t[0]), t[1]
-        if ALLOW_GUEST:
-            g = self.headers.get("X-Guest-Id", "")
-            if GUEST_RE.match(g):
-                uid = K("g" + g)
-                with LOCK:
-                    known = DB.execute(f"SELECT 1 AS x FROM {U} WHERE id=?", (uid,)).fetchone()
-                    DB.commit()
-                if not known and not RL_GUEST_NEW.allow(self._ip()):
-                    raise ApiError(429, "rate")
-                return uid, "Guest" + g[:4]
-        raise ApiError(401, "auth")
-
-    def _read_body(self):
-        try:
-            ln = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            raise ApiError(400, "bad_request")
-        if ln < 0 or ln > MAX_BODY:
-            raise ApiError(413, "too_large")
-        if ln == 0:
-            return {}
-        raw = self.rfile.read(ln)
-        try:
-            obj = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
-            raise ApiError(400, "bad_json")
-        return obj if isinstance(obj, dict) else {}
-
-    def _dispatch(self, fn):
-        try:
-            fn()
-        except ApiError as e:
-            try:
-                self._json({"error": e.key}, e.code)
-            except OSError:
-                pass
-        except OSError:
-            pass
-        except Exception as ex:
-            print("handler error:", repr(ex))
-            try:
-                self._json({"error": "server"}, 500)
-            except Exception:
-                pass
-
-    def do_GET(self):
-        self._dispatch(self._get)
-
-    def do_POST(self):
-        self._dispatch(self._post)
-
-    def do_HEAD(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html", "/health"):
-            self._send(200, b"", "text/html; charset=utf-8", head=True)
+def act_mining(tg, b):
+    with cursor() as cur:
+        u = touch(cur, tg)
+        if b.get("on"):
+            if not u["permit"]:
+                raise Err("تحتاج تصريح التعدين أولاً")
+            if u["energy"] < 1:
+                raise Err("لا توجد طاقة كافية")
+            u["mining"] = 1
         else:
-            self._send(404, b"", "text/plain", head=True)
-
-    def _get(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        if path in ("/", "/index.html"):
-            return self._send(200, INDEX_BYTES, "text/html; charset=utf-8")
-        if path == "/health":
-            return self._json({"ok": True, "height": CHAIN.height})
-        if not path.startswith("/api/"):
-            return self._send(404, "not found", "text/plain")
-        self._limit()
-        if path == "/api/blocks":
-            return self._json(cached("blocks", 1.0, recent_blocks))
-        if path == "/api/leaderboard":
-            return self._json(cached("lb", 3.0, leaderboard))
-        if path == "/api/verify":
-            ok, info = cached("verify", 60.0, CHAIN.verify)
-            return self._json({"valid": ok, "info": info})
-        if path == "/api/state":
-            uid, name = self._auth()
-            ref = urllib.parse.parse_qs(parsed.query).get("ref", [None])[0]
-            return self._json(state_for(get_user(uid, name, ref)))
-        self._send(404, "not found", "text/plain")
-
-    def _post(self):
-        path = urllib.parse.urlparse(self.path).path
-        if not path.startswith("/api/"):
-            return self._send(404, "not found", "text/plain")
-        self._limit()
-        uid, name = self._auth()
-        if not RL_ACT.allow(uid):
-            raise ApiError(429, "rate")
-        body = self._read_body()
-        with LOCK:
-            u = get_user(uid, name)
-            if path == "/api/start":
-                if u["energy"] < 5:
-                    raise ApiError(400, "no_energy")
-                DB.execute(f"UPDATE {U} SET mining=1 WHERE id=?", (uid,))
-            elif path == "/api/stop":
-                DB.execute(f"UPDATE {U} SET mining=0 WHERE id=?", (uid,))
-            elif path == "/api/mode":
-                try:
-                    m = int(body.get("mode", 1))
-                except (TypeError, ValueError):
-                    raise ApiError(400, "bad_mode")
-                if m not in (1, 2, 3):
-                    raise ApiError(400, "bad_mode")
-                DB.execute(f"UPDATE {U} SET mode=? WHERE id=?", (m, uid))
-            elif path == "/api/refill":
-                if time.time() - u["last_refill"] < REFILL_COOLDOWN:
-                    raise ApiError(400, "cooldown")
-                DB.execute(f"UPDATE {U} SET energy=LEAST(?,energy+?), last_refill=? WHERE id=?",
-                           (MAX_ENERGY, REFILL_AMOUNT, time.time(), uid))
-            else:
-                return self._send(404, "not found", "text/plain")
-            DB.commit()
-            return self._json(state_for(settle(uid)))
+            u["mining"] = 0
+        save_user(cur, u)
+    return {}
 
 
-# ───────────────────────── بوت تيليجرام ─────────────────────────
-class TgError(Exception):
-    def __init__(self, code, desc, retry=0):
-        super().__init__(f"{code}: {desc}")
-        self.code, self.desc, self.retry = code, desc, retry
+def act_daily(tg, b):
+    with cursor() as cur:
+        u = touch(cur, tg)
+        streak, wait = daily_info(u)
+        if wait > 0:
+            raise Err("المكافأة التالية لم تحن بعد")
+        idx = streak % 7
+        if idx < 6:
+            u["energy"] += DAILY[idx]          # قد تتجاوز الحد الأقصى كمكافأة
+        else:
+            u["balance"] += 500
+            u["total"] += 500
+        u["streak"], u["last_daily"] = streak + 1, time.time()
+        save_user(cur, u)
+    return {}
 
 
-def tg(method, _timeout=60, **params):
-    req = urllib.request.Request(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                                 data=json.dumps(params).encode(),
-                                 headers={"Content-Type": "application/json"})
+def act_blocks(tg, b):
+    with cursor() as cur:
+        cur.execute("SELECT * FROM m_blocks ORDER BY id DESC LIMIT 25")
+        rows = cur.fetchall()
+    return {"blocks": [dict(id=r["id"], miner=r["miner_name"], level=r["miner_level"], reward=r["reward"],
+                            t=r["created_at"]) for r in rows]}
+
+
+def act_top(tg, b):
+    with cursor() as cur:
+        cur.execute("SELECT id,name,level,total FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
+        rows = cur.fetchall()
+        cur.execute("SELECT total FROM m_users WHERE id=?", (tg["id"],))
+        mine = (cur.fetchone() or {}).get("total", 0)
+        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (mine,))
+        rank = cur.fetchone()["r"]
+    return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], me=r["id"] == tg["id"]) for r in rows],
+            "rank": rank, "mytotal": mine}
+
+
+def task_done(tg, key):
+    with cursor() as cur:
+        cur.execute("INSERT INTO m_tasks(user_id,task) VALUES(?,?) ON CONFLICT DO NOTHING", (tg["id"], key))
+        if cur.rowcount == 1:
+            add_points(cur, tg["id"], TASKS[key]["reward"])
+
+
+async def act_task(tg, b):
+    key = b.get("task")
+    if key not in TASKS:
+        raise Err("مهمة غير موجودة")
+    m = await MAIN_APP.bot.get_chat_member(TASK_CHANNEL, tg["id"])
+    if m.status not in ("member", "administrator", "creator"):
+        raise Err("لم تشترك بعد")
+    await asyncio.to_thread(task_done, tg, key)
+    return {}
+
+
+async def act_invoice(tg, b):
+    key = b.get("item")
+    it = ITEMS.get(key)
+    if not it:
+        raise Err("عنصر غير معروف")
+    if key == "permit":
+        def has():
+            with cursor() as cur:
+                ensure_user(cur, tg["id"], tg["name"], tg["username"], tg["ref"])
+                cur.execute("SELECT permit FROM m_users WHERE id=?", (tg["id"],))
+                return cur.fetchone()["permit"]
+        if await asyncio.to_thread(has):
+            raise Err("لديك تصريح بالفعل")
+    link = await MAIN_APP.bot.create_invoice_link(
+        title=it["title"], description=it["desc"], payload=f"{key}:{tg['id']}", provider_token="",
+        currency="XTR", prices=[LabeledPrice(it["title"], it["stars"])])
+    return {"link": link}
+
+
+SYNC = {"me": act_me, "mining": act_mining, "daily": act_daily, "blocks": act_blocks, "top": act_top}
+ASYNC = {"task": act_task, "invoice": act_invoice}
+
+
+@web.middleware
+async def err_mw(request, handler):
     try:
-        with urllib.request.urlopen(req, timeout=_timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Err as e:
+        return web.json_response({"ok": False, "error": str(e)})
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("WEB ERROR on %s", request.path)
+        return web.json_response({"ok": False, "error": "تعذّر الاتصال، حاول مجدداً"})
+
+
+async def web_api(request):
+    act = request.match_info["act"]
+    tg = verify_init_data(request.headers.get("X-Init-Data", ""))
+    if not tg:
+        raise web.HTTPUnauthorized()
+    body = {}
+    if request.method == "POST":
         try:
-            body = json.loads(e.read())
+            body = await request.json()
         except Exception:
             body = {}
-        raise TgError(e.code, body.get("description", str(e)), (body.get("parameters") or {}).get("retry_after", 0))
-
-
-def send(chat, text, kb=None):
-    try:
-        p = {"chat_id": chat, "text": text}
-        if kb:
-            p["reply_markup"] = kb
-        tg("sendMessage", **p)
-    except TgError as e:
-        if e.code not in (400, 403):
-            print("send failed:", e)
-    except Exception as ex:
-        print("send failed:", repr(ex))
-
-
-# ---- أوامر الأدمن ----
-ADMIN_COMMANDS = [
-    {"command": "admin", "description": "أوامر الأدمن"},
-    {"command": "setblocks", "description": "تحديد عدد بلوكات مستخدم: id عدد"},
-    {"command": "addblocks", "description": "زيادة/إنقاص بلوكات مستخدم: id عدد"},
-    {"command": "userinfo", "description": "معلومات مستخدم: id"},
-]
-ADMIN_HELP = ("🛠 أوامر الأدمن:\n"
-              "/setblocks <id> <n> — تحديد عدد بلوكات المستخدم\n"
-              "/addblocks <id> <n> — زيادة أو إنقاص (مثال: -3)\n"
-              "/userinfo <id> — معلومات المستخدم\n\n"
-              f"<id> رقم تيليجرام (123456) أو المعرّف الكامل ({ID_PREFIX}.123456)")
-
-
-def resolve_key(arg):
-    arg = (arg or "").strip()
-    if "." in arg:
-        return arg if arg.split(".", 1)[0] == ID_PREFIX and re.fullmatch(r"[A-Za-z0-9_.-]{3,80}", arg) else None
-    return K(arg) if re.fullmatch(r"[A-Za-z0-9]{1,40}", arg) else None
-
-
-def admin_cmd(cmd, args, cid):
-    if cmd == "/admin":
-        return send(cid, ADMIN_HELP)
-    if cmd in ("/setblocks", "/addblocks"):
-        if len(args) != 2:
-            return send(cid, f"الصيغة: {cmd} <id> <n>")
-        key = resolve_key(args[0])
-        try:
-            n = int(args[1])
-        except ValueError:
-            return send(cid, "العدد يجب أن يكون رقماً صحيحاً.")
-        if not key:
-            return send(cid, "معرّف غير صالح.")
-        with LOCK:
-            u = DB.execute(f"SELECT blocks_found FROM {U} WHERE id=?", (key,)).fetchone()
-            if not u:
-                DB.commit()
-                return send(cid, f"المستخدم {key} غير موجود.")
-            old = u["blocks_found"]
-            new = n if cmd == "/setblocks" else old + n
-            new = max(0, min(new, MAX_BLOCKS_VALUE))
-            DB.execute(f"UPDATE {U} SET blocks_found=? WHERE id=?", (new, key))
-            DB.commit()
-        _CACHE.clear()
-        return send(cid, f"✅ {key}\nعدد البلوكات: {old} ← {new}")
-    if cmd == "/userinfo":
-        key = resolve_key(args[0]) if args else None
-        if not key:
-            return send(cid, "الصيغة: /userinfo <id>")
-        with LOCK:
-            u = DB.execute(f"SELECT * FROM {U} WHERE id=?", (key,)).fetchone()
-            DB.commit()
-        if not u:
-            return send(cid, f"المستخدم {key} غير موجود.")
-        lvl, _ = level_of(u["xp"])
-        return send(cid, f"👤 {u['name']} ({key})\n💰 {u['balance']:.4f} {COIN}\n"
-                         f"⛏ بلوكات: {u['blocks_found']}\n🎚 مستوى: {lvl}\n"
-                         f"⚡ طاقة: {int(u['energy'])}\n#️⃣ هاشات: {u['hashes']}")
-
-
-def handle_update(upd):
-    m = upd.get("message")
-    if not isinstance(m, dict):
-        return
-    frm, chat = m.get("from") or {}, m.get("chat") or {}
-    text = (m.get("text") or "").strip()
-    if not text or "id" not in frm or "id" not in chat or frm.get("is_bot"):
-        return
-    raw = str(frm["id"])
-    uid = K(raw)
-    name = clean_name(("@" + frm["username"]) if frm.get("username") else frm.get("first_name"), "User")
-    cid, private = chat["id"], chat.get("type") == "private"
-    parts = text.split()
-    cmd = parts[0].split("@")[0].lower()
-    if not cmd.startswith("/"):
-        return
-    if not RL_BOT.allow(uid):
-        return
-    if raw in ADMIN_IDS and cmd in ("/admin", "/setblocks", "/addblocks", "/userinfo"):
-        return admin_cmd(cmd, parts[1:], cid)
-    if cmd == "/start":
-        ref = parts[1][4:] if len(parts) > 1 and parts[1].startswith("ref_") else None
-        get_user(uid, name, ref)
-        kb = {"inline_keyboard": [[{"text": "⛏ ابدأ التعدين", "web_app": {"url": WEB_APP_URL}}]]} \
-            if (private and WEB_APP_URL.startswith("https")) else None
-        send(cid, f"أهلاً {name} 👋\nعدّن بلوكات حقيقية بإثبات العمل (PoW) واربح {COIN}.\n"
-                  + ("اضغط الزر لفتح تطبيق التعدين." if kb else "افتح البوت في محادثة خاصة لبدء التعدين."), kb)
-    elif cmd == "/balance":
-        u = get_user(uid, name)
-        send(cid, f"💰 رصيدك: {u['balance']:.4f} {COIN}\n⛏ بلوكات وجدتها: {u['blocks_found']}")
-    elif cmd == "/top":
-        lines = [f"{i + 1}. {r['name']} — {r['balance']:.2f}" for i, r in enumerate(cached("lb10", 3.0, lambda: leaderboard(10)))]
-        send(cid, "🏆 أفضل المعدّنين:\n" + ("\n".join(lines) or "-"))
-    elif cmd == "/chain":
-        ok, info = cached("verify", 60.0, CHAIN.verify)
-        send(cid, f"⛓ ارتفاع السلسلة: {CHAIN.height}\nالصعوبة: {CHAIN.bits} بت\nسلامة السلسلة: {'✅' if ok else '❌'}")
-
-
-def bot_loop():
-    global BOT_USERNAME
-    while not STOP.is_set():
-        try:
-            BOT_USERNAME = tg("getMe")["result"]["username"]
-            tg("deleteWebhook", drop_pending_updates=False)
-            user_cmds = [
-                {"command": "start", "description": "فتح تطبيق التعدين"},
-                {"command": "balance", "description": "رصيدك"},
-                {"command": "top", "description": "أفضل المعدّنين"},
-                {"command": "chain", "description": "حالة السلسلة"}]
-            tg("setMyCommands", commands=user_cmds)
-            # قائمة "/" الخاصة بالأدمن: تظهر له فقط (في محادثته الخاصة مع البوت)
-            for a in ADMIN_IDS:
-                try:
-                    tg("setMyCommands", commands=user_cmds + ADMIN_COMMANDS,
-                       scope={"type": "chat", "chat_id": int(a)})
-                except TgError as e:
-                    print(f"admin commands for {a} not set ({e}) — يجب أن يضغط الأدمن /start مرة أولاً")
-            if WEB_APP_URL.startswith("https"):
-                tg("setChatMenuButton", menu_button={"type": "web_app", "text": "⛏ تعدين",
-                                                     "web_app": {"url": WEB_APP_URL}})
-            print("Bot started: @" + BOT_USERNAME, "| web app:", WEB_APP_URL or "-")
-            break
-        except TgError as e:
-            if e.code == 401:
-                print("!! BOT_TOKEN غير صالح (401): البوت متوقف، والموقع يعمل بوضع الضيف.")
-                return
-            print("bot init failed:", e)
-            STOP.wait(10)
-        except Exception as ex:
-            print("bot init failed:", repr(ex))
-            STOP.wait(10)
+    if act in SYNC:
+        res = await asyncio.to_thread(SYNC[act], tg, body)
+    elif act in ASYNC:
+        res = await ASYNC[act](tg, body)
     else:
+        raise web.HTTPNotFound()
+    return web.json_response({"ok": True, **res})
+
+
+async def web_page(request):
+    return web.Response(text=WEB_HTML, content_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
+async def web_health(request):
+    return web.Response(text="ok")
+
+
+async def start_web():
+    global WEB_RUNNER
+    if not WEBAPP_URL:
+        log.error("WEBAPP_URL / RAILWAY_PUBLIC_DOMAIN غير مضبوط: لن تعمل واجهة الويب")
+        return
+    w = web.Application(middlewares=[err_mw])
+    w.add_routes([web.get("/", web_health), web.get("/app", web_page),
+                  web.route("*", "/api/{act}", web_api)])
+    WEB_RUNNER = web.AppRunner(w)
+    await WEB_RUNNER.setup()
+    await web.TCPSite(WEB_RUNNER, "0.0.0.0", PORT).start()
+    log.info("Mini App on 0.0.0.0:%s (%s/app)", PORT, WEBAPP_URL)
+
+
+async def block_loop():
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await asyncio.to_thread(make_block)
+        except Exception:
+            log.exception("block loop")
+
+
+# ═══════════ 5) أوامر البوت والدفع بالنجوم ═══════════
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ref = None
+    if context.args and context.args[0].startswith("ref_") and context.args[0][4:].isdigit():
+        ref = int(context.args[0][4:])
+
+    def reg():
+        with cursor() as cur:
+            ensure_user(cur, u.id, u.full_name, u.username, ref)
+    await asyncio.to_thread(reg)
+    text = ("👋 أهلاً بك في <b>TotalHash</b>!\n\nلعبة تعدين افتراضية: اجمع النقاط، طوّر معدّنك، "
+            "وتصدّر القائمة.\nℹ️ النقاط داخل اللعبة فقط ولا تمثل عملة رقمية حقيقية ولا يمكن سحبها.")
+    if WEBAPP_URL:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app"))]])
+        await update.message.reply_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text)
+
+
+async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.pre_checkout_query
+    try:
+        key, uid = q.invoice_payload.split(":")
+        ok = key in ITEMS and int(uid) == q.from_user.id and q.currency == "XTR" \
+            and q.total_amount == ITEMS[key]["stars"]
+    except Exception:
+        ok = False
+    await q.answer(ok=ok, error_message=None if ok else "بيانات الدفع غير صحيحة")
+
+
+async def on_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sp = update.message.successful_payment
+    key = sp.invoice_payload.split(":")[0]
+    ok = await asyncio.to_thread(apply_payment, update.effective_user.id, key,
+                                 sp.telegram_payment_charge_id, sp.total_amount)
+    if ok:
+        await update.message.reply_text("✅ تم الدفع وتفعيل طلبك! عُد إلى التطبيق ⛏")
+
+
+async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    a = context.args
+    if len(a) != 2 or not a[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/refund user_id charge_id</code>")
+        return
+    try:
+        await context.bot.refund_star_payment(user_id=int(a[0]), telegram_payment_charge_id=a[1])
+    except Exception as e:
+        await update.message.reply_text(f"فشل الاسترجاع: {html.escape(str(e))}")
         return
 
-    offset, backoff = 0, 2
-    while not STOP.is_set():
+    def mark():
+        with cursor() as cur:
+            cur.execute("SELECT item FROM m_payments WHERE charge_id=?", (a[1],))
+            r = cur.fetchone()
+            cur.execute("UPDATE m_payments SET refunded=1 WHERE charge_id=?", (a[1],))
+            if r and r["item"] == "permit":
+                cur.execute("UPDATE m_users SET permit=0, mining=0 WHERE id=?", (int(a[0]),))
+    await asyncio.to_thread(mark)
+    await update.message.reply_text("💸 تم الاسترجاع وإلغاء التصريح.")
+
+
+async def post_init(app: Application):
+    global MAIN_APP
+    MAIN_APP = app
+    await start_web()
+    try:
+        await app.bot.set_my_commands([BotCommand("start", "🏠 الصفحة الرئيسية")])
+        if WEBAPP_URL:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="⛏ تعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app")))
+    except Exception as e:
+        log.warning("setup failed: %s", e)
+    BG.append(asyncio.create_task(block_loop()))
+    if ADMIN_ID:
         try:
-            res = tg("getUpdates", _timeout=65, offset=offset, timeout=50, allowed_updates=["message"])
-            backoff = 2
-            for upd in res.get("result", []):
-                if "update_id" not in upd:
-                    continue
-                offset = upd["update_id"] + 1
-                try:
-                    handle_update(upd)
-                except Exception as ex:
-                    print("update error:", repr(ex))
-                    with LOCK:
-                        DB.rollback()
-        except TgError as e:
-            if e.code == 401:
-                print("!! BOT_TOKEN غير صالح (401): تم إيقاف البوت.")
-                return
-            if e.code == 409:
-                print("bot conflict (409): نسخة أخرى تستخدم نفس التوكن، انتظار 15s")
-                STOP.wait(15)
-            elif e.code == 429:
-                STOP.wait(e.retry + 1)
-            else:
-                print("bot error:", e)
-                STOP.wait(backoff)
-                backoff = min(60, backoff * 2)
-        except Exception as ex:
-            print("bot network error:", repr(ex))
-            STOP.wait(backoff)
-            backoff = min(60, backoff * 2)
+            await app.bot.send_message(ADMIN_ID, f"✅ البوت يعمل.\n🗄 {'PostgreSQL' if USE_PG else 'SQLite'}\n"
+                                       f"🌐 {WEBAPP_URL + '/app' if WEBAPP_URL else 'WEBAPP_URL غير مضبوط'}")
+        except Exception:
+            pass
 
 
-# ───────────────────────── واجهة الموقع ─────────────────────────
-INDEX_HTML = r"""<!doctype html>
-<html lang="ar" dir="rtl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>HashChain</title>
+async def post_shutdown(app: Application):
+    for t in BG:
+        t.cancel()
+    if WEB_RUNNER:
+        await WEB_RUNNER.cleanup()
+
+
+# ═══════════ 6) الواجهة (Mini App) ═══════════
+WEB_HTML = r"""<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>TotalHash</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:#131518;--card:#1e2126;--card2:#23272d;--line:#2d3238;--tx:#eceef1;--mut:#8a919b;--or:#ffa95c;--gr:#34d399;--rd:#e5484d;--bl:#38bdf8;--pu:#a78bfa}
+:root{--bg:#17191c;--card:#202327;--line:#31353b;--ac:#ffa45b;--tx:#eceef0;--mut:#8b9098;--red:#d94848;--grn:#3ecf8e;--blue:#38b6ff;--pur:#9b7bff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;padding-bottom:84px}
-.wrap{max-width:560px;margin:0 auto;padding:14px}
-.card{background:var(--card);border:1px solid var(--line);border-top:1px solid #ffa95c55;border-radius:16px;padding:16px;margin-bottom:12px}
-.lbl{font:600 11px ui-monospace,monospace;letter-spacing:.15em;color:var(--mut);text-transform:uppercase}
-.lbl:before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--or);margin-inline-end:8px}
-.big{font-size:44px;font-weight:800;margin:10px 0 2px;direction:ltr;text-align:right}
-.big small{font-size:24px;color:var(--mut);font-weight:700}
-.coin{display:inline-flex;width:34px;height:34px;border-radius:9px;background:var(--or);color:#222;align-items:center;justify-content:center;font-weight:900;font-size:20px;vertical-align:middle;margin-inline-end:8px}
-.bar{height:7px;background:#2a2f36;border-radius:9px;overflow:hidden;margin:6px 0 12px}
-.bar>i{display:block;height:100%;border-radius:9px;transition:width .6s}
-.row{display:flex;justify-content:space-between;font:12px ui-monospace,monospace;color:var(--mut);direction:ltr}
-.btn{width:100%;border:0;border-radius:12px;padding:15px;font-size:16px;font-weight:700;cursor:pointer;color:#222;background:var(--or)}
-.btn.red{background:var(--rd);color:#fff}.btn.dark{background:#2a2420;color:var(--or);border:1px solid #ffa95c66}
-.btn:disabled{opacity:.5}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:10px}
-.grid>div{padding:12px 14px;background:var(--card);border:.5px solid var(--line)}
-.grid b{display:block;font-size:20px;margin-top:4px;direction:ltr;text-align:right}
-.grid span{font-size:12px;color:var(--mut)}
-.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-weight:700}
-.tag{font-size:12px;border:1px solid #555;color:#bbb;padding:3px 10px;border-radius:8px}
-.live{color:var(--gr);border-color:#34d39966;background:#34d39911}
-.modes{display:flex;gap:8px;margin:12px 0}
-.modes button{flex:1;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--tx);font-weight:700;cursor:pointer}
-.modes button.on{border-color:var(--or);color:var(--or)}
-.blk{display:flex;justify-content:space-between;gap:8px;padding:12px;background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:8px;font-size:13px}
-.blk .n{color:var(--or);font-weight:800;font-size:17px;direction:ltr}
-.blk .m{color:var(--mut);font-size:12px;margin-top:4px}
-.blk code{font:11px ui-monospace,monospace;color:var(--mut);direction:ltr;display:block;margin-top:4px;word-break:break-all}
-nav{position:fixed;bottom:0;left:0;right:0;background:#181a1e;border-top:1px solid var(--line);display:flex;justify-content:space-around;padding:8px 0 12px}
-nav button{background:0;border:0;color:var(--mut);font-size:12px;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;flex:1}
-nav button span{font-size:22px}nav button.on{color:var(--or)}
-.tab{display:none}.tab.on{display:block}
-h3{margin:4px 0 12px}
-.lb{display:flex;justify-content:space-between;padding:10px 4px;border-bottom:1px solid var(--line)}
-input.ref{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);padding:12px;border-radius:10px;direction:ltr;margin:10px 0}
-.top{background:var(--card);border:1px solid var(--line);border-top:1px solid #ffa95c55;border-radius:14px;overflow:hidden;direction:ltr}
-.th{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}
-.th .ti{width:34px;height:34px;border-radius:9px;background:var(--card2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:16px}
-.tr{display:flex;align-items:center;gap:12px;padding:14px;border-bottom:1px solid var(--line)}
-.tr:last-child{border-bottom:0}
-.rk{flex:none;width:36px;height:36px;border-radius:8px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font:700 13px ui-monospace,monospace;color:var(--mut)}
-.rk.t3{background:#3a2d27;border-color:#6b4a33;color:var(--or)}
-.av{flex:none;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:15px}
-.nm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.nm b{font-size:16px;word-break:break-word}
-.bdg{font-size:11px;padding:1px 8px;border-radius:6px;border:1px solid}
-.bdg.b3{color:var(--bl);border-color:var(--bl);background:#38bdf811}
-.bdg.b2{color:var(--gr);border-color:var(--gr);background:#34d39911}
-.bdg.b1{color:var(--mut);border-color:var(--line)}
-.lv{font-size:12px;color:var(--mut)}
-.bl{display:flex;align-items:center;gap:6px;margin-top:5px;color:#b4bac3;font:600 15px ui-monospace,monospace;direction:ltr;justify-content:flex-start}
-.bl i{font-style:normal;width:15px;height:15px;border-radius:4px;background:var(--or);color:#222;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:900}
-.bl small{font-size:11px;color:#5d646e}
-.toast{position:fixed;top:44px;left:50%;transform:translateX(-50%);background:#000c;padding:10px 18px;border-radius:10px;display:none;z-index:9}
-.off{position:fixed;top:0;left:0;right:0;background:var(--rd);color:#fff;text-align:center;padding:7px;font-size:13px;display:none;z-index:10}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",Tahoma,sans-serif;padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+.w{max-width:560px;margin:0 auto;padding:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:16px;margin-bottom:12px}
+h2{margin:0 0 6px;font-size:20px}h3{margin:0 0 10px;font-size:15px;color:var(--mut)}
+.h{color:var(--mut);font-size:13px;margin:0}
+.big{font-size:44px;font-weight:800;line-height:1.1;direction:ltr;text-align:right}
+.big small{font-size:22px;color:var(--mut)}
+.bar{height:9px;background:var(--bg);border-radius:9px;overflow:hidden;margin:6px 0 12px}
+.bar i{display:block;height:100%;border-radius:9px;transition:width .3s}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px;color:var(--mut)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.cell{background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:11px}
+.cell b{display:block;font-size:19px;color:var(--tx);direction:ltr;text-align:right}
+button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:14px;width:100%;margin-top:10px;cursor:pointer;color:var(--tx);background:var(--bg);border:1px solid var(--line)}
+button:active{transform:scale(.98)}button:disabled{opacity:.45}
+button.pri{background:var(--ac);color:#1e1307;border:0}button.stop{background:var(--red);color:#fff;border:0}
+button.sm{width:auto;margin:0;padding:8px 14px}
+.blk{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.blk:last-child{border:0}.blk b{font-size:14px}
+.tag{color:var(--ac);font-weight:700;direction:ltr}
+.days{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.day{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:9px;text-align:center;font-size:13px;color:var(--mut)}
+.day.on{border-color:var(--ac);color:var(--ac)}.day b{display:block;color:var(--tx);font-size:15px}
+.kv{background:var(--bg);border:1px dashed var(--line);border-radius:12px;padding:10px;word-break:break-all;direction:ltr;text-align:left;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+.nav{position:fixed;inset:auto 0 0 0;display:flex;background:var(--bg);border-top:1px solid var(--line);padding:6px 8px calc(6px + env(safe-area-inset-bottom));z-index:5}
+.nav div{flex:1;text-align:center;padding:6px 2px;color:var(--mut);font-size:12px;font-weight:700;cursor:pointer}
+.nav div.on{color:var(--ac)}.nav span{display:block;font-size:22px}
+.rk{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}.rk:last-child{border:0}
+.rk i{width:30px;height:30px;border-radius:9px;background:var(--bg);border:1px solid var(--line);display:grid;place-items:center;font-style:normal;font-size:13px;font-weight:800}
+.rk .n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:700}
+.rk.me{color:var(--ac)}
+#toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:20}
+#toast.on{opacity:1}
 </style></head><body>
-<div class="off" id="off"></div>
-<div class="toast" id="toast"></div>
-<div class="wrap">
-
-<section class="tab on" id="t-mine">
-  <div class="card">
-    <div class="lbl">WALLET · MAIN VAULT</div>
-    <div class="big"><span class="coin">#</span><span id="bal">0</span><small id="bal2"></small></div>
-    <div style="color:var(--mut);font-size:13px">إجمالي رصيد __COIN__</div>
-    <div style="margin-top:14px" class="row"><span>XP · مستوى <b id="lvl" style="color:var(--pu)">1</b></span><span id="xp"></span></div>
-    <div class="bar"><i id="xpb" style="background:var(--pu);width:0"></i></div>
-    <div class="row"><span>⚡ ENERGY</span><span id="en"></span></div>
-    <div class="bar"><i id="enb" style="background:var(--bl);width:0"></i></div>
-    <button class="btn" id="refill">⚡ احصل على طاقة</button>
-  </div>
-
-  <div class="card">
-    <div class="head"><span>معلومات الكتلة <span class="tag" id="nb">#1</span></span></div>
-    <div class="grid">
-      <div><span>الصعوبة</span><b id="diff">-</b></div><div><span>إجمالي معدل الهاش</span><b id="nhr">-</b></div>
-      <div><span>المكافأة</span><b id="rew">-</b></div><div><span>معدّنون متصلون</span><b id="miners">-</b></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="head"><span>⛏ تعدين</span><span class="tag" id="stag">متوقف</span></div>
-    <div class="grid">
-      <div><span>معدل الهاش</span><b id="hr">-</b></div><div><span>إجمالي الهاش</span><b id="hs">-</b></div>
-      <div><span>كتل وجدتها</span><b id="bf">0</b></div><div><span>ترتيبك</span><b id="rk">-</b></div>
-    </div>
-    <div class="modes" id="modes"><button data-m="1">×1 عادي</button><button data-m="2">×2 سريع</button><button data-m="3">×3 تيربو</button></div>
-    <button class="btn" id="mbtn">ابدأ التعدين</button>
-  </div>
-
-  <h3>آخر 25 كتلة</h3><div id="blocks"></div>
-</section>
-
-<section class="tab" id="t-ref">
-  <div class="card"><div class="lbl">REFERRALS</div><h3 style="margin-top:10px">ادعُ أصدقاءك</h3>
-    <p style="color:var(--mut);font-size:14px">تحصل أنت وصديقك على <b style="color:var(--or)">5 __COIN__</b> عند انضمامه عبر رابطك.</p>
-    <input class="ref" id="rlink" readonly>
-    <button class="btn" id="copy">نسخ الرابط</button>
-    <p style="color:var(--mut)">عدد المدعوين: <b id="refs" style="color:var(--tx)">0</b></p></div>
-</section>
-
-<section class="tab" id="t-stats">
-  <div class="top">
-    <div class="th"><span class="ti">🏆</span><b>المعدّنين <span dir="ltr">Top 100</span></b></div>
-    <div id="lb"></div>
-  </div>
-  <button class="btn dark" id="statsBtn" style="margin-top:12px">📊 إحصائيات الشبكة ▾</button>
-  <div class="card" id="statsPanel" style="display:none;margin-top:12px"><div class="lbl">NETWORK</div>
-    <div class="grid">
-      <div><span>ارتفاع السلسلة</span><b id="sh">-</b></div><div><span>الصعوبة (بت)</span><b id="sb">-</b></div>
-      <div><span>العرض الكلي</span><b id="ss">-</b></div><div><span>المستخدمون</span><b id="su">-</b></div>
-      <div><span>آخر فاصل زمني</span><b id="si">-</b></div><div><span>الهدف</span><b id="st">-</b></div>
-    </div>
-    <button class="btn dark" id="ver" style="margin-top:12px">⛓ تحقق من سلامة السلسلة</button>
-  </div>
-</section>
-
-<section class="tab" id="t-wallet">
-  <div class="card"><div class="lbl">WALLET</div>
-    <div class="big"><span class="coin">#</span><span id="wbal">0</span></div>
-    <div style="color:var(--mut)" id="wname"></div>
-    <p style="color:var(--mut);font-size:13px;line-height:1.8;margin-top:14px">
-    عملة __COIN__ تُنتَج فقط عبر إيجاد بلوك صالح بإثبات العمل (SHA-256 مزدوج). السلسلة مخزّنة ومترابطة بالهاش ويمكن التحقق منها من تبويب الإحصائيات.</p>
-  </div>
-</section>
-</div>
-
-<nav>
- <button data-t="mine" class="on"><span>⛏</span>تعدين</button>
- <button data-t="ref"><span>👥</span>إحالات</button>
- <button data-t="stats"><span>📊</span>إحصائيات</button>
- <button data-t="wallet"><span>👛</span>محفظة</button>
-</nav>
-
+<div class="w" id="app"><p class="h" style="text-align:center;margin-top:40vh">…</p></div>
+<div class="nav" id="nav"></div><div id="toast"></div>
 <script>
-/* [FIX-20] واجهة مرنة: مهلة للشبكة، 502/غير JSON، منع التكرار، تخزين غير متاح، هروب XSS */
-const tgw = window.Telegram && Telegram.WebApp;
-try { if (tgw) { tgw.ready(); tgw.expand(); } } catch (e) {}
-const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function rndId(){const a=new Uint8Array(12);try{crypto.getRandomValues(a)}catch(e){for(let i=0;i<12;i++)a[i]=Math.floor(Math.random()*256)}return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('')}
-let gid = null; try { gid = localStorage.getItem('gid'); } catch (e) {}
-if (!gid || !/^[A-Za-z0-9]{8,40}$/.test(gid)) { gid = rndId(); try { localStorage.setItem('gid', gid); } catch (e) {} }
-const H = () => ({'Content-Type':'application/json','X-Init-Data':(tgw&&tgw.initData)||'','X-Guest-Id':gid});
-function cleanRef(v){v=String(v||'').replace(/^ref_/,'');return /^\d{1,20}$/.test(v)?v:''}
-const ref = cleanRef(new URLSearchParams(location.search).get('ref')) || cleanRef(tgw&&tgw.initDataUnsafe&&tgw.initDataUnsafe.start_param);
-const fmt=n=>{n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'G';if(n>=1e6)return (n/1e6).toFixed(2)+'M';if(n>=1e3)return (n/1e3).toFixed(n>=1e4?1:2)+'K';return ''+Math.round(n)};
-let toastT=0;
-function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>e.style.display='none',2400)}
-function banner(t){const e=$('off');e.textContent=t||'';e.style.display=t?'block':'none'}
-const ERR={no_energy:'لا توجد طاقة كافية',cooldown:'انتظر قليلاً قبل الاستخدام التالي',auth:'تعذّر تسجيل الدخول — أعد فتح التطبيق',rate:'طلبات كثيرة، تمهّل قليلاً',network:'لا يوجد اتصال بالخادم',server:'خطأ في الخادم، حاول لاحقاً',too_large:'طلب غير صالح',bad_mode:'وضع غير صالح',bad_json:'طلب غير صالح'};
-async function api(p,m='GET',b,quiet){
-  const ctl=new AbortController(), to=setTimeout(()=>ctl.abort(),8000);
-  let r,j;
-  try{
-    r=await fetch(p,{method:m,headers:H(),body:b?JSON.stringify(b):undefined,signal:ctl.signal,cache:'no-store'});
-    try{j=await r.json()}catch(_){j={error:'server'}}
-  }catch(e){ banner(ERR.network); if(!quiet)toast(ERR.network); throw {error:'network'}; }
-  finally{ clearTimeout(to); }
-  if(r.status>=500){ banner(ERR.server) } else if(r.status===401){ banner(ERR.auth) } else banner('');
-  if(!r.ok){ if(!quiet)toast(ERR[j.error]||'خطأ'); throw j; }
-  return j;
-}
-let S=null;
-function render(s){
-  S=s; const b=s.balance.toFixed(4), i=b.indexOf('.')+3;
-  $('bal').textContent=b.slice(0,i); $('bal2').textContent=b.slice(i); $('wbal').textContent=s.balance.toFixed(4);
-  $('wname').textContent=s.name; $('lvl').textContent=s.level;
-  $('xp').textContent=Math.floor(s.xp)+' / '+s.xp_need; $('xpb').style.width=Math.min(100,s.xp/s.xp_need*100)+'%';
-  $('en').textContent=Math.floor(s.energy)+' / '+s.max_energy+'  +'+s.regen+' /min'; $('enb').style.width=s.energy/s.max_energy*100+'%';
-  const n=s.net; $('nb').textContent='#'+n.next_block; $('diff').textContent=fmt(n.difficulty); $('nhr').textContent=fmt(n.hashrate)+' H/s';
-  $('rew').textContent=n.reward.toFixed(2); $('miners').textContent=n.miners;
-  $('hr').textContent=fmt(s.hashrate)+' H/s'; $('hs').textContent=fmt(s.hashes); $('bf').textContent=s.blocks_found; $('rk').textContent='#'+s.rank;
-  $('stag').textContent=s.mining?'قيد التشغيل':'متوقف'; $('stag').className='tag'+(s.mining?' live':'');
-  $('mbtn').textContent=s.mining?'إيقاف التعدين':'ابدأ التعدين'; $('mbtn').className='btn'+(s.mining?' red':'');
-  document.querySelectorAll('#modes button').forEach(x=>x.classList.toggle('on',+x.dataset.m===s.mode));
-  $('rlink').value=s.ref_link||'(رابط الإحالة متاح داخل تيليجرام)'; $('refs').textContent=s.refs;
-  $('sh').textContent=n.height; $('sb').textContent=n.bits; $('ss').textContent=fmt(n.supply); $('su').textContent=n.users;
-  $('si').textContent=n.last_interval.toFixed(1)+'s'; $('st').textContent=n.target_time+'s';
-  $('refill').disabled=s.refill_in>0; $('refill').textContent=s.refill_in>0?('⚡ متاح بعد '+Math.ceil(s.refill_in/60)+' د'):'⚡ احصل على طاقة (+500)';
-}
-const busy={poll:false,blocks:false,act:false};
-async function guard(k,fn){ if(busy[k]) return; busy[k]=true; try{ await fn() }catch(e){} finally{ busy[k]=false } }
-const poll=()=>guard('poll',async()=>{ if(document.hidden) return; render(await api('/api/state'+(ref?'?ref='+encodeURIComponent(ref):''),'GET',null,true)) });
-const blocks=()=>guard('blocks',async()=>{ if(document.hidden) return; const l=await api('/api/blocks','GET',null,true);
-  $('blocks').innerHTML=l.map(b=>`<div class="blk"><div><div class="n">#${(+b.idx).toLocaleString('en')}</div><div class="m">⛏ ${esc(b.miner)} · مستوى ${+b.level}</div><div class="m">${esc(b.time)}</div><code>${esc(b.hash.slice(0,32))}…</code></div><div style="text-align:left;direction:ltr"><div class="tag">+${(+b.reward).toFixed(2)} #</div><div class="m" style="margin-top:8px">${+b.bits} bits</div></div></div>`).join('') });
-const AVC=[['#6d6af0','#8e8bff'],['#3fbf6b','#8fe28f'],['#b36cf5','#e17cf2'],['#38a6f0','#5d7bf5'],['#f08a3c','#f5b86a']];
-function avatar(n){n=String(n);const ch=Array.from(n.replace(/^@/,''))[0]||'?';let h=0;for(const c of n)h=(h*31+c.codePointAt(0))>>>0;const p=AVC[h%AVC.length];return `<div class="av" style="background:linear-gradient(135deg,${p[0]},${p[1]})">${esc(ch.toUpperCase())}</div>`}
-function balHtml(v){const s=(+v||0).toFixed(4),i=s.split('.')[0],d=s.split('.')[1];return Number(i).toLocaleString('en')+'.'+d[0]+'<small>'+d.slice(1)+'</small>'}
-const BD={3:['تيربو','b3'],2:['سريع','b2'],1:['عادي','b1']};
-const lb=()=>guard('poll2',async()=>{ const l=await api('/api/leaderboard','GET',null,true);
-  $('lb').innerHTML=l.length?l.map((r,i)=>{const b=BD[r.mode]||BD[1];return `<div class="tr"><div class="rk${i<3?' t3':''}">${String(i+1).padStart(2,'0')}</div>${avatar(r.name)}<div style="flex:1;min-width:0"><div class="nm"><b>${esc(r.name)}</b><span class="bdg ${b[1]}">${b[0]}</span><span class="lv">مستوى ${+r.level}</span></div><div class="bl"><i>#</i>${balHtml(r.balance)}</div></div></div>`}).join(''):'<div class="tr" style="color:var(--mut)">لا يوجد معدّنون بعد</div>' });
-const act=fn=>guard('act',async()=>{ render(await fn()) });
-$('mbtn').onclick=()=>act(()=>api(S&&S.mining?'/api/stop':'/api/start','POST'));
-$('refill').onclick=()=>act(async()=>{ const s=await api('/api/refill','POST'); toast('تمت إضافة الطاقة ⚡'); return s });
-document.querySelectorAll('#modes button').forEach(x=>x.onclick=()=>act(()=>api('/api/mode','POST',{mode:+x.dataset.m})));
-$('copy').onclick=()=>{ try{navigator.clipboard.writeText($('rlink').value);toast('تم النسخ')}catch(e){$('rlink').select();toast('انسخ الرابط يدوياً')} };
-$('ver').onclick=()=>guard('ver',async()=>{ const r=await api('/api/verify'); toast(r.valid?'✅ السلسلة سليمة ('+r.info+' بلوك)':'❌ خلل عند البلوك '+r.info) });
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.id==='t-'+b.dataset.t));
-  if(b.dataset.t==='stats')lb();
-});
-$('statsBtn').onclick=()=>{const p=$('statsPanel'),open=p.style.display==='none';p.style.display=open?'block':'none';$('statsBtn').textContent=open?'📊 إخفاء الإحصائيات ▴':'📊 إحصائيات الشبكة ▾';if(open)p.scrollIntoView({behavior:'smooth',block:'nearest'})};
-setInterval(()=>{ if($('t-stats').classList.contains('on')&&!document.hidden) lb() },5000);
-document.addEventListener('visibilitychange',()=>{ if(!document.hidden){poll();blocks()} });
-poll();blocks();setInterval(poll,2000);setInterval(blocks,3000);
+const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
+let S=null,B=[],TOP=null,tab='mine';
+const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const f=(n,d=2)=>Number(n).toLocaleString('en',{minimumFractionDigits:d,maximumFractionDigits:d});
+const fi=n=>Number(n).toLocaleString('en',{maximumFractionDigits:0});
+function toast(m){const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
+async function api(p,b){
+  const r=await fetch('/api/'+p,{method:b===undefined?'GET':'POST',headers:{'X-Init-Data':tg.initData,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const j=await r.json();if(!j.ok)throw new Error(j.error||'خطأ');return j}
+async function load(){
+  S=await api('me');
+  if(tab==='mine')B=(await api('blocks')).blocks;
+  if(tab==='top')TOP=await api('top');
+  draw()}
+function go(t){tab=t;load().catch(e=>toast(e.message))}
+function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
+async function act(p,b){try{await api(p,b||{});await load()}catch(e){toast(e.message)}}
+function timeAgo(t){const s=Math.max(0,Math.floor(Date.now()/1000-t));return s<60?s+'ث':Math.floor(s/60)+'د'}
+function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
+
+function vMine(){
+  let h='';
+  if(!S.permit){
+    h+=`<div class="card"><h2>🔑 تصريح التعدين</h2><p class="h">لبدء التعدين تحتاج تصريحاً بدفعة واحدة.<br>النقاط افتراضية داخل اللعبة.</p>
+    <button class="pri" onclick="buy('permit')">⭐ ادفع ${S.prices.permit} نجمة</button></div>`;
+  }else{
+    h+=`<div class="card"><div class="row"><span>الرصيد (HASH)</span><span>⚡ ${S.online} معدّن نشط</span></div>
+    <div class="big" id="bal">${f(S.balance,4)}</div>
+    <div class="row" style="margin-top:12px"><span>XP · مستوى ${S.level}</span><span>${S.xp} / ${S.xp_need}</span></div>
+    <div class="bar"><i style="width:${Math.min(100,S.xp/S.xp_need*100)}%;background:var(--pur)"></i></div>
+    <div class="row"><span>الطاقة +${S.regen}/د</span><span id="enx">${fi(S.energy)} / ${fi(S.max_energy)}</span></div>
+    <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
+    ${S.mining?'<button class="stop" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
+      '<button class="pri" onclick="act(\'mining\',{on:true})">▶ بدء التعدين</button>'}
+    <div class="grid" style="margin-top:12px"><div class="cell"><span class="h">معدل الهاش</span><b>${fi(S.hashrate)} H/s</b></div>
+    <div class="cell"><span class="h">الربح</span><b>${f(S.rate*3600,1)}/س</b></div></div>
+    <div class="grid"><button onclick="buy('energy_up')">🚀 +2000 طاقة قصوى<br><small>⭐ ${S.prices.energy_up}</small></button>
+    <button onclick="buy('restore')">🔋 استعادة الطاقة<br><small>⭐ ${S.prices.restore}</small></button></div></div>`;
+  }
+  h+=`<div class="card"><h3>آخر 25 كتلة</h3>`+(B.length?B.map(b=>`<div class="blk"><div><b>#${fi(b.id)}</b> · ${esc(b.miner)} <span class="h">Lv${b.level}</span></div>
+  <div><span class="tag">+${f(b.reward,1)}</span> <span class="h">${timeAgo(b.t)}</span></div></div>`).join(''):'<p class="h">لا توجد كتل بعد.</p>')+'</div>';
+  return h}
+function vRefs(){return `<div class="card"><h2>👥 إحالاتك</h2><p class="h">ادعُ أصدقاءك: تحصل على <b>${S.ref_bonus}</b> نقطة عن كل صديق يشتري تصريح التعدين.</p>
+  <div class="grid" style="margin-top:12px"><div class="cell"><span class="h">عدد المُحالين</span><b>${S.refs}</b></div></div>
+  <div class="kv" style="margin-top:12px">${esc(S.ref_link)}</div>
+  <button class="pri" onclick="tg.openTelegramLink('https://t.me/share/url?url='+encodeURIComponent(S.ref_link)+'&text='+encodeURIComponent('⛏ تعال نعدّن معاً!'))">📤 مشاركة الرابط</button>
+  <button onclick="navigator.clipboard.writeText(S.ref_link).then(()=>toast('تم النسخ'))">📋 نسخ الرابط</button></div>`}
+function vTasks(){
+  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000','500 #'];
+  const ready=S.daily_wait<=0;
+  let h=`<div class="card"><h2>🎁 مكافآت يومية</h2><p class="h">عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى).</p><div class="days" style="margin-top:12px">`+
+  lab.map((l,i)=>`<div class="day ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>${i<6?'⚡ ':''}${l}</b>${i<S.day_idx?'✓':''}</div>`).join('')+`</div>
+  <button class="pri" ${ready?'':'disabled'} onclick="act('daily')">${ready?'🎁 استلم مكافأة اليوم':'التالية بعد '+fmtWait(S.daily_wait)}</button></div>`;
+  if(S.tasks.length)h+=`<div class="card"><h3>المهام</h3>`+S.tasks.map(t=>`<div class="rk"><span class="n">${esc(t.title)}</span><span class="tag">+${t.reward}</span>
+  ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
+  return h}
+function vTop(){
+  if(!TOP)return '<p class="h">…</p>';
+  return `<div class="card"><h2>🏆 أفضل 100 معدّن</h2><p class="h">ترتيبك: #${TOP.rank} · ${f(TOP.mytotal,2)}</p></div><div class="card">`+
+  (TOP.top.length?TOP.top.map((r,i)=>`<div class="rk ${r.me?'me':''}"><i>${i+1}</i><span class="n">${esc(r.name)} <span class="h">Lv${r.level}</span></span><span class="tag">${fi(r.total)}</span></div>`).join(''):'<p class="h">لا أحد بعد.</p>')+'</div>'}
+function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${f(S.balance,4)}</div></div>
+  <div class="card"><h3>المتجر (نجوم تيليجرام)</h3>
+  ${S.permit?'<p class="h">✅ تصريح التعدين مفعّل.</p>':`<button class="pri" onclick="buy('permit')">🔑 تصريح التعدين — ⭐ ${S.prices.permit}</button>`}
+  <button onclick="buy('energy_up')">🚀 زيادة الطاقة القصوى (+2000، +5/د) — ⭐ ${S.prices.energy_up}</button>
+  <button onclick="buy('restore')">🔋 استعادة الطاقة — ⭐ ${S.prices.restore}</button></div>
+  <div class="card"><p class="h">ℹ️ النقاط افتراضية داخل اللعبة فقط، ولا تمثل عملة رقمية ولا يمكن سحبها أو تحويلها لمال.</p></div>`}
+const V={mine:vMine,refs:vRefs,tasks:vTasks,top:vTop,wallet:vWallet};
+function draw(){
+  $('nav').innerHTML=TABS.map(t=>`<div class="${t[0]===tab?'on':''}" onclick="go('${t[0]}')"><span>${t[1]}</span>${t[2]}</div>`).join('');
+  $('app').innerHTML='<div class="w" style="padding:0">'+V[tab]()+'</div>'}
+setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
+  if(!S||!S.mining||tab!=='mine')return;
+  const dt=.25,run=Math.min(dt,S.energy/S.cost);
+  S.balance+=run*S.rate;S.energy-=run*S.cost;
+  if($('bal'))$('bal').textContent=f(S.balance,4);
+  if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
+  if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
+  if(S.energy<=0)load().catch(()=>{})},250);
+setInterval(()=>{if(S&&!document.hidden)load().catch(()=>{})},6000);
+if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
+else load().catch(e=>{$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
 """
 
-INDEX_BYTES = INDEX_HTML.replace("__COIN__", COIN).encode("utf-8")
 
-
-# ───────────────────────── التشغيل ─────────────────────────
+# ═══════════ 7) التشغيل ═══════════
 def main():
-    global CHAIN, DB
-    DB = open_db()
     init_db()
-    CHAIN = Chain()
-    supervise("miner", miner_loop)
-    if BOT_TOKEN:
-        supervise("bot", bot_loop)
-    else:
-        print("BOT_TOKEN غير مضبوط: الموقع يعمل بوضع الضيف فقط.")
-
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    srv.daemon_threads = True
-    srv.request_queue_size = 64
-
-    def _term(signum, frame):
-        print(f"signal {signum}: shutting down…")
-        STOP.set()
-        threading.Thread(target=srv.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, _term)
-    signal.signal(signal.SIGINT, _term)
-
-    print(f"HashChain running on :{PORT} | postgres ✓ | prefix={ID_PREFIX} | height={CHAIN.height} bits={CHAIN.bits}")
-    try:
-        srv.serve_forever(poll_interval=0.5)
-    finally:
-        STOP.set()
-        srv.server_close()
-        with LOCK:
-            try:
-                DB.commit()
-            except Exception:
-                pass
-            DB.close()
-        print("bye.")
+    app = (Application.builder().token(BOT_TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML))
+           .post_init(post_init).post_shutdown(post_shutdown).build())
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("refund", cmd_refund))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+    log.info("Bot started (polling)")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
