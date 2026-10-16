@@ -44,7 +44,7 @@ from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, Labele
                       WebAppInfo, MenuButtonWebApp, BotCommand, BotCommandScopeChat)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CommandHandler, MessageHandler, PreCheckoutQueryHandler,
-                          ContextTypes, Defaults, filters)
+                          ConversationHandler, ContextTypes, Defaults, filters)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -807,7 +807,7 @@ async def on_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ADMIN_ID, f"💳 دفعة جديدة\n👤 {html.escape(u.full_name)} (<code>{u.id}</code>)\n"
                               f"📦 {key} · ⭐ {sp.total_amount}\n"
                               f"🧾 <code>{html.escape(sp.telegram_payment_charge_id)}</code>\n\n"
-                              f"للاسترجاع:\n<code>/refund {html.escape(sp.telegram_payment_charge_id)}</code>")
+                              f"للاسترجاع أرسل: <code>/refund {u.id}</code>")
             except Exception:
                 pass
 
@@ -835,31 +835,107 @@ def _mark_refunded(p):
         save_user(cur, u)
 
 
-async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/refund charge_id   أو   /refund user_id charge_id"""
-    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
-        return
-    a = context.args
-    if len(a) not in (1, 2):
-        await update.message.reply_text("الاستعمال: <code>/refund charge_id</code>\n"
-                                        "لعرض الدفعات: /payments")
-        return
-    cid = a[-1]
-    p = await asyncio.to_thread(_find_payment, cid)
-    if not p:
-        await update.message.reply_text("❌ هذه الدفعة غير موجودة في القاعدة. استعمل /payments")
-        return
-    if p["refunded"]:
-        await update.message.reply_text("ℹ️ هذه الدفعة مُرجعة مسبقاً.")
-        return
+R_UID, R_PICK, R_CONF = range(3)
+
+
+def _user_payments(uid):
+    with cursor() as cur:
+        cur.execute("SELECT name FROM m_users WHERE id=?", (uid,))
+        u = cur.fetchone()
+        cur.execute("SELECT * FROM m_payments WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (uid,))
+        return (u or {}).get("name") or "—", cur.fetchall()
+
+
+async def _do_refund(bot, p):
+    cur_p = await asyncio.to_thread(_find_payment, p["charge_id"])
+    if not cur_p:
+        return "❌ الدفعة غير موجودة في القاعدة."
+    if cur_p["refunded"]:
+        return "ℹ️ هذه الدفعة مُرجعة مسبقاً."
     try:
-        await context.bot.refund_star_payment(user_id=int(p["user_id"]), telegram_payment_charge_id=cid)
+        await bot.refund_star_payment(user_id=int(p["user_id"]), telegram_payment_charge_id=p["charge_id"])
     except Exception as e:
-        await update.message.reply_text(f"❌ فشل الاسترجاع: {html.escape(str(e))}")
-        return
+        return f"❌ فشل الاسترجاع: {html.escape(str(e))}"
     await asyncio.to_thread(_mark_refunded, p)
-    await update.message.reply_text(f"💸 تم إرجاع ⭐ {p['stars']} للمستخدم <code>{p['user_id']}</code>"
-                                    f" وسحب أثر ({p['item']}).")
+    return f"💸 تم إرجاع ⭐ {p['stars']} للمستخدم <code>{p['user_id']}</code> وسحب أثر ({p['item']})."
+
+
+async def _refund_show(update, context, uid):
+    name, rows = await asyncio.to_thread(_user_payments, uid)
+    if not rows:
+        await update.message.reply_text("لا توجد دفعات لهذا المستخدم.")
+        return ConversationHandler.END
+    context.user_data["rf"] = rows
+    lines = [f"{i}) {'↩️ مُرجعة' if r['refunded'] else '✅'} {r['item']} · ⭐ {r['stars']} · "
+             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(r['created_at'] or 0))}"
+             for i, r in enumerate(rows, 1)]
+    await update.message.reply_text(f"👤 {html.escape(name)} (<code>{uid}</code>)\n\n" + "\n".join(lines) +
+                                    "\n\nأرسل <b>رقم</b> الدفعة التي تريد استرجاعها، أو /cancel")
+    return R_PICK
+
+
+async def refund_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/refund ← يسأل عن الايدي ← يعرض الدفعات مرقمة ← رقم ← تأكيد"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    context.user_data.pop("rf", None)
+    context.user_data.pop("rf_sel", None)
+    if context.args:
+        a0 = context.args[0]
+        if a0.isdigit():
+            return await _refund_show(update, context, int(a0))
+        p = await asyncio.to_thread(_find_payment, a0)          # /refund charge_id (مباشر)
+        if not p:
+            await update.message.reply_text("❌ الدفعة غير موجودة.")
+            return ConversationHandler.END
+        await update.message.reply_text(await _do_refund(context.bot, p))
+        return ConversationHandler.END
+    await update.message.reply_text("💸 أرسل <b>ايدي المستخدم</b> (أرقام فقط)، أو /cancel")
+    return R_UID
+
+
+async def refund_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if not t.isdigit():
+        await update.message.reply_text("⚠️ الايدي أرقام فقط. أعد المحاولة أو /cancel")
+        return R_UID
+    return await _refund_show(update, context, int(t))
+
+
+async def refund_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = context.user_data.get("rf") or []
+    t = (update.message.text or "").strip()
+    if not t.isdigit() or not 1 <= int(t) <= len(rows):
+        await update.message.reply_text(f"⚠️ أرسل رقماً من 1 إلى {len(rows)}، أو /cancel")
+        return R_PICK
+    p = rows[int(t) - 1]
+    if p["refunded"]:
+        await update.message.reply_text("ℹ️ هذه الدفعة مُرجعة مسبقاً، اختر رقماً آخر.")
+        return R_PICK
+    context.user_data["rf_sel"] = p
+    await update.message.reply_text(
+        f"⚠️ سيتم إرجاع <b>⭐ {p['stars']}</b> ({p['item']}) للمستخدم <code>{p['user_id']}</code>.\n\n"
+        "أرسل كلمة <b>تأكيد</b> للتنفيذ، أو /cancel للإلغاء.")
+    return R_CONF
+
+
+async def refund_conf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip().lower()
+    p = context.user_data.get("rf_sel")
+    if p and t in ("تأكيد", "تاكيد", "confirm", "yes", "نعم"):
+        await update.message.reply_text(await _do_refund(context.bot, p))
+    else:
+        await update.message.reply_text("تم الإلغاء.")
+    context.user_data.pop("rf", None)
+    context.user_data.pop("rf_sel", None)
+    return ConversationHandler.END
+
+
+async def refund_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("rf", None)
+    context.user_data.pop("rf_sel", None)
+    await update.message.reply_text("تم الإلغاء.")
+    return ConversationHandler.END
 
 
 async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1238,7 +1314,13 @@ def main():
     app = (Application.builder().token(BOT_TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML))
            .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("refund", cmd_refund))
+    txt = filters.TEXT & ~filters.COMMAND
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("refund", refund_start)],
+        states={R_UID: [MessageHandler(txt, refund_uid)],
+                R_PICK: [MessageHandler(txt, refund_pick)],
+                R_CONF: [MessageHandler(txt, refund_conf)]},
+        fallbacks=[CommandHandler("cancel", refund_cancel)], allow_reentry=True))
     app.add_handler(CommandHandler("payments", cmd_payments))
     app.add_handler(CommandHandler("gencode", cmd_gencode))
     app.add_handler(CommandHandler("codes", cmd_codes))
