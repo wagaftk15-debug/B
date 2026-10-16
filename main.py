@@ -88,6 +88,7 @@ REF_MIN = 1000
 DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
 PATRON_SECS = 86400
 MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
+STALE_SECS = 15         # أي معدّن لم تُحدَّث بياناته منذ هذه المدة تُحدَّث تلقائياً من السيرفر
 
 # أوضاع التعدين:
 #   mul   = مضاعف الهاش
@@ -101,6 +102,9 @@ MODES = {1: dict(name="عادي", mul=1.0, cost=1.0, stars=0),
          6: dict(name="كوازار", mul=20.0, cost=26.0, stars=2499),
          7: dict(name="نجم نابض", mul=34.0, cost=44.0, stars=3999),
          8: dict(name="التفرد", mul=40.0, cost=52.0, stars=6999)}
+# أسماء بديلة تُقبل في أمر /gencode mode ...
+MODE_ALIASES = {"normal": 1, "turbo": 2, "super": 3, "nitro": 4, "plasma": 5,
+                "quasar": 6, "pulsar": 7, "singularity": 8}
 for _k, _m in MODES.items():            # كل وضع مدفوع يصبح عنصراً في المتجر
     if _m["stars"] > 0:
         ITEMS[f"mode_{_k}"] = dict(stars=_m["stars"], title=f"وضع {_m['name']}",
@@ -354,14 +358,14 @@ def hashrate(u):
     return (BASE_HR * (1 + 0.05 * (u["level"] - 1)) + u.get("srv", 0)) * mode_of(u)["mul"]
 
 
-def tier(hr):
-    if hr >= 20000:
-        return "super"
-    if hr >= 5000:
-        return "nitro"
-    if hr >= 1500:
-        return "turbo"
-    return ""
+def tier(mode):
+    """الشارة تعتمد على الوضع المفتوح والفعّال للمستخدم (وليس على قوة الهاش).
+    ترجع رقم الوضع (2..8) أو 0 للوضع العادي (بدون شارة)."""
+    try:
+        m = int(mode or 1)
+    except (TypeError, ValueError):
+        return 0
+    return m if (m in MODES and m > 1) else 0
 
 
 def xp_need(level):
@@ -425,11 +429,12 @@ def lock_user(cur, uid):
 
 
 def save_user(cur, u):
+    # نحفظ الوضع الفعّال (المفتوح فعلاً) كي لا تظهر شارة وضع لم يشتره المستخدم
     cur.execute("""UPDATE m_users SET permit=?,level=?,xp=?,balance=?,total=?,energy=?,max_energy=?,
         regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?,modes=?
         WHERE id=?""",
                 (u["permit"], u["level"], u["xp"], u["balance"], u["total"], u["energy"], u["max_energy"],
-                 u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], u["mode"],
+                 u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], cur_mode(u),
                  hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["modes"], u["id"]))
 
 
@@ -449,7 +454,7 @@ def state(u):
                 mining=bool(u["mining"]), hashrate=hr, rate=hr / EARN_DIV, cost=COST * m["cost"],
                 mode=cur_mode(u), unlocked=sorted(unlocked(u)),
                 hashes=u["hashes"], wins=u["wins"], income=u["income"],
-                patron_left=max(0, int(u["patron"] - time.time())), srv=u["srv"], tier=tier(hr),
+                patron_left=max(0, int(u["patron"] - time.time())), srv=u["srv"], tier=tier(cur_mode(u)),
                 day_idx=streak % 7, daily_wait=wait)
 
 
@@ -494,15 +499,41 @@ def make_block():
             return
         total = sum(m["hr"] for m in ms)
         w = random.choices(ms, weights=[max(m["hr"], 1.0) for m in ms])[0]
-        rew = BLOCK_REWARD * (2 if w["patron"] > now else 1)
-        cur.execute("UPDATE m_users SET balance=balance+?,total=total+?,wins=wins+1,income=income+? WHERE id=?",
-                    (rew, rew, rew, w["id"]))
+        try:
+            u = lock_user(cur, w["id"])          # تحديث الفائز لحظياً (المستوى/الرصيد/الطاقة) قبل تسجيل الكتلة
+        except Err:
+            return
+        rew = BLOCK_REWARD * (2 if u["patron"] > now else 1)
+        u["balance"] += rew
+        u["total"] += rew
+        u["wins"] += 1
+        u["income"] += rew
+        save_user(cur, u)
         cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,thr,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)", (w["id"], w["name"], w["level"], rew, len(ms), total, int(now)))
+                    "VALUES(?,?,?,?,?,?,?)", (u["id"], u["name"], u["level"], rew, len(ms), total, int(now)))
         cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
         cur.execute("SELECT MAX(id) AS m FROM m_blocks")
         if ((cur.fetchone() or {}).get("m") or 0) >= CHAIN["blocks"]:
             CHAIN["done"] = True
+
+
+def settle_stale():
+    """يحدّث (مستوى/رصيد/طاقة) المعدّنين الذين أغلقوا التطبيق أو أصبح في الخلفية،
+    كي تظهر مستوياتهم وأرصدتهم الحقيقية في الكتل والترتيب وبقية الشاشات بدل أن تبقى قديمة."""
+    now = time.time()
+    with cursor() as cur:
+        cur.execute("SELECT id FROM m_users WHERE mining=1 AND last_tick<? ORDER BY last_tick LIMIT 500",
+                    (now - STALE_SECS,))
+        ids = [r["id"] for r in cur.fetchall()]
+    for i in ids:
+        try:
+            with cursor() as cur:
+                u = lock_user(cur, i)
+                save_user(cur, u)
+        except Err:
+            pass
+        except Exception:
+            log.exception("settle_stale %s", i)
 
 
 # ═══════════ 3.1) DEX: تبادل HASH ↔ طاقة ═══════════
@@ -517,7 +548,7 @@ def dex_info():
 
 
 # ═══════════ 3.2) أكواد الاسترداد ═══════════
-CODE_KINDS = {"energy": "طاقة", "hash": "نقاط HASH", "permit": "تصريح التعدين"}
+CODE_KINDS = {"energy": "طاقة", "hash": "نقاط HASH", "permit": "تصريح التعدين", "mode": "وضع تعدين"}
 
 
 def parse_amt(s):
@@ -539,6 +570,27 @@ def fmt_amt(n):
     return f"{n:g}"
 
 
+def resolve_mode(s):
+    """يقبل رقم الوضع (1-8) أو اسمه بالعربي أو الإنجليزي (turbo, super, ...) ← رقم الوضع أو None"""
+    s = (s or "").strip().lower()
+    if s.isdigit():
+        n = int(s)
+        return n if n in MODES else None
+    if s in MODE_ALIASES:
+        return MODE_ALIASES[s]
+    for k, m in MODES.items():
+        if m["name"] == s:
+            return k
+    return None
+
+
+def prize_text(kind, amount):
+    if kind == "mode":
+        m = MODES.get(int(amount))
+        return "وضع " + (m["name"] if m else str(int(amount)))
+    return CODE_KINDS.get(kind, kind) + ("" if kind == "permit" else f" {fmt_amt(amount)}")
+
+
 def redeem_code(tg, code):
     code = code.strip().upper()
     with cursor() as cur:
@@ -551,6 +603,12 @@ def redeem_code(tg, code):
             raise Err("انتهت صلاحية هذا الكود (اكتمل عدد الاستخدامات)")
         if c["kind"] == "permit" and u["permit"]:
             raise Err("لديك تصريح بالفعل")
+        if c["kind"] == "mode":
+            mid = int(c["amount"])
+            if mid not in MODES:
+                raise Err("هذا الكود يشير إلى وضع غير موجود")
+            if mid in unlocked(u):
+                raise Err("هذا الوضع مفتوح لديك بالفعل")
         cur.execute("INSERT INTO m_redeems(code,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", (code, u["id"]))
         if cur.rowcount != 1:
             raise Err("استخدمت هذا الكود من قبل")
@@ -561,6 +619,11 @@ def redeem_code(tg, code):
             u["balance"] += c["amount"]
             u["total"] += c["amount"]
             msg = f"💰 +{fmt_amt(c['amount'])} HASH"
+        elif c["kind"] == "mode":
+            s = unlocked(u)
+            s.add(mid)
+            u["modes"] = ",".join(map(str, sorted(s)))
+            msg = f"🚀 تم فتح وضع {MODES[mid]['name']}"
         else:
             u["permit"] = 1
             msg = "🔑 تم تفعيل تصريح التعدين"
@@ -751,14 +814,14 @@ def act_refs(tg, b):
         info = {}
         if rows:
             ids = [r["rid"] for r in rows]
-            cur.execute("SELECT id,name,level,hr FROM m_users WHERE id IN (" + ",".join("?" * len(ids)) + ")",
+            cur.execute("SELECT id,name,level,mode FROM m_users WHERE id IN (" + ",".join("?" * len(ids)) + ")",
                         tuple(ids))
             info = {r["id"]: r for r in cur.fetchall()}
     out = []
     for r in rows:
         u = info.get(r["rid"])
         if u:
-            out.append(dict(name=u["name"], level=u["level"], tier=tier(u["hr"]), count=int(r["n"]),
+            out.append(dict(name=u["name"], level=u["level"], tier=tier(u["mode"]), count=int(r["n"]),
                             active=int(r["act"] or 0), me=r["rid"] == tg["id"]))
     return {"reftop": out}
 
@@ -773,19 +836,19 @@ def act_blocks(tg, b):
 
 def act_top(tg, b):
     with cursor() as cur:
-        cur.execute("SELECT id,name,level,total,hr FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
+        cur.execute("SELECT id,name,level,total,mode FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
         rows = cur.fetchall()
-        cur.execute("SELECT name,level,total,hr FROM m_users WHERE id=?", (tg["id"],))
-        me = cur.fetchone() or dict(name=tg["name"], level=1, total=0, hr=BASE_HR)
+        cur.execute("SELECT name,level,total,mode FROM m_users WHERE id=?", (tg["id"],))
+        me = cur.fetchone() or dict(name=tg["name"], level=1, total=0, mode=1)
         cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (me["total"],))
         rank = cur.fetchone()["r"]
         cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE total>0")
         holders = cur.fetchone()["n"]
     mined = blocks_mined()
-    return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], tier=tier(r["hr"]),
+    return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], tier=tier(r["mode"]),
                          me=r["id"] == tg["id"]) for r in rows],
             "rank": rank, "mytotal": me["total"],
-            "mine": dict(name=me["name"], level=me["level"], total=me["total"], tier=tier(me["hr"])),
+            "mine": dict(name=me["name"], level=me["level"], total=me["total"], tier=tier(me["mode"])),
             "chain": dict(holders=holders, emission=CHAIN["blocks"] * BLOCK_REWARD,
                           pct=min(100.0, mined / CHAIN["blocks"] * 100), mined=mined, blocks=CHAIN["blocks"],
                           start_date=fmt_d(CHAIN["start"]))}
@@ -917,6 +980,16 @@ async def block_loop():
             await asyncio.to_thread(make_block)
         except Exception:
             log.exception("block loop")
+
+
+async def settle_loop():
+    """كل 10 ثوانٍ: يحدّث بيانات المعدّنين النشطين الذين لا يرسل تطبيقهم طلبات (مغلق/في الخلفية)."""
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await asyncio.to_thread(settle_stale)
+        except Exception:
+            log.exception("settle loop")
 
 
 # ═══════════ 5) أوامر البوت والدفع بالنجوم ═══════════
@@ -1132,20 +1205,31 @@ async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/gencode <energy|hash|permit> <المقدار> [عدد_الاستخدامات] [كود_مخصص]"""
+    """/gencode <energy|hash|permit|mode> <المقدار أو الوضع> [عدد_الاستخدامات] [كود_مخصص]"""
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
     a = context.args
     if len(a) < 2 or a[0].lower() not in CODE_KINDS:
+        modes_list = " · ".join(f"{k}={m['name']}" for k, m in MODES.items())
         await update.message.reply_text(
             "الاستعمال:\n<code>/gencode energy 10k 100</code> ← طاقة 10K لأول 100 شخص\n"
             "<code>/gencode hash 100k 50 MYCODE</code> ← نقاط بكود مخصص\n"
-            "<code>/gencode permit 0 20</code> ← تصريح تعدين لأول 20 شخص\n\n"
+            "<code>/gencode permit 0 20</code> ← تصريح تعدين لأول 20 شخص\n"
+            "<code>/gencode mode 2 10</code> ← فتح وضع تيربو لأول 10 أشخاص\n"
+            "<code>/gencode mode turbo 10 MYCODE</code> ← بالاسم وبكود مخصص\n\n"
+            f"🚀 الأوضاع: {modes_list}\n"
+            "(يقبل الرقم أو الاسم: normal, turbo, super, nitro, plasma, quasar, pulsar, singularity أو بالعربي)\n\n"
             "/codes لعرض الأكواد · /delcode CODE للحذف")
         return
     kind = a[0].lower()
     try:
-        amount = parse_amt(a[1])
+        if kind == "mode":
+            amount = resolve_mode(a[1])
+            if amount is None:
+                await update.message.reply_text("❌ وضع غير معروف. أرسل /gencode لعرض الأوضاع.")
+                return
+        else:
+            amount = parse_amt(a[1])
         max_uses = int(a[2]) if len(a) > 2 else 1
     except ValueError:
         await update.message.reply_text("قيمة غير صحيحة")
@@ -1160,7 +1244,7 @@ async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await asyncio.to_thread(add):
         await update.message.reply_text("هذا الكود موجود مسبقاً")
         return
-    prize = CODE_KINDS[kind] + ("" if kind == "permit" else f" {fmt_amt(amount)}")
+    prize = prize_text(kind, amount)
     await update.message.reply_text(
         f"✅ تم إنشاء الكود:\n<code>{html.escape(code)}</code>\n"
         f"🎁 {prize} · 👥 {max_uses} استخدام\n\nانسخ هذا للقناة:\n"
@@ -1310,7 +1394,10 @@ async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لا توجد أكواد.")
         return
     await update.message.reply_text("\n".join(
-        f"<code>{html.escape(r['code'])}</code> · {r['kind']} {fmt_amt(r['amount'])} · {r['uses']}/{r['max_uses']}"
+        f"<code>{html.escape(r['code'])}</code> · "
+        + (f"mode {html.escape(prize_text('mode', r['amount']))}" if r['kind'] == 'mode'
+           else f"{r['kind']} {fmt_amt(r['amount'])}")
+        + f" · {r['uses']}/{r['max_uses']}"
         for r in rs))
 
 
@@ -1366,6 +1453,7 @@ async def post_init(app: Application):
     except Exception as e:
         log.warning("setup failed: %s", e)
     BG.append(asyncio.create_task(block_loop()))
+    BG.append(asyncio.create_task(settle_loop()))
     if ADMIN_ID:
         try:
             await app.bot.send_message(ADMIN_ID, f"✅ البوت يعمل.\n🗄 {'PostgreSQL' if USE_PG else 'SQLite'}\n"
@@ -1614,7 +1702,9 @@ const f=(n,d=2)=>Number(n).toLocaleString('en',{minimumFractionDigits:d,maximumF
 const fi=n=>Number(n).toLocaleString('en',{maximumFractionDigits:0});
 const fk=n=>{n=Number(n);return n>=1e9?f(n/1e9)+'B':n>=1e6?f(n/1e6)+'M':n>=1e3?f(n/1e3)+'K':fi(n)};
 const bal=n=>{const s=f(n,4);return s.slice(0,-3)+'<small>'+s.slice(-3)+'</small>'};
-const badge=t=>t?`<span class="bdg ${t}">${TL[t]}</span>`:'';
+/* الشارة = اسم وضع التعدين المفتوح والفعّال للمستخدم (t = رقم الوضع، 0 = عادي بدون شارة) */
+const badge=t=>{if(!t||!S||!S.modes||!S.modes[t])return '';const c=(MC[t]||MC[1])[1];
+  return `<span class="bdg" style="color:${c};background:${c}1f;border-color:${c}b0">${esc(S.modes[t].name)}</span>`};
 const av=n=>{let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="av" style="background:hsl(${h},55%,48%)">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`};
 function toast(m){const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
 async function api(p,b){
