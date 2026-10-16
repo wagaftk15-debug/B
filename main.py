@@ -1646,7 +1646,7 @@ function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
 function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
 
 /* ═══ أوضاع التعدين + اختبار السرعة ═══ */
-const TEST_SECS=30;   /* مدة اختبار كل وضع بالثواني */
+const TEST_SECS=10;   /* مدة اختبار كل وضع بالثواني */
 const MC={1:['gauge','#8b9098'],2:['rocket','#38b6ff'],3:['zap','#ffb02e'],4:['flame','#3ecf8e'],5:['atom','#9b7bff'],6:['orbit','#ff4fa3'],7:['radiation','#ff5252'],8:['spark','#ffd23f']};
 let TEST={run:false,stop:false,cur:0,rate:0,el:0,res:{}};
 function saveRes(){}   /* النتائج لا تُحفظ: تبدأ فارغة في كل مرة يُفتح فيها التطبيق */
@@ -1860,12 +1860,12 @@ function sheetHTML(){
     <p class="h" id="dxp" style="text-align:center;margin:8px 0 0">${dxPrev()}</p>
     <button class="pri" onclick="dxGo()">${dxSide==='buy'?'شراء':'بيع'}</button>`;
   }else if(sheet==='modes'){
-    const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b),mins=Math.max(1,Math.round(ks.length*TEST_SECS/60));
+    const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b),tot=ks.length*TEST_SECS;
     b=`<div class="cap cap2"><i class="dot"></i>MINING · MODES</div><h2>أوضاع التعدين</h2>
     <p class="h">كل مستوى يستخدم طريقة بحث هاش مختلفة — درجات متفاوتة من توازي WebCrypto. أداء موحد على الجوال والكمبيوتر.</p>`+
     ks.map(k=>modeCard(k)).join('')+
     `<button class="runb" id="rb" onclick="runBench()">${runLbl()}</button>
-    <p class="mnote">يستغرق الاختبار نحو ${mins} ${mins<3?'دقيقتين':'دقائق'} (${TEST_SECS} ث لكل وضع). لا تستخدم الجهاز خلال الاختبار للحصول على أدق نتيجة.</p>`;
+    <p class="mnote">يستغرق الاختبار نحو ${tot} ثانية (${TEST_SECS} ث لكل وضع). لا تستخدم الجهاز خلال الاختبار للحصول على أدق نتيجة.</p>`;
     return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><button class="xb" onclick="closeSheet()">${ic('x',16)}</button><div class="sh lt">${b}</div></div></div>`}
   return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="sh"><button class="sm" style="float:left;margin:0" onclick="closeSheet()">✕</button>${b}</div></div>`}
 
