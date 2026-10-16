@@ -1168,30 +1168,34 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
 .sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
 .cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
-#introw{position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
+#introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
-.it{position:absolute;top:10%;left:0;right:0;text-align:center;font-weight:800;font-size:34px;letter-spacing:-.5px;color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .it i{color:var(--ac);font-style:normal}
-.il{position:absolute;left:13%;right:13%;top:56%;height:180px;direction:ltr}
-.ir{position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;align-items:center;font-size:16px;color:#7d838b;opacity:0;transition:opacity .35s,transform .35s,color .35s}
-.ir.cur{color:#eceef0}
-.ist{font-size:13px;color:var(--ac);direction:ltr;white-space:nowrap}
-.ist b{font-weight:400;margin-right:5px}
-.ist em{display:inline-block;width:3px;height:3px;border-radius:50%;background:#6b7178;margin:0 3px;animation:bl 1s infinite}
+.il{position:absolute;left:calc(var(--u)*75);right:calc(var(--u)*73);top:57.4%;height:0;direction:ltr}
+.ir{position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;align-items:center;font-size:calc(var(--u)*17);color:#8b9098;opacity:0;transition:opacity .35s,transform .35s,color .35s}
+.ir.cur{color:#e6e8ea}
+.ist{font-size:calc(var(--u)*13);color:var(--ac);direction:ltr;white-space:nowrap}
+.ist b{font-weight:400;margin-right:calc(var(--u)*6)}
+.ist em{display:inline-block;width:calc(var(--u)*4);height:calc(var(--u)*4);border-radius:50%;background:#6b7178;margin:0 calc(var(--u)*3);animation:bl 1s infinite}
 .ist em:nth-child(2){animation-delay:.2s}.ist em:nth-child(3){animation-delay:.4s}
+.ib{position:absolute;left:calc(var(--u)*69);width:calc(var(--u)*452);top:74.9%;height:calc(var(--u)*3);background:#ffffff12;border-radius:3px;overflow:hidden}
+.ib i{display:block;height:100%;width:0;background:var(--ac)}
 @keyframes bl{50%{opacity:.2}}
 #toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
 #toast.on{opacity:1}
 </style></head><body>
 <div id="introw"><canvas id="intro"></canvas>
-<div class="it">__TITLE__<i>.</i></div><div class="il" id="il"></div></div>
+<div class="it">__TITLE__<i>.</i></div><div class="il" id="il"></div><div class="ib"><i id="ibf"></i></div></div>
 <script>
-/* مقدمة التطبيق (4 ثوانٍ): العنوان + خطوات التحميل + المربعات من منتصف الشاشة نحو الأسفل */
+/* مقدمة التطبيق (4 ثوانٍ). كل الأبعاد مقاسة من الفيديو (عرض 590) وتتناسب مع عرض شاشة الجهاز */
 (function(){
-  const wrap=document.getElementById('introw'),cv=document.getElementById('intro'),il=document.getElementById('il');
+  const wrap=document.getElementById('introw'),cv=document.getElementById('intro'),il=document.getElementById('il'),bf=document.getElementById('ibf');
   try{
+    let U=innerWidth/590;wrap.style.setProperty('--u',U+'px');
     const STEPS=['تفعيل المحرك','تنزيل السلسلة','الانضمام إلى البركة','المزامنة مع الشبكة','تجهيز أول كتلة'];
-    const AT=[200,900,1600,2300,3000],DONE=3500,OP=[1,.5,.3,.16],GAP=38;
+    const AT=[200,900,1600,2300,3000],DONE=3500,OP=[1,.6,.35,.2],GAP=37.5;
+    const ty=a=>'translateY(calc(-50% + '+a+'px))';
     il.innerHTML=STEPS.map(s=>`<div class="ir"><span>${s}</span><span class="ist"></span></div>`).join('');
     const rows=il.children;let shown=-1;
     function upd(t){
@@ -1200,25 +1204,27 @@ button.sm{width:auto;margin:0;padding:8px 14px}
       if(key===shown)return;shown=key;
       for(let k=0;k<rows.length;k++){
         const r=rows[k],st=r.lastChild;
-        if(k>=idx){r.style.opacity=0;r.style.transform='translateY(-14px)';st.innerHTML='';continue}
+        if(k>=idx){r.style.opacity=0;r.style.transform=ty(-14*U);st.innerHTML='';continue}
         const age=idx-1-k,done=k<idx-1||fin;
         r.style.opacity=OP[age]!==undefined?OP[age]:0;
-        r.style.transform='translateY('+(age*GAP)+'px)';
+        r.style.transform=ty(age*GAP*U);
         r.classList.toggle('cur',age===0&&!done);
         st.innerHTML=done?'<b>✓</b> تم':'<em></em><em></em><em></em>'}}
-    const cx=cv.getContext('2d'),DUR=4000,CELL=16,SZ=11,START=.46,RAMP=.16,dpr=Math.min(2,window.devicePixelRatio||1);
-    let W=0,H=0,cells=[];
+    const cx=cv.getContext('2d'),DUR=4000,START=.46,RAMP=.18,dpr=Math.min(2,window.devicePixelRatio||1);
+    let W=0,H=0,cells=[],CELL=16,SZ=11,RAD=2.5;
     function init(){
       const r=cv.getBoundingClientRect();W=Math.max(1,Math.round(r.width));H=Math.max(1,Math.round(r.height));
+      U=W/590;wrap.style.setProperty('--u',U+'px');shown=-1;
+      CELL=16*U;SZ=11*U;RAD=2.5*U;
       cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);cells=[];
       const cols=Math.ceil(W/CELL)+1,rows2=Math.ceil(H/CELL)+1;
       for(let r2=0;r2<rows2;r2++){
         const yf=r2*CELL/H;if(yf<START)continue;
         const ramp=Math.min(1,(yf-START)/RAMP);
         for(let c=0;c<cols;c++)cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,ramp:ramp,
-          o:Math.random()<.3,p:Math.random()*6.28,s:1.2+Math.random()*2.6,pw:3+Math.random()*3})}}
+          o:Math.random()<.2,p:Math.random()*6.28,s:1.2+Math.random()*2.6,pw:4+Math.random()*3})}}
     init();
-    function sq(x,y){if(cx.roundRect){cx.beginPath();cx.roundRect(x,y,SZ,SZ,2.5);cx.fill()}else cx.fillRect(x,y,SZ,SZ)}
+    function sq(x,y){if(cx.roundRect){cx.beginPath();cx.roundRect(x,y,SZ,SZ,RAD);cx.fill()}else cx.fillRect(x,y,SZ,SZ)}
     let t=0,last=0,fading=false;
     function frame(now){
       const dt=last?Math.min(50,now-last):16;last=now;t+=dt;   /* لا يحسب وقت التوقف أو التحميل */
@@ -1226,13 +1232,13 @@ button.sm{width:auto;margin:0;padding:8px 14px}
       const r=cv.getBoundingClientRect();
       if(Math.round(r.width)!==W||Math.round(r.height)!==H)init();
       if(!fading&&t>DUR-600){fading=true;wrap.style.opacity='0'}
-      upd(t);
+      upd(t);bf.style.width=Math.min(100,t/DONE*100)+'%';
       cx.clearRect(0,0,W,H);
       const g=Math.min(1,t/300);
       for(const c of cells){
         const w=.5+.5*Math.sin(t/1000*c.s+c.p);
         const a=c.ramp*g*(.1+.9*Math.pow(w,c.pw));
-        cx.fillStyle=c.o?`rgba(228,150,85,${(a*.95).toFixed(3)})`:`rgba(122,112,90,${(a*.7).toFixed(3)})`;
+        cx.fillStyle=c.o?`rgba(215,138,78,${(a*.85).toFixed(3)})`:`rgba(105,96,80,${(a*.6).toFixed(3)})`;
         sq(c.x,c.y)}
       requestAnimationFrame(frame)}
     requestAnimationFrame(frame);
