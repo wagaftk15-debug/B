@@ -1652,17 +1652,29 @@ let TEST={run:false,stop:false,cur:0,rate:0,el:0,res:{}};
 function saveRes(){}   /* النتائج لا تُحفظ: تبدأ فارغة في كل مرة يُفتح فيها التطبيق */
 /* الاختبار يعمل داخل Web Worker (خيط منفصل) حتى لا تعلق الواجهة */
 const WSRC=`onmessage=async e=>{const par=e.data.par,ms=e.data.ms,buf=new Uint8Array(32);crypto.getRandomValues(buf);const t0=performance.now();let n=0,last=0;
-while(true){const el=performance.now()-t0;if(el>=ms)break;const j=[];for(let i=0;i<par;i++){buf[0]=(n+i)&255;buf[1]=((n+i)>>8)&255;j.push(crypto.subtle.digest('SHA-256',buf))}await Promise.all(j);n+=par;if(el-last>200){last=el;postMessage({el:el,n:n})}}
-postMessage({el:performance.now()-t0,n:n,done:1})}`;
-function stopBench(){TEST.stop=true;if(TEST.w){TEST.w.terminate();TEST.w=null;if(TEST.wres)TEST.wres({stop:1})}}
-function benchOne(par){
+while(true){const el=performance.now()-t0;if(el>=ms)break;
+if(par===1){buf[0]=n&255;buf[1]=(n>>8)&255;await crypto.subtle.digest('SHA-256',buf);n++}
+else{const j=new Array(par);for(let i=0;i<par;i++){buf[0]=(n+i)&255;buf[1]=((n+i)>>8)&255;j[i]=crypto.subtle.digest('SHA-256',buf)}await Promise.all(j);n+=par}
+if(el-last>200){last=el;postMessage({n:n})}}
+postMessage({n:n,done:1})}`;
+/* لكل وضع: [عدد الخيوط، حجم الدفعة المتوازية] — كل وضع أعلى = توازي أكبر */
+const BENCH={1:[1,1],2:[1,2],3:[1,8],4:[2,8],5:[2,32],6:[3,32],7:[4,64],8:[8,64]};
+const MAXW=Math.max(1,(navigator.hardwareConcurrency||4)-1);   /* نترك خيطاً حراً للواجهة */
+function stopBench(){TEST.stop=true;if(TEST.wres)TEST.wres({stop:1})}
+function benchOne(cfg){
   return new Promise(res=>{
-    let w;try{w=new Worker(URL.createObjectURL(new Blob([WSRC],{type:'text/javascript'})))}catch(e){return res(null)}
-    TEST.w=w;TEST.wres=res;
-    w.onmessage=ev=>{const d=ev.data;TEST.el=d.el;TEST.rate=d.n;uiModes();
-      if(d.done){w.terminate();TEST.w=null;res({n:d.n,el:d.el})}};
-    w.onerror=()=>{try{w.terminate()}catch(e){}TEST.w=null;res(null)};
-    w.postMessage({par:par,ms:TEST_SECS*1000})})}
+    const url=URL.createObjectURL(new Blob([WSRC],{type:'text/javascript'}));
+    const ws=[],ns=new Array(cfg.w).fill(0),t0=performance.now();let left=cfg.w,dead=false;
+    const finish=v=>{if(dead)return;dead=true;ws.forEach(w=>{try{w.terminate()}catch(e){}});try{URL.revokeObjectURL(url)}catch(e){}TEST.wres=null;res(v)};
+    TEST.wres=finish;
+    try{for(let i=0;i<cfg.w;i++){
+      const w=new Worker(url);ws.push(w);
+      w.onmessage=ev=>{const d=ev.data;ns[i]=d.n;const tot=ns.reduce((a,b)=>a+b,0);
+        TEST.el=performance.now()-t0;TEST.rate=tot;uiModes();
+        if(d.done&&--left===0)finish({n:tot,el:performance.now()-t0})};
+      w.onerror=()=>finish(null);
+      w.postMessage({par:cfg.b,ms:TEST_SECS*1000})}}
+    catch(e){finish(null)}})}
 function mSub(k){
   if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
   if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H</span>`;
@@ -1686,8 +1698,8 @@ async function runBench(){
     for(const k of ks){
       if(TEST.stop)break;
       TEST.cur=k;TEST.rate=0;TEST.el=0;
-      const par=Math.max(1,Math.round(S.modes[k].mul));   /* درجة التوازي = مضاعف الوضع */
-      const r=await benchOne(par);
+      const bc=BENCH[k]||[1,1];
+      const r=await benchOne({w:Math.min(bc[0],MAXW),b:bc[1]});
       if(TEST.stop||(r&&r.stop))break;
       if(!r){toast('المتصفح لا يدعم الاختبار');break}
       TEST.res[k]=r.n;saveRes()
