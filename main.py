@@ -543,12 +543,12 @@ def recent_blocks(limit=25):
              "nonce": r["nonce"], "bits": r["bits"]} for r in rows]
 
 
-def leaderboard(limit=20):
+def leaderboard(limit=100):
     with LOCK:
-        rows = DB.execute("SELECT name,balance,blocks_found,xp FROM users ORDER BY balance DESC LIMIT ?",
+        rows = DB.execute("SELECT name,balance,blocks_found,xp,mode FROM users ORDER BY balance DESC LIMIT ?",
                           (limit,)).fetchall()
     return [{"name": clean_name(r["name"]), "balance": r["balance"], "blocks": r["blocks_found"],
-             "level": level_of(r["xp"])[0]} for r in rows]
+             "level": level_of(r["xp"])[0], "mode": r["mode"]} for r in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -888,6 +888,24 @@ nav button span{font-size:22px}nav button.on{color:var(--or)}
 h3{margin:4px 0 12px}
 .lb{display:flex;justify-content:space-between;padding:10px 4px;border-bottom:1px solid var(--line)}
 input.ref{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);padding:12px;border-radius:10px;direction:ltr;margin:10px 0}
+.top{background:var(--card);border:1px solid var(--line);border-top:1px solid #ffa95c55;border-radius:14px;overflow:hidden;direction:ltr}
+.th{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}
+.th .ti{width:34px;height:34px;border-radius:9px;background:var(--card2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:16px}
+.tr{display:flex;align-items:center;gap:12px;padding:14px;border-bottom:1px solid var(--line)}
+.tr:last-child{border-bottom:0}
+.rk{flex:none;width:36px;height:36px;border-radius:8px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font:700 13px ui-monospace,monospace;color:var(--mut)}
+.rk.t3{background:#3a2d27;border-color:#6b4a33;color:var(--or)}
+.av{flex:none;width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:15px}
+.nm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.nm b{font-size:16px;word-break:break-word}
+.bdg{font-size:11px;padding:1px 8px;border-radius:6px;border:1px solid}
+.bdg.b3{color:var(--bl);border-color:var(--bl);background:#38bdf811}
+.bdg.b2{color:var(--gr);border-color:var(--gr);background:#34d39911}
+.bdg.b1{color:var(--mut);border-color:var(--line)}
+.lv{font-size:12px;color:var(--mut)}
+.bl{display:flex;align-items:center;gap:6px;margin-top:5px;color:#b4bac3;font:600 15px ui-monospace,monospace;direction:ltr;justify-content:flex-start}
+.bl i{font-style:normal;width:15px;height:15px;border-radius:4px;background:var(--or);color:#222;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:900}
+.bl small{font-size:11px;color:#5d646e}
 .toast{position:fixed;top:44px;left:50%;transform:translateX(-50%);background:#000c;padding:10px 18px;border-radius:10px;display:none;z-index:9}
 .off{position:fixed;top:0;left:0;right:0;background:var(--rd);color:#fff;text-align:center;padding:7px;font-size:13px;display:none;z-index:10}
 </style></head><body>
@@ -937,7 +955,12 @@ input.ref{width:100%;background:var(--card2);border:1px solid var(--line);color:
 </section>
 
 <section class="tab" id="t-stats">
-  <div class="card"><div class="lbl">NETWORK</div>
+  <div class="top">
+    <div class="th"><span class="ti">🏆</span><b>المعدّنين <span dir="ltr">Top 100</span></b></div>
+    <div id="lb"></div>
+  </div>
+  <button class="btn dark" id="statsBtn" style="margin-top:12px">📊 إحصائيات الشبكة ▾</button>
+  <div class="card" id="statsPanel" style="display:none;margin-top:12px"><div class="lbl">NETWORK</div>
     <div class="grid">
       <div><span>ارتفاع السلسلة</span><b id="sh">-</b></div><div><span>الصعوبة (بت)</span><b id="sb">-</b></div>
       <div><span>العرض الكلي</span><b id="ss">-</b></div><div><span>المستخدمون</span><b id="su">-</b></div>
@@ -945,7 +968,6 @@ input.ref{width:100%;background:var(--card2);border:1px solid var(--line);color:
     </div>
     <button class="btn dark" id="ver" style="margin-top:12px">⛓ تحقق من سلامة السلسلة</button>
   </div>
-  <h3>🏆 المتصدرون</h3><div class="card" id="lb"></div>
 </section>
 
 <section class="tab" id="t-wallet">
@@ -1017,8 +1039,12 @@ async function guard(k,fn){ if(busy[k]) return; busy[k]=true; try{ await fn() }c
 const poll=()=>guard('poll',async()=>{ if(document.hidden) return; render(await api('/api/state'+(ref?'?ref='+encodeURIComponent(ref):''),'GET',null,true)) });
 const blocks=()=>guard('blocks',async()=>{ if(document.hidden) return; const l=await api('/api/blocks','GET',null,true);
   $('blocks').innerHTML=l.map(b=>`<div class="blk"><div><div class="n">#${(+b.idx).toLocaleString('en')}</div><div class="m">⛏ ${esc(b.miner)} · مستوى ${+b.level}</div><div class="m">${esc(b.time)}</div><code>${esc(b.hash.slice(0,32))}…</code></div><div style="text-align:left;direction:ltr"><div class="tag">+${(+b.reward).toFixed(2)} #</div><div class="m" style="margin-top:8px">${+b.bits} bits</div></div></div>`).join('') });
+const AVC=[['#6d6af0','#8e8bff'],['#3fbf6b','#8fe28f'],['#b36cf5','#e17cf2'],['#38a6f0','#5d7bf5'],['#f08a3c','#f5b86a']];
+function avatar(n){n=String(n);const ch=Array.from(n.replace(/^@/,''))[0]||'?';let h=0;for(const c of n)h=(h*31+c.codePointAt(0))>>>0;const p=AVC[h%AVC.length];return `<div class="av" style="background:linear-gradient(135deg,${p[0]},${p[1]})">${esc(ch.toUpperCase())}</div>`}
+function balHtml(v){const s=(+v||0).toFixed(4),i=s.split('.')[0],d=s.split('.')[1];return Number(i).toLocaleString('en')+'.'+d[0]+'<small>'+d.slice(1)+'</small>'}
+const BD={3:['تيربو','b3'],2:['سريع','b2'],1:['عادي','b1']};
 const lb=()=>guard('poll2',async()=>{ const l=await api('/api/leaderboard','GET',null,true);
-  $('lb').innerHTML=l.map((r,i)=>`<div class="lb"><span>${i+1}. ${esc(r.name)} <small style="color:var(--mut)">Lv${+r.level}</small></span><b>${(+r.balance).toFixed(2)}</b></div>`).join('') });
+  $('lb').innerHTML=l.length?l.map((r,i)=>{const b=BD[r.mode]||BD[1];return `<div class="tr"><div class="rk${i<3?' t3':''}">${String(i+1).padStart(2,'0')}</div>${avatar(r.name)}<div style="flex:1;min-width:0"><div class="nm"><b>${esc(r.name)}</b><span class="bdg ${b[1]}">${b[0]}</span><span class="lv">مستوى ${+r.level}</span></div><div class="bl"><i>#</i>${balHtml(r.balance)}</div></div></div>`}).join(''):'<div class="tr" style="color:var(--mut)">لا يوجد معدّنون بعد</div>' });
 const act=fn=>guard('act',async()=>{ render(await fn()) });
 $('mbtn').onclick=()=>act(()=>api(S&&S.mining?'/api/stop':'/api/start','POST'));
 $('refill').onclick=()=>act(async()=>{ const s=await api('/api/refill','POST'); toast('تمت إضافة الطاقة ⚡'); return s });
@@ -1030,6 +1056,8 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.id==='t-'+b.dataset.t));
   if(b.dataset.t==='stats')lb();
 });
+$('statsBtn').onclick=()=>{const p=$('statsPanel'),open=p.style.display==='none';p.style.display=open?'block':'none';$('statsBtn').textContent=open?'📊 إخفاء الإحصائيات ▴':'📊 إحصائيات الشبكة ▾';if(open)p.scrollIntoView({behavior:'smooth',block:'nearest'})};
+setInterval(()=>{ if($('t-stats').classList.contains('on')&&!document.hidden) lb() },5000);
 document.addEventListener('visibilitychange',()=>{ if(!document.hidden){poll();blocks()} });
 poll();blocks();setInterval(poll,2000);setInterval(blocks,3000);
 </script></body></html>
