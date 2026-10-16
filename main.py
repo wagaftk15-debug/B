@@ -1659,13 +1659,13 @@ function benchOne(par){
   return new Promise(res=>{
     let w;try{w=new Worker(URL.createObjectURL(new Blob([WSRC],{type:'text/javascript'})))}catch(e){return res(null)}
     TEST.w=w;TEST.wres=res;
-    w.onmessage=ev=>{const d=ev.data;TEST.el=d.el;TEST.rate=d.n/Math.max(.001,d.el/1000);uiModes();
+    w.onmessage=ev=>{const d=ev.data;TEST.el=d.el;TEST.rate=d.n;uiModes();
       if(d.done){w.terminate();TEST.w=null;res({n:d.n,el:d.el})}};
     w.onerror=()=>{try{w.terminate()}catch(e){}TEST.w=null;res(null)};
     w.postMessage({par:par,ms:TEST_SECS*1000})})}
 function mSub(k){
-  if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H/s</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
-  if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H/s</span>`;
+  if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
+  if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H</span>`;
   return 'شغّل الاختبار'}
 function mBar(k){
   if(TEST.run&&TEST.cur==k)return Math.min(100,TEST.el/(TEST_SECS*1000)*100);   /* أثناء اختبار هذا الوضع: تقدّم الوقت */
@@ -1690,7 +1690,7 @@ async function runBench(){
       const r=await benchOne(par);
       if(TEST.stop||(r&&r.stop))break;
       if(!r){toast('المتصفح لا يدعم الاختبار');break}
-      TEST.res[k]=r.n/Math.max(.001,r.el/1000);saveRes()
+      TEST.res[k]=r.n;saveRes()
       TEST.el=0;uiModes()}
   }catch(e){toast('تعذّر تنفيذ الاختبار')}
   TEST.run=false;TEST.cur=0;uiModes()}
