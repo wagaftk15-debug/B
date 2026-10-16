@@ -41,7 +41,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool, PoolError
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
-                      WebAppInfo, MenuButtonWebApp, BotCommand)
+                      WebAppInfo, MenuButtonWebApp, BotCommand, BotCommandScopeChat)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CommandHandler, MessageHandler, PreCheckoutQueryHandler,
                           ContextTypes, Defaults, filters)
@@ -717,8 +717,15 @@ async def post_init(app: Application):
     MAIN_APP = app
     await start_web()
     try:
-        await app.bot.set_my_commands([BotCommand("start", "🏠 الصفحة الرئيسية"),
-                                       BotCommand("redeem", "🎁 استرداد كود")])
+        user_cmds = [BotCommand("start", "🏠 الصفحة الرئيسية"),
+                     BotCommand("redeem", "🎁 استرداد كود")]
+        await app.bot.set_my_commands(user_cmds)
+        if ADMIN_ID:
+            admin_cmds = user_cmds + [BotCommand("gencode", "➕ إنشاء كود جديد"),
+                                      BotCommand("codes", "📋 عرض الأكواد"),
+                                      BotCommand("delcode", "🗑 حذف كود"),
+                                      BotCommand("refund", "💸 استرجاع دفعة")]
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
                 text="⛏ تعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app")))
