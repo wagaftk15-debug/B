@@ -72,9 +72,15 @@ ITEMS = {
     "energy_up": dict(stars=59, title="زيادة الطاقة القصوى", desc="+2000 طاقة قصوى و +5 طاقة/دقيقة."),
     "restore": dict(stars=32, title="استعادة الطاقة", desc="يملأ طاقتك للحد الأقصى فوراً."),
     "patron": dict(stars=99, title="راعي التعدين", desc="مكافأة الكتلة ×2 لمدة 24 ساعة (تتراكم)."),
+    "support": dict(stars=0, title="دعم المطوّر", desc="دعم اللعبة بالمبلغ الذي تختاره من النجوم. شكراً لك ❤️"),
 }
 BASE_HR = 1000          # معدل الهاش الأساسي (H/s)
-COST = 1.0              # طاقة/ثانية أثناء التعدين
+COST = 3.0              # طاقة/ثانية أثناء التعدين (كلما زاد الرقم نزلت الطاقة أسرع)
+EARN_DIV = 36000        # أرباح HASH بالثانية = معدل الهاش / هذا الرقم
+XP_DIV = 1000           # خبرة بالثانية = معدل الهاش / هذا الرقم (أكبر = ترقية أبطأ)
+EASY_LEVELS = 10        # عدد المستويات السهلة
+XP_GROWTH = 1.10        # نسبة زيادة الصعوبة بعد المستويات السهلة (10% لكل مستوى)
+SUPPORT_MAX = 10000     # أقصى مبلغ دعم بالنجوم
 BLOCK_REWARD = 50       # مكافأة الكتلة (كل 5 ثوانٍ، تُسحب بالقرعة حسب قوة الهاش)
 REF_BONUS = 500         # مكافأة المُحيل عند شراء المُحال للتصريح
 DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
@@ -94,7 +100,7 @@ SERVERS = {
     "rack": dict(title="RACK", hr=12000, cost=20000, mins=0),
     "farm": dict(title="FARM", hr=50000, cost=80000, mins=0),
 }
-DEX_BASE = 0.012        # سعر طاقة واحدة بنقاط HASH
+DEX_BASE = 0.008        # سعر طاقة واحدة بنقاط HASH
 DEX_FEE = 0.03          # عمولة البيع
 TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
@@ -253,7 +259,10 @@ def tier(hr):
 
 
 def xp_need(level):
-    return 150 + 144 * level
+    """أول 10 مستويات سهلة (42 ← 150 خبرة)، وبعدها تزيد الصعوبة 10% لكل مستوى."""
+    if level <= EASY_LEVELS:
+        return 30 + 12 * level
+    return int((30 + 12 * EASY_LEVELS) * XP_GROWTH ** (level - EASY_LEVELS))
 
 
 def settle(u):
@@ -263,12 +272,12 @@ def settle(u):
         cost = COST * mode_of(u)["cost"]
         hr = hashrate(u)
         run = min(dt, u["energy"] / cost)
-        earned = run * hr / 1e5
+        earned = run * hr / EARN_DIV
         u["energy"] = max(0.0, u["energy"] - run * cost)
         u["balance"] += earned
         u["total"] += earned
         u["hashes"] += run * hr
-        u["xp"] += earned * 5
+        u["xp"] += run * hr / XP_DIV
         while u["xp"] >= xp_need(u["level"]):
             u["xp"] -= xp_need(u["level"])
             u["level"] += 1
@@ -327,7 +336,7 @@ def state(u):
     hr = hashrate(u)
     return dict(permit=bool(u["permit"]), level=u["level"], xp=int(u["xp"]), xp_need=xp_need(u["level"]),
                 balance=u["balance"], energy=u["energy"], max_energy=u["max_energy"], regen=u["regen"],
-                mining=bool(u["mining"]), hashrate=hr, rate=hr / 1e5, cost=COST * m["cost"],
+                mining=bool(u["mining"]), hashrate=hr, rate=hr / EARN_DIV, cost=COST * m["cost"],
                 mode=u["mode"], hashes=u["hashes"], wins=u["wins"], income=u["income"],
                 patron_left=max(0, int(u["patron"] - time.time())), srv=u["srv"], tier=tier(hr),
                 day_idx=streak % 7, daily_wait=wait)
@@ -656,6 +665,14 @@ async def act_invoice(tg, b):
     it = ITEMS.get(key)
     if not it:
         raise Err("عنصر غير معروف")
+    stars = it["stars"]
+    if key == "support":
+        try:
+            stars = int(b.get("stars"))
+        except (TypeError, ValueError):
+            raise Err("مبلغ غير صحيح")
+        if not 1 <= stars <= SUPPORT_MAX:
+            raise Err(f"المبلغ من 1 إلى {SUPPORT_MAX} نجمة")
     if key == "permit":
         def has():
             with cursor() as cur:
@@ -666,7 +683,7 @@ async def act_invoice(tg, b):
             raise Err("لديك تصريح بالفعل")
     link = await MAIN_APP.bot.create_invoice_link(
         title=it["title"], description=it["desc"], payload=f"{key}:{tg['id']}", provider_token="",
-        currency="XTR", prices=[LabeledPrice(it["title"], it["stars"])])
+        currency="XTR", prices=[LabeledPrice(it["title"], stars)])
     return {"link": link}
 
 
@@ -765,8 +782,11 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.pre_checkout_query
     try:
         key, uid = q.invoice_payload.split(":")
-        ok = key in ITEMS and int(uid) == q.from_user.id and q.currency == "XTR" \
-            and q.total_amount == ITEMS[key]["stars"]
+        if key == "support":
+            amount_ok = 1 <= q.total_amount <= SUPPORT_MAX
+        else:
+            amount_ok = key in ITEMS and q.total_amount == ITEMS[key]["stars"]
+        ok = key in ITEMS and int(uid) == q.from_user.id and q.currency == "XTR" and amount_ok
     except Exception:
         ok = False
     await q.answer(ok=ok, error_message=None if ok else "بيانات الدفع غير صحيحة")
@@ -778,31 +798,90 @@ async def on_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = await asyncio.to_thread(apply_payment, update.effective_user.id, key,
                                  sp.telegram_payment_charge_id, sp.total_amount)
     if ok:
-        await update.message.reply_text("✅ تم الدفع وتفعيل طلبك! عُد إلى التطبيق ⛏")
+        await update.message.reply_text("✅ تم الدفع وتفعيل طلبك! عُد إلى التطبيق ⛏" if key != "support"
+                                        else "❤️ شكراً لدعمك!")
+        if ADMIN_ID:
+            u = update.effective_user
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID, f"💳 دفعة جديدة\n👤 {html.escape(u.full_name)} (<code>{u.id}</code>)\n"
+                              f"📦 {key} · ⭐ {sp.total_amount}\n"
+                              f"🧾 <code>{html.escape(sp.telegram_payment_charge_id)}</code>\n\n"
+                              f"للاسترجاع:\n<code>/refund {html.escape(sp.telegram_payment_charge_id)}</code>")
+            except Exception:
+                pass
+
+
+def _find_payment(cid):
+    with cursor() as cur:
+        cur.execute("SELECT * FROM m_payments WHERE charge_id=?", (cid,))
+        return cur.fetchone()
+
+
+def _mark_refunded(p):
+    """تعليم الدفعة كمُرجعة وسحب أثرها من حساب المستخدم."""
+    with cursor() as cur:
+        cur.execute("UPDATE m_payments SET refunded=1 WHERE charge_id=?", (p["charge_id"],))
+        u = lock_user(cur, p["user_id"])
+        k = p["item"]
+        if k == "permit":
+            u["permit"], u["mining"] = 0, 0
+        elif k == "energy_up":
+            u["max_energy"] = max(1000, u["max_energy"] - 2000)
+            u["regen"] = max(30, u["regen"] - 5)
+            u["energy"] = min(u["energy"], u["max_energy"])
+        elif k == "patron":
+            u["patron"] = max(0, u["patron"] - PATRON_SECS)
+        save_user(cur, u)
 
 
 async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/refund charge_id   أو   /refund user_id charge_id"""
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
     a = context.args
-    if len(a) != 2 or not a[0].isdigit():
-        await update.message.reply_text("الاستعمال: <code>/refund user_id charge_id</code>")
+    if len(a) not in (1, 2):
+        await update.message.reply_text("الاستعمال: <code>/refund charge_id</code>\n"
+                                        "لعرض الدفعات: /payments")
+        return
+    cid = a[-1]
+    p = await asyncio.to_thread(_find_payment, cid)
+    if not p:
+        await update.message.reply_text("❌ هذه الدفعة غير موجودة في القاعدة. استعمل /payments")
+        return
+    if p["refunded"]:
+        await update.message.reply_text("ℹ️ هذه الدفعة مُرجعة مسبقاً.")
         return
     try:
-        await context.bot.refund_star_payment(user_id=int(a[0]), telegram_payment_charge_id=a[1])
+        await context.bot.refund_star_payment(user_id=int(p["user_id"]), telegram_payment_charge_id=cid)
     except Exception as e:
-        await update.message.reply_text(f"فشل الاسترجاع: {html.escape(str(e))}")
+        await update.message.reply_text(f"❌ فشل الاسترجاع: {html.escape(str(e))}")
+        return
+    await asyncio.to_thread(_mark_refunded, p)
+    await update.message.reply_text(f"💸 تم إرجاع ⭐ {p['stars']} للمستخدم <code>{p['user_id']}</code>"
+                                    f" وسحب أثر ({p['item']}).")
+
+
+async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payments [user_id]  ← آخر 15 دفعة مع charge_id"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
 
-    def mark():
+    def rows():
         with cursor() as cur:
-            cur.execute("SELECT item FROM m_payments WHERE charge_id=?", (a[1],))
-            r = cur.fetchone()
-            cur.execute("UPDATE m_payments SET refunded=1 WHERE charge_id=?", (a[1],))
-            if r and r["item"] == "permit":
-                cur.execute("UPDATE m_users SET permit=0, mining=0 WHERE id=?", (int(a[0]),))
-    await asyncio.to_thread(mark)
-    await update.message.reply_text("💸 تم الاسترجاع وإلغاء التصريح.")
+            if context.args and context.args[0].isdigit():
+                cur.execute("SELECT * FROM m_payments WHERE user_id=? ORDER BY created_at DESC LIMIT 15",
+                            (int(context.args[0]),))
+            else:
+                cur.execute("SELECT * FROM m_payments ORDER BY created_at DESC LIMIT 15")
+            return cur.fetchall()
+    rs = await asyncio.to_thread(rows)
+    if not rs:
+        await update.message.reply_text("لا توجد دفعات.")
+        return
+    await update.message.reply_text("\n\n".join(
+        f"{'↩️' if r['refunded'] else '✅'} {r['item']} · ⭐ {r['stars']} · 👤 <code>{r['user_id']}</code>\n"
+        f"<code>/refund {html.escape(r['charge_id'])}</code>" for r in rs))
 
 
 async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,6 +976,7 @@ async def post_init(app: Application):
             admin_cmds = user_cmds + [BotCommand("gencode", "➕ إنشاء كود جديد"),
                                       BotCommand("codes", "📋 عرض الأكواد"),
                                       BotCommand("delcode", "🗑 حذف كود"),
+                                      BotCommand("payments", "🧾 عرض الدفعات"),
                                       BotCommand("refund", "💸 استرجاع دفعة")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
@@ -1014,6 +1094,8 @@ async function act(p,b){try{const r=await api(p,b||{});if(r.msg)toast(r.msg);awa
 function dxPrev(){const v=parseFloat(dxVal)||0,p=S.dex.price;
   return dxSide==='buy'?'≈ '+fi(v/p)+' ⚡':'≈ '+f(v*p*(1-S.dex.fee),4)+' HASH'}
 function dxGo(){api('dex',{side:dxSide,amount:parseFloat(dxVal)||0}).then(r=>{toast(r.msg);dxVal='';load()}).catch(e=>toast(e.message))}
+function donate(){const n=parseInt($('sp').value);if(!n||n<1)return toast('أدخل عدد النجوم');
+  api('invoice',{item:'support',stars:n}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')toast('❤️ شكراً لدعمك!')})).catch(e=>toast(e.message))}
 function fmtDate(t){return new Date(t*1000).toLocaleString('en-GB',{hour12:false}).replace(',','')}
 function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
 function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
@@ -1092,6 +1174,10 @@ function vWallet(){return `<div class="card"><div class="row"><span>الرصيد
   <button onclick="buy('energy_up')">🚀 زيادة الطاقة القصوى (+2000، +5/د) — ⭐ ${S.prices.energy_up}</button>
   <button onclick="buy('restore')">🔋 استعادة الطاقة — ⭐ ${S.prices.restore}</button>
   <button onclick="buy('patron')">👑 راعي التعدين ×2 (24h) — ⭐ ${S.prices.patron}</button></div>
+  <div class="card"><h3>❤️ ادعم المطوّر</h3><p class="h">اختر المبلغ الذي تريده من النجوم.</p>
+  <div class="seg" style="margin-top:10px"><button onclick="$('sp').value=10">10</button><button onclick="$('sp').value=50">50</button><button onclick="$('sp').value=100">100</button></div>
+  <input id="sp" class="inp" type="number" inputmode="numeric" min="1" placeholder="عدد النجوم" style="margin-top:10px">
+  <button class="pri" onclick="donate()">⭐ ادعم الآن</button></div>
   <div class="card"><p class="h">ℹ️ النقاط افتراضية داخل اللعبة فقط، ولا تمثل عملة رقمية ولا يمكن سحبها أو تحويلها لمال.</p></div>`}
 
 function sheetHTML(){
@@ -1153,6 +1239,7 @@ def main():
            .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("refund", cmd_refund))
+    app.add_handler(CommandHandler("payments", cmd_payments))
     app.add_handler(CommandHandler("gencode", cmd_gencode))
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("delcode", cmd_delcode))
