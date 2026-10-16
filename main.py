@@ -32,7 +32,7 @@ if _todo:
     if _missing():
         raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
-import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html
+import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
@@ -178,6 +178,10 @@ def init_db():
         cur.execute(f"""CREATE TABLE IF NOT EXISTS m_blocks(
             id {pk}, miner_id BIGINT, miner_name TEXT, miner_level INT,
             reward DOUBLE PRECISION, miners INT, created_at BIGINT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS m_codes(
+            code TEXT PRIMARY KEY, kind TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            max_uses INT NOT NULL DEFAULT 1, uses INT NOT NULL DEFAULT 0, created_at BIGINT)""")
+        cur.execute("CREATE TABLE IF NOT EXISTS m_redeems(code TEXT, user_id BIGINT, PRIMARY KEY(code, user_id))")
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
                 "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)"):
         with cursor() as cur:
@@ -301,6 +305,59 @@ def make_block():
         cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
 
 
+# ═══════════ 3.1) أكواد الاسترداد ═══════════
+CODE_KINDS = {"energy": "طاقة", "hash": "نقاط HASH", "permit": "تصريح التعدين"}
+
+
+def parse_amt(s):
+    s = s.lower().replace(",", "").strip()
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1_000, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1_000_000, s[:-1]
+    return float(s) * mult
+
+
+def fmt_amt(n):
+    n = float(n)
+    if n >= 1_000_000 and n % 1_000_000 == 0:
+        return f"{int(n // 1_000_000)}M"
+    if n >= 1000 and n % 1000 == 0:
+        return f"{int(n // 1000)}K"
+    return f"{n:g}"
+
+
+def redeem_code(tg, code):
+    code = code.strip().upper()
+    with cursor() as cur:
+        u = touch(cur, tg)
+        cur.execute("SELECT * FROM m_codes WHERE code=?" + (" FOR UPDATE" if USE_PG else ""), (code,))
+        c = cur.fetchone()
+        if not c:
+            raise Err("الكود غير صحيح")
+        if c["uses"] >= c["max_uses"]:
+            raise Err("انتهت صلاحية هذا الكود (اكتمل عدد الاستخدامات)")
+        if c["kind"] == "permit" and u["permit"]:
+            raise Err("لديك تصريح بالفعل")
+        cur.execute("INSERT INTO m_redeems(code,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", (code, u["id"]))
+        if cur.rowcount != 1:
+            raise Err("استخدمت هذا الكود من قبل")
+        if c["kind"] == "energy":
+            u["energy"] += c["amount"]          # قد تتجاوز الحد الأقصى كمكافأة
+            msg = f"⚡ +{fmt_amt(c['amount'])} طاقة"
+        elif c["kind"] == "hash":
+            u["balance"] += c["amount"]
+            u["total"] += c["amount"]
+            msg = f"💰 +{fmt_amt(c['amount'])} HASH"
+        else:
+            u["permit"] = 1
+            msg = "🔑 تم تفعيل تصريح التعدين"
+        cur.execute("UPDATE m_codes SET uses=uses+1 WHERE code=?", (code,))
+        save_user(cur, u)
+    return msg
+
+
 # ═══════════ 4) واجهة الـ API (aiohttp) ═══════════
 MAIN_APP, WEB_RUNNER, BG = None, None, []
 
@@ -399,6 +456,10 @@ def act_top(tg, b):
             "rank": rank, "mytotal": mine}
 
 
+def act_redeem(tg, b):
+    return {"msg": "✅ " + redeem_code(tg, str(b.get("code", "")))}
+
+
 def task_done(tg, key):
     with cursor() as cur:
         cur.execute("INSERT INTO m_tasks(user_id,task) VALUES(?,?) ON CONFLICT DO NOTHING", (tg["id"], key))
@@ -436,7 +497,8 @@ async def act_invoice(tg, b):
     return {"link": link}
 
 
-SYNC = {"me": act_me, "mining": act_mining, "daily": act_daily, "blocks": act_blocks, "top": act_top}
+SYNC = {"me": act_me, "mining": act_mining, "daily": act_daily, "blocks": act_blocks, "top": act_top,
+        "redeem": act_redeem}
 ASYNC = {"task": act_task, "invoice": act_invoice}
 
 
@@ -570,12 +632,93 @@ async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💸 تم الاسترجاع وإلغاء التصريح.")
 
 
+async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/gencode <energy|hash|permit> <المقدار> [عدد_الاستخدامات] [كود_مخصص]"""
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    a = context.args
+    if len(a) < 2 or a[0].lower() not in CODE_KINDS:
+        await update.message.reply_text(
+            "الاستعمال:\n<code>/gencode energy 10k 100</code> ← طاقة 10K لأول 100 شخص\n"
+            "<code>/gencode hash 100k 50 MYCODE</code> ← نقاط بكود مخصص\n"
+            "<code>/gencode permit 0 20</code> ← تصريح تعدين لأول 20 شخص\n\n"
+            "/codes لعرض الأكواد · /delcode CODE للحذف")
+        return
+    kind = a[0].lower()
+    try:
+        amount = parse_amt(a[1])
+        max_uses = int(a[2]) if len(a) > 2 else 1
+    except ValueError:
+        await update.message.reply_text("قيمة غير صحيحة")
+        return
+    code = (a[3].upper() if len(a) > 3 else "TH-" + secrets.token_hex(4).upper())[:32]
+
+    def add():
+        with cursor() as cur:
+            cur.execute("INSERT INTO m_codes(code,kind,amount,max_uses,created_at) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT DO NOTHING", (code, kind, amount, max_uses, int(time.time())))
+            return cur.rowcount == 1
+    if not await asyncio.to_thread(add):
+        await update.message.reply_text("هذا الكود موجود مسبقاً")
+        return
+    prize = CODE_KINDS[kind] + ("" if kind == "permit" else f" {fmt_amt(amount)}")
+    await update.message.reply_text(
+        f"✅ تم إنشاء الكود:\n<code>{html.escape(code)}</code>\n"
+        f"🎁 {prize} · 👥 {max_uses} استخدام\n\nانسخ هذا للقناة:\n"
+        f"🎁 كود جديد: <code>{html.escape(code)}</code>\n"
+        f"أدخله في التطبيق ← المحفظة، أو أرسل <code>/redeem {html.escape(code)}</code>")
+
+
+async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+
+    def rows():
+        with cursor() as cur:
+            cur.execute("SELECT * FROM m_codes ORDER BY created_at DESC LIMIT 30")
+            return cur.fetchall()
+    rs = await asyncio.to_thread(rows)
+    if not rs:
+        await update.message.reply_text("لا توجد أكواد.")
+        return
+    await update.message.reply_text("\n".join(
+        f"<code>{html.escape(r['code'])}</code> · {r['kind']} {fmt_amt(r['amount'])} · {r['uses']}/{r['max_uses']}"
+        for r in rs))
+
+
+async def cmd_delcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID or not context.args:
+        return
+    code = context.args[0].upper()
+
+    def rm():
+        with cursor() as cur:
+            cur.execute("DELETE FROM m_codes WHERE code=?", (code,))
+            return cur.rowcount
+    n = await asyncio.to_thread(rm)
+    await update.message.reply_text("🗑 تم الحذف" if n else "الكود غير موجود")
+
+
+async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("الاستعمال: <code>/redeem CODE</code>")
+        return
+    u = update.effective_user
+    tg = dict(id=u.id, name=u.full_name, username=u.username or "", ref=None)
+    try:
+        msg = await asyncio.to_thread(redeem_code, tg, context.args[0])
+        await update.message.reply_text("✅ " + msg)
+    except Err as e:
+        await update.message.reply_text("❌ " + html.escape(str(e)))
+
+
 async def post_init(app: Application):
     global MAIN_APP
     MAIN_APP = app
     await start_web()
     try:
-        await app.bot.set_my_commands([BotCommand("start", "🏠 الصفحة الرئيسية")])
+        await app.bot.set_my_commands([BotCommand("start", "🏠 الصفحة الرئيسية"),
+                                       BotCommand("redeem", "🎁 استرداد كود")])
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
                 text="⛏ تعدين", web_app=WebAppInfo(url=WEBAPP_URL + "/app")))
@@ -637,6 +780,7 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .rk i{width:30px;height:30px;border-radius:9px;background:var(--bg);border:1px solid var(--line);display:grid;place-items:center;font-style:normal;font-size:13px;font-weight:800}
 .rk .n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:700}
 .rk.me{color:var(--ac)}
+.inp{width:100%;padding:13px;border-radius:14px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font:inherit;direction:ltr;text-align:center}
 #toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:20}
 #toast.on{opacity:1}
 </style></head><body>
@@ -662,6 +806,8 @@ async function load(){
   draw()}
 function go(t){tab=t;load().catch(e=>toast(e.message))}
 function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
+function redeem(){const c=$('cd').value.trim();if(!c)return;
+  api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
 async function act(p,b){try{await api(p,b||{});await load()}catch(e){toast(e.message)}}
 function timeAgo(t){const s=Math.max(0,Math.floor(Date.now()/1000-t));return s<60?s+'ث':Math.floor(s/60)+'د'}
 function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
@@ -707,6 +853,9 @@ function vTop(){
   return `<div class="card"><h2>🏆 أفضل 100 معدّن</h2><p class="h">ترتيبك: #${TOP.rank} · ${f(TOP.mytotal,2)}</p></div><div class="card">`+
   (TOP.top.length?TOP.top.map((r,i)=>`<div class="rk ${r.me?'me':''}"><i>${i+1}</i><span class="n">${esc(r.name)} <span class="h">Lv${r.level}</span></span><span class="tag">${fi(r.total)}</span></div>`).join(''):'<p class="h">لا أحد بعد.</p>')+'</div>'}
 function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${f(S.balance,4)}</div></div>
+  <div class="card"><h3>🎁 لديك كود؟</h3>
+  <input id="cd" class="inp" placeholder="TH-XXXXXXXX" autocapitalize="characters" autocomplete="off">
+  <button class="pri" onclick="redeem()">استرداد</button></div>
   <div class="card"><h3>المتجر (نجوم تيليجرام)</h3>
   ${S.permit?'<p class="h">✅ تصريح التعدين مفعّل.</p>':`<button class="pri" onclick="buy('permit')">🔑 تصريح التعدين — ⭐ ${S.prices.permit}</button>`}
   <button onclick="buy('energy_up')">🚀 زيادة الطاقة القصوى (+2000، +5/د) — ⭐ ${S.prices.energy_up}</button>
@@ -724,7 +873,7 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
-setInterval(()=>{if(S&&!document.hidden)load().catch(()=>{})},6000);
+setInterval(()=>{if(S&&!document.hidden&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
 if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
 else load().catch(e=>{$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
@@ -738,6 +887,10 @@ def main():
            .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("refund", cmd_refund))
+    app.add_handler(CommandHandler("gencode", cmd_gencode))
+    app.add_handler(CommandHandler("codes", cmd_codes))
+    app.add_handler(CommandHandler("delcode", cmd_delcode))
+    app.add_handler(CommandHandler("redeem", cmd_redeem))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
     log.info("Bot started (polling)")
