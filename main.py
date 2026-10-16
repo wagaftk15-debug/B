@@ -1,13 +1,36 @@
 # ── تثبيت تلقائي للمكتبات الناقصة (يعمل حتى لو لم يقرأ Railway ملف requirements.txt) ──
-import subprocess as _sp, sys as _sys
-for _mod, _pkg in (("aiohttp", "aiohttp==3.10.5"), ("telegram", "python-telegram-bot==21.6"),
-                   ("psycopg2", "psycopg2-binary==2.9.9")):
-    try:
-        __import__(_mod)
-    except ImportError:
-        for _flags in ([], ["--break-system-packages"]):
-            if _sp.call([_sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", _pkg, *_flags]) == 0:
-                break
+import subprocess as _sp, sys as _sys, importlib as _il, shutil as _sh
+_NEED = (("aiohttp", "aiohttp==3.10.5"), ("telegram", "python-telegram-bot==21.6"),
+         ("psycopg2", "psycopg2-binary==2.9.9"))
+
+
+def _missing():
+    _il.invalidate_caches()
+    out = []
+    for _m, _p in _NEED:
+        try:
+            _il.import_module(_m)
+        except ImportError:
+            out.append(_p)
+    return out
+
+
+_todo = _missing()
+if _todo:
+    print("Installing missing packages:", _todo, flush=True)
+    _py = _sys.executable
+    _tries = [[_py, "-m", "pip", "install", "-q", *_todo],
+              [_py, "-m", "pip", "install", "-q", "--break-system-packages", *_todo]]
+    if _sh.which("uv"):
+        _tries.append(["uv", "pip", "install", "-q", "--python", _py, *_todo])
+    for _cmd in _tries:
+        if _sp.call(_cmd) == 0 and not _missing():
+            break
+    else:                                   # pip غير موجود في البيئة: ثبّته ثم أعد المحاولة
+        _sp.call([_py, "-m", "ensurepip", "--upgrade"])
+        _sp.call([_py, "-m", "pip", "install", "-q", *_todo])
+    if _missing():
+        raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
 import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html
 from contextlib import contextmanager
