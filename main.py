@@ -104,6 +104,8 @@ SERVERS = {
 DEX_BASE = 0.008        # سعر طاقة واحدة بنقاط HASH
 DEX_FEE = 0.03          # عمولة البيع
 TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
+DEFAULT_TITLE = "TotalHash"   # عنوان المقدمة الافتراضي (يتغير بالأمر /settitle)
+TITLE = DEFAULT_TITLE
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
 
 
@@ -225,6 +227,7 @@ def init_db():
         cur.execute(f"""CREATE TABLE IF NOT EXISTS m_servers(
             id {pk}, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
             expires DOUBLE PRECISION NOT NULL DEFAULT 0)""")
+        cur.execute("CREATE TABLE IF NOT EXISTS m_settings(k TEXT PRIMARY KEY, v TEXT)")
     add_cols("m_users", [("mode", "INT NOT NULL DEFAULT 1"),
                          ("hr", "DOUBLE PRECISION NOT NULL DEFAULT 1000"),
                          ("hashes", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
@@ -237,6 +240,12 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS ix_m_srv ON m_servers (user_id)"):
         with cursor() as cur:
             cur.execute(ddl)
+    global TITLE
+    with cursor() as cur:
+        cur.execute("SELECT v FROM m_settings WHERE k='title'")
+        r = cur.fetchone()
+        if r and r["v"]:
+            TITLE = r["v"]
     log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
 
 
@@ -729,7 +738,7 @@ async def web_api(request):
 
 
 async def web_page(request):
-    return web.Response(text=WEB_HTML, content_type="text/html", headers={"Cache-Control": "no-cache"})
+    return web.Response(text=WEB_HTML.replace("__TITLE__", html.escape(TITLE)), content_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
 async def web_health(request):
@@ -998,6 +1007,33 @@ async def cmd_gencode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"أدخله في التطبيق ← المحفظة، أو أرسل <code>/redeem {html.escape(code)}</code>")
 
 
+async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settitle <العنوان الجديد>   |   /settitle reset  ← يرجع الافتراضي"""
+    global TITLE
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    parts = (update.message.text or "").split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            f"✏️ العنوان الحالي: <b>{html.escape(TITLE)}</b>\n\nلتغييره:\n<code>/settitle اسم جديد</code>\n"
+            f"للعودة للافتراضي ({html.escape(DEFAULT_TITLE)}):\n<code>/settitle reset</code>")
+        return
+    new = parts[1].strip()
+    if new.lower() in ("reset", "default", "افتراضي"):
+        new = DEFAULT_TITLE
+    new = new[:40]
+    if not new:
+        return
+
+    def save():
+        with cursor() as cur:
+            cur.execute("INSERT INTO m_settings(k,v) VALUES('title',?) ON CONFLICT (k) DO UPDATE SET v=excluded.v",
+                        (new,))
+    await asyncio.to_thread(save)
+    TITLE = new
+    await update.message.reply_text(f"✅ تم تغيير العنوان إلى: <b>{html.escape(new)}</b>\nيظهر في مقدمة التطبيق عند الفتح القادم.")
+
+
 async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
         return
@@ -1054,6 +1090,7 @@ async def post_init(app: Application):
                                       BotCommand("codes", "📋 عرض الأكواد"),
                                       BotCommand("delcode", "🗑 حذف كود"),
                                       BotCommand("payments", "🧾 عرض الدفعات"),
+                                      BotCommand("settitle", "✏️ تغيير عنوان البوت"),
                                       BotCommand("refund", "💸 استرجاع دفعة")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
@@ -1081,7 +1118,7 @@ async def post_shutdown(app: Application):
 WEB_HTML = r"""<!doctype html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>TotalHash</title>
+<title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{--bg:#17191c;--card:#202327;--line:#31353b;--ac:#ffa45b;--tx:#eceef0;--mut:#8b9098;--red:#d94848;--grn:#3ecf8e;--blue:#38b6ff;--pur:#9b7bff}
@@ -1131,23 +1168,51 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
 .sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
 .cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
-#intro{position:fixed;inset:0;width:100%;height:100%;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none}
+#introw{position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
+#intro{position:absolute;inset:0;width:100%;height:100%}
+.it{position:absolute;top:10%;left:0;right:0;text-align:center;font-weight:800;font-size:34px;letter-spacing:-.5px;color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.it i{color:var(--ac);font-style:normal}
+.il{position:absolute;left:13%;right:13%;top:56%;height:180px;direction:ltr}
+.ir{position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;align-items:center;font-size:16px;color:#7d838b;opacity:0;transition:opacity .35s,transform .35s,color .35s}
+.ir.cur{color:#eceef0}
+.ist{font-size:13px;color:var(--ac);direction:ltr;white-space:nowrap}
+.ist b{font-weight:400;margin-right:5px}
+.ist em{display:inline-block;width:3px;height:3px;border-radius:50%;background:#6b7178;margin:0 3px;animation:bl 1s infinite}
+.ist em:nth-child(2){animation-delay:.2s}.ist em:nth-child(3){animation-delay:.4s}
+@keyframes bl{50%{opacity:.2}}
 #toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
 #toast.on{opacity:1}
 </style></head><body>
-<canvas id="intro"></canvas>
+<div id="introw"><canvas id="intro"></canvas>
+<div class="it">__TITLE__<i>.</i></div><div class="il" id="il"></div></div>
 <script>
-/* مقدمة المربعات (مطابقة لشاشة التحميل): شبكة 16px، مربع 11px، تبدأ من منتصف الشاشة تقريباً وتزداد نحو الأسفل، مدتها 4 ثوانٍ */
+/* مقدمة التطبيق (4 ثوانٍ): العنوان + خطوات التحميل + المربعات من منتصف الشاشة نحو الأسفل */
 (function(){
-  const cv=document.getElementById('intro');
+  const wrap=document.getElementById('introw'),cv=document.getElementById('intro'),il=document.getElementById('il');
   try{
+    const STEPS=['تفعيل المحرك','تنزيل السلسلة','الانضمام إلى البركة','المزامنة مع الشبكة','تجهيز أول كتلة'];
+    const AT=[200,900,1600,2300,3000],DONE=3500,OP=[1,.5,.3,.16],GAP=38;
+    il.innerHTML=STEPS.map(s=>`<div class="ir"><span>${s}</span><span class="ist"></span></div>`).join('');
+    const rows=il.children;let shown=-1;
+    function upd(t){
+      let idx=0;AT.forEach((a,i)=>{if(t>=a)idx=i+1});
+      const fin=t>=DONE,key=idx+(fin?100:0);
+      if(key===shown)return;shown=key;
+      for(let k=0;k<rows.length;k++){
+        const r=rows[k],st=r.lastChild;
+        if(k>=idx){r.style.opacity=0;r.style.transform='translateY(-14px)';st.innerHTML='';continue}
+        const age=idx-1-k,done=k<idx-1||fin;
+        r.style.opacity=OP[age]!==undefined?OP[age]:0;
+        r.style.transform='translateY('+(age*GAP)+'px)';
+        r.classList.toggle('cur',age===0&&!done);
+        st.innerHTML=done?'<b>✓</b> تم':'<em></em><em></em><em></em>'}}
     const cx=cv.getContext('2d'),DUR=4000,CELL=16,SZ=11,START=.46,RAMP=.16,dpr=Math.min(2,window.devicePixelRatio||1);
     let W=0,H=0,cells=[];
     function init(){
       const r=cv.getBoundingClientRect();W=Math.max(1,Math.round(r.width));H=Math.max(1,Math.round(r.height));
       cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);cells=[];
-      const cols=Math.ceil(W/CELL)+1,rows=Math.ceil(H/CELL)+1;
-      for(let r2=0;r2<rows;r2++){
+      const cols=Math.ceil(W/CELL)+1,rows2=Math.ceil(H/CELL)+1;
+      for(let r2=0;r2<rows2;r2++){
         const yf=r2*CELL/H;if(yf<START)continue;
         const ramp=Math.min(1,(yf-START)/RAMP);
         for(let c=0;c<cols;c++)cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,ramp:ramp,
@@ -1157,21 +1222,22 @@ button.sm{width:auto;margin:0;padding:8px 14px}
     let t=0,last=0,fading=false;
     function frame(now){
       const dt=last?Math.min(50,now-last):16;last=now;t+=dt;   /* لا يحسب وقت التوقف أو التحميل */
-      if(t>=DUR){cv.remove();return}
+      if(t>=DUR){wrap.remove();return}
       const r=cv.getBoundingClientRect();
       if(Math.round(r.width)!==W||Math.round(r.height)!==H)init();
-      if(!fading&&t>DUR-600){fading=true;cv.style.opacity='0'}
+      if(!fading&&t>DUR-600){fading=true;wrap.style.opacity='0'}
+      upd(t);
       cx.clearRect(0,0,W,H);
       const g=Math.min(1,t/300);
       for(const c of cells){
         const w=.5+.5*Math.sin(t/1000*c.s+c.p);
-        const a=c.ramp*g*(.1+.9*Math.pow(w,c.pw));      /* أغلبها خافت وبعضها يومض بقوة */
+        const a=c.ramp*g*(.1+.9*Math.pow(w,c.pw));
         cx.fillStyle=c.o?`rgba(228,150,85,${(a*.95).toFixed(3)})`:`rgba(122,112,90,${(a*.7).toFixed(3)})`;
         sq(c.x,c.y)}
       requestAnimationFrame(frame)}
     requestAnimationFrame(frame);
-    setTimeout(()=>{if(cv.parentNode)cv.remove()},DUR+6000);   /* أمان: لا يعلق أبداً */
-  }catch(e){cv.remove()}
+    setTimeout(()=>{if(wrap.parentNode)wrap.remove()},DUR+6000);   /* أمان: لا يعلق أبداً */
+  }catch(e){wrap.remove()}
 })();
 </script>
 <div class="w" id="app"><p class="h" style="text-align:center;margin-top:40vh">…</p></div>
@@ -1363,6 +1429,7 @@ def main():
                 R_CONF: [MessageHandler(txt, refund_conf)]},
         fallbacks=[CommandHandler("cancel", refund_cancel)], allow_reentry=True))
     app.add_handler(CommandHandler("payments", cmd_payments))
+    app.add_handler(CommandHandler("settitle", cmd_settitle))
     app.add_handler(CommandHandler("gencode", cmd_gencode))
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("delcode", cmd_delcode))
