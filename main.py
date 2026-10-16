@@ -1649,8 +1649,7 @@ function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
 const TEST_SECS=30;   /* مدة اختبار كل وضع بالثواني */
 const MC={1:['gauge','#8b9098'],2:['rocket','#38b6ff'],3:['zap','#ffb02e'],4:['flame','#3ecf8e'],5:['atom','#9b7bff'],6:['orbit','#ff4fa3'],7:['radiation','#ff5252'],8:['spark','#ffd23f']};
 let TEST={run:false,stop:false,cur:0,rate:0,el:0,res:{}};
-try{TEST.res=JSON.parse(localStorage.getItem('th_bench')||'{}')||{}}catch(e){}
-function saveRes(){try{localStorage.setItem('th_bench',JSON.stringify(TEST.res))}catch(e){}}
+function saveRes(){}   /* النتائج لا تُحفظ: تبدأ فارغة في كل مرة يُفتح فيها التطبيق */
 function mSub(k){
   if(TEST.run&&TEST.cur==k)return `<span class="lt">${fk(TEST.rate)} H/s</span> · ${Math.max(0,Math.ceil(TEST_SECS-TEST.el/1000))}ث`;
   if(TEST.res[k]!=null)return `<span class="lt">${fk(TEST.res[k])} H/s</span>`;
@@ -1668,7 +1667,7 @@ function uiModes(){
 async function runBench(){
   if(TEST.run){TEST.stop=true;return}
   if(!window.crypto||!crypto.subtle)return toast('المتصفح لا يدعم WebCrypto');
-  TEST.run=true;TEST.stop=false;
+  TEST.run=true;TEST.stop=false;TEST.res={};   /* كل اختبار جديد يبدأ بنتائج فارغة */
   const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b);
   try{
     for(const k of ks){
