@@ -26,13 +26,13 @@ if _todo:
     for _cmd in _tries:
         if _sp.call(_cmd) == 0 and not _missing():
             break
-    else:                                   # pip غير موجود في البيئة: ثبّته ثم أعد المحاولة
+    else:
         _sp.call([_py, "-m", "ensurepip", "--upgrade"])
         _sp.call([_py, "-m", "pip", "install", "-q", *_todo])
     if _missing():
         raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
-import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets
+import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
@@ -71,13 +71,33 @@ ITEMS = {
     "permit": dict(stars=500, title="تصريح التعدين", desc="يفتح لك التعدين في اللعبة (نقاط افتراضية)."),
     "energy_up": dict(stars=59, title="زيادة الطاقة القصوى", desc="+2000 طاقة قصوى و +5 طاقة/دقيقة."),
     "restore": dict(stars=32, title="استعادة الطاقة", desc="يملأ طاقتك للحد الأقصى فوراً."),
+    "patron": dict(stars=99, title="راعي التعدين", desc="مكافأة الكتلة ×2 لمدة 24 ساعة (تتراكم)."),
 }
 BASE_HR = 1000          # معدل الهاش الأساسي (H/s)
 COST = 1.0              # طاقة/ثانية أثناء التعدين
-BLOCK_REWARD = 50       # مكافأة الكتلة (كل 5 ثوانٍ لمعدّن نشط عشوائي)
+BLOCK_REWARD = 50       # مكافأة الكتلة (كل 5 ثوانٍ، تُسحب بالقرعة حسب قوة الهاش)
 REF_BONUS = 500         # مكافأة المُحيل عند شراء المُحال للتصريح
-DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: +500 نقطة
+DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
+PATRON_SECS = 86400
+MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
+
+# أوضاع التعدين: مضاعف الهاش، مضاعف استهلاك الطاقة
+MODES = {1: dict(name="عادي", mul=1.0, cost=1.0),
+         2: dict(name="تيربو", mul=2.0, cost=2.5),
+         3: dict(name="نيترو", mul=4.0, cost=6.0)}
+
+# الخوادم: hr = زيادة الهاش، cost بنقاط HASH (0 = مكافأة فقط)، mins = مدة مؤقتة
+SERVERS = {
+    "slim": dict(title="SLIM", hr=500, cost=0, mins=30),
+    "nano": dict(title="NANO", hr=800, cost=1000, mins=0),
+    "core": dict(title="CORE", hr=3000, cost=5000, mins=0),
+    "rack": dict(title="RACK", hr=12000, cost=20000, mins=0),
+    "farm": dict(title="FARM", hr=50000, cost=80000, mins=0),
+}
+DEX_BASE = 0.012        # سعر طاقة واحدة بنقاط HASH
+DEX_FEE = 0.03          # عمولة البيع
 TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
+SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
 
 
 # ═══════════ 2) قاعدة البيانات (PostgreSQL، وإلا SQLite) ═══════════
@@ -143,6 +163,19 @@ def cursor():
                     c.close()
 
 
+def add_cols(table, cols):
+    """ترقية الجداول القديمة بإضافة الأعمدة الجديدة دون فقدان البيانات."""
+    for name, ddl in cols:
+        with cursor() as cur:
+            if USE_PG:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}")
+            else:
+                cur.execute(f"PRAGMA table_info({table})")
+                have = {r["name"] for r in cur.fetchall()}
+                if name not in have:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def init_db():
     global USE_PG, pool, sq
     for u in [os.environ.get("DATABASE_URL"), os.environ.get("DATABASE_PUBLIC_URL")]:
@@ -182,16 +215,41 @@ def init_db():
             code TEXT PRIMARY KEY, kind TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
             max_uses INT NOT NULL DEFAULT 1, uses INT NOT NULL DEFAULT 0, created_at BIGINT)""")
         cur.execute("CREATE TABLE IF NOT EXISTS m_redeems(code TEXT, user_id BIGINT, PRIMARY KEY(code, user_id))")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS m_servers(
+            id {pk}, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
+            expires DOUBLE PRECISION NOT NULL DEFAULT 0)""")
+    add_cols("m_users", [("mode", "INT NOT NULL DEFAULT 1"),
+                         ("hr", "DOUBLE PRECISION NOT NULL DEFAULT 1000"),
+                         ("hashes", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                         ("wins", "INT NOT NULL DEFAULT 0"),
+                         ("income", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                         ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
+    add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
-                "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)"):
+                "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)",
+                "CREATE INDEX IF NOT EXISTS ix_m_srv ON m_servers (user_id)"):
         with cursor() as cur:
             cur.execute(ddl)
     log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
 
 
 # ═══════════ 3) منطق التعدين (يُحسب كسولاً عند كل طلب) ═══════════
+def mode_of(u):
+    return MODES.get(u.get("mode") or 1, MODES[1])
+
+
 def hashrate(u):
-    return BASE_HR * (1 + 0.05 * (u["level"] - 1))
+    return (BASE_HR * (1 + 0.05 * (u["level"] - 1)) + u.get("srv", 0)) * mode_of(u)["mul"]
+
+
+def tier(hr):
+    if hr >= 20000:
+        return "super"
+    if hr >= 5000:
+        return "nitro"
+    if hr >= 1500:
+        return "turbo"
+    return ""
 
 
 def xp_need(level):
@@ -202,11 +260,14 @@ def settle(u):
     now = time.time()
     dt = max(0.0, now - u["last_tick"])
     if u["mining"]:
-        run = min(dt, u["energy"] / COST)
-        earned = run * hashrate(u) / 1e5
-        u["energy"] = max(0.0, u["energy"] - run * COST)
+        cost = COST * mode_of(u)["cost"]
+        hr = hashrate(u)
+        run = min(dt, u["energy"] / cost)
+        earned = run * hr / 1e5
+        u["energy"] = max(0.0, u["energy"] - run * cost)
         u["balance"] += earned
         u["total"] += earned
+        u["hashes"] += run * hr
         u["xp"] += earned * 5
         while u["xp"] >= xp_need(u["level"]):
             u["xp"] -= xp_need(u["level"])
@@ -238,15 +299,19 @@ def lock_user(cur, uid):
     u = cur.fetchone()
     if not u:
         raise Err("user")
+    cur.execute("SELECT kind FROM m_servers WHERE user_id=? AND (expires=0 OR expires>?)", (uid, time.time()))
+    u["srv"] = sum(SERVERS[r["kind"]]["hr"] for r in cur.fetchall() if r["kind"] in SERVERS)
     settle(u)
     return u
 
 
 def save_user(cur, u):
     cur.execute("""UPDATE m_users SET permit=?,level=?,xp=?,balance=?,total=?,energy=?,max_energy=?,
-        regen=?,mining=?,last_tick=?,streak=?,last_daily=? WHERE id=?""",
+        regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?
+        WHERE id=?""",
                 (u["permit"], u["level"], u["xp"], u["balance"], u["total"], u["energy"], u["max_energy"],
-                 u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], u["id"]))
+                 u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], u["mode"],
+                 hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["id"]))
 
 
 def daily_info(u):
@@ -258,9 +323,13 @@ def daily_info(u):
 
 def state(u):
     streak, wait = daily_info(u)
+    m = mode_of(u)
+    hr = hashrate(u)
     return dict(permit=bool(u["permit"]), level=u["level"], xp=int(u["xp"]), xp_need=xp_need(u["level"]),
                 balance=u["balance"], energy=u["energy"], max_energy=u["max_energy"], regen=u["regen"],
-                mining=bool(u["mining"]), hashrate=hashrate(u), rate=hashrate(u) / 1e5, cost=COST,
+                mining=bool(u["mining"]), hashrate=hr, rate=hr / 1e5, cost=COST * m["cost"],
+                mode=u["mode"], hashes=u["hashes"], wins=u["wins"], income=u["income"],
+                patron_left=max(0, int(u["patron"] - time.time())), srv=u["srv"], tier=tier(hr),
                 day_idx=streak % 7, daily_wait=wait)
 
 
@@ -286,26 +355,43 @@ def apply_payment(uid, key, charge, stars):
             u["regen"] += 5
         elif key == "restore":
             u["energy"] = max(u["energy"], u["max_energy"])
+        elif key == "patron":
+            u["patron"] = max(time.time(), u["patron"]) + PATRON_SECS
         save_user(cur, u)
     return True
 
 
 def make_block():
-    """كتلة كل 5 ثوانٍ، مكافأتها لمعدّن نشط عشوائي."""
+    """كتلة كل 5 ثوانٍ؛ الفائز بالقرعة موزونة بقوة الهاش بين المعدّنين النشطين فعلاً."""
+    now = time.time()
     with cursor() as cur:
-        cur.execute("SELECT id,name,level FROM m_users WHERE mining=1 AND energy>1 ORDER BY random() LIMIT 1")
-        m = cur.fetchone()
-        if not m:
+        cur.execute("DELETE FROM m_servers WHERE expires>0 AND expires<?", (now,))
+        cur.execute("SELECT id,name,level,hr,patron FROM m_users WHERE " + SQL_ACTIVE + " LIMIT 3000", (now,))
+        ms = cur.fetchall()
+        if not ms:
             return
-        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE mining=1")
-        n = cur.fetchone()["n"]
-        add_points(cur, m["id"], BLOCK_REWARD)
-        cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,created_at) VALUES(?,?,?,?,?,?)",
-                    (m["id"], m["name"], m["level"], BLOCK_REWARD, n, int(time.time())))
+        total = sum(m["hr"] for m in ms)
+        w = random.choices(ms, weights=[max(m["hr"], 1.0) for m in ms])[0]
+        rew = BLOCK_REWARD * (2 if w["patron"] > now else 1)
+        cur.execute("UPDATE m_users SET balance=balance+?,total=total+?,wins=wins+1,income=income+? WHERE id=?",
+                    (rew, rew, rew, w["id"]))
+        cur.execute("INSERT INTO m_blocks(miner_id,miner_name,miner_level,reward,miners,thr,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)", (w["id"], w["name"], w["level"], rew, len(ms), total, int(now)))
         cur.execute("DELETE FROM m_blocks WHERE id < (SELECT MAX(id)-200 FROM m_blocks)")
 
 
-# ═══════════ 3.1) أكواد الاسترداد ═══════════
+# ═══════════ 3.1) DEX: تبادل HASH ↔ طاقة ═══════════
+def dex_price(t):
+    return DEX_BASE * (1 + 0.06 * math.sin(t / 1800) + 0.03 * math.sin(t / 421 + 1))
+
+
+def dex_info():
+    now = time.time()
+    p, old = dex_price(now), dex_price(now - 3600)
+    return dict(price=p, change=(p / old - 1) * 100, fee=DEX_FEE)
+
+
+# ═══════════ 3.2) أكواد الاسترداد ═══════════
 CODE_KINDS = {"energy": "طاقة", "hash": "نقاط HASH", "permit": "تصريح التعدين"}
 
 
@@ -344,7 +430,7 @@ def redeem_code(tg, code):
         if cur.rowcount != 1:
             raise Err("استخدمت هذا الكود من قبل")
         if c["kind"] == "energy":
-            u["energy"] += c["amount"]          # قد تتجاوز الحد الأقصى كمكافأة
+            u["energy"] += c["amount"]
             msg = f"⚡ +{fmt_amt(c['amount'])} طاقة"
         elif c["kind"] == "hash":
             u["balance"] += c["amount"]
@@ -389,16 +475,31 @@ def touch(cur, tg):
 
 
 def act_me(tg, b):
+    now = time.time()
     with cursor() as cur:
         u = touch(cur, tg)
         save_user(cur, u)
         cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=?", (u["id"],))
         refs = cur.fetchone()["n"]
-        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE mining=1")
-        online = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(hr),0) AS h FROM m_users WHERE " + SQL_ACTIVE, (now,))
+        a = cur.fetchone()
+        cur.execute("SELECT MAX(id) AS m FROM m_blocks")
+        last_block = (cur.fetchone() or {}).get("m") or 0
         cur.execute("SELECT task FROM m_tasks WHERE user_id=?", (u["id"],))
         done = {r["task"] for r in cur.fetchall()}
-    return dict(**state(u), refs=refs, online=online, ref_bonus=REF_BONUS, daily=DAILY,
+        cur.execute("SELECT kind, COUNT(*) AS n FROM m_servers WHERE user_id=? AND expires=0 GROUP BY kind",
+                    (u["id"],))
+        owned = {r["kind"]: r["n"] for r in cur.fetchall()}
+        cur.execute("SELECT kind, expires FROM m_servers WHERE user_id=? AND expires>?", (u["id"], now))
+        temps = [dict(title=SERVERS[r["kind"]]["title"], hr=SERVERS[r["kind"]]["hr"],
+                      left=int(r["expires"] - now)) for r in cur.fetchall() if r["kind"] in SERVERS]
+    servers = [dict(key=k, title=v["title"], hr=v["hr"], owned=owned.get(k, 0),
+                    cost=int(v["cost"] * 1.25 ** owned.get(k, 0)), max=MAX_SRV)
+               for k, v in SERVERS.items() if v["cost"] > 0]
+    return dict(**state(u), refs=refs, online=a["n"], total_hr=a["h"], difficulty=a["h"] * 0.2,
+                block_reward=BLOCK_REWARD * (2 if u["patron"] > now else 1), next_block=last_block + 1,
+                ref_bonus=REF_BONUS, daily=DAILY, dex=dex_info(), servers=servers, temps=temps,
+                modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
                 tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
                 channel=TASK_CHANNEL, prices={k: v["stars"] for k, v in ITEMS.items()})
@@ -419,6 +520,20 @@ def act_mining(tg, b):
     return {}
 
 
+def act_mode(tg, b):
+    try:
+        m = int(b.get("mode"))
+    except (TypeError, ValueError):
+        raise Err("وضع غير صحيح")
+    if m not in MODES:
+        raise Err("وضع غير صحيح")
+    with cursor() as cur:
+        u = touch(cur, tg)
+        u["mode"] = m
+        save_user(cur, u)
+    return {}
+
+
 def act_daily(tg, b):
     with cursor() as cur:
         u = touch(cur, tg)
@@ -429,11 +544,68 @@ def act_daily(tg, b):
         if idx < 6:
             u["energy"] += DAILY[idx]          # قد تتجاوز الحد الأقصى كمكافأة
         else:
-            u["balance"] += 500
-            u["total"] += 500
+            sv = SERVERS["slim"]
+            cur.execute("INSERT INTO m_servers(user_id,kind,expires) VALUES(?,?,?)",
+                        (u["id"], "slim", time.time() + sv["mins"] * 60))
+            u["srv"] += sv["hr"]
         u["streak"], u["last_daily"] = streak + 1, time.time()
         save_user(cur, u)
     return {}
+
+
+def act_server(tg, b):
+    key = b.get("key")
+    sv = SERVERS.get(key)
+    if not sv or sv["cost"] <= 0:
+        raise Err("خادم غير معروف")
+    with cursor() as cur:
+        u = touch(cur, tg)
+        cur.execute("SELECT COUNT(*) AS n FROM m_servers WHERE user_id=? AND kind=? AND expires=0",
+                    (u["id"], key))
+        owned = cur.fetchone()["n"]
+        if owned >= MAX_SRV:
+            raise Err("وصلت للحد الأقصى من هذا الخادم")
+        cost = int(sv["cost"] * 1.25 ** owned)
+        if u["balance"] < cost:
+            raise Err("رصيد HASH غير كافٍ")
+        u["balance"] -= cost
+        cur.execute("INSERT INTO m_servers(user_id,kind,expires) VALUES(?,?,0)", (u["id"], key))
+        u["srv"] += sv["hr"]
+        save_user(cur, u)
+    return {"msg": f"✅ تم شراء خادم {sv['title']}"}
+
+
+def act_dex(tg, b):
+    side = b.get("side")
+    try:
+        amt = float(b.get("amount"))
+    except (TypeError, ValueError):
+        raise Err("مقدار غير صحيح")
+    if not (amt > 0) or amt > 1e12 or amt != amt:
+        raise Err("مقدار غير صحيح")
+    p = dex_price(time.time())
+    with cursor() as cur:
+        u = touch(cur, tg)
+        if side == "buy":
+            if u["balance"] < amt:
+                raise Err("رصيد HASH غير كافٍ")
+            gain = amt / p
+            if u["energy"] + gain > u["max_energy"] + 0.5:
+                raise Err("تتجاوز الحد الأقصى للطاقة")
+            u["balance"] -= amt
+            u["energy"] += gain
+            msg = f"✅ +{gain:,.0f} ⚡"
+        elif side == "sell":
+            if u["energy"] < amt:
+                raise Err("طاقة غير كافية")
+            got = amt * p * (1 - DEX_FEE)
+            u["energy"] -= amt
+            u["balance"] += got
+            msg = f"✅ +{got:,.4f} HASH"
+        else:
+            raise Err("عملية غير صحيحة")
+        save_user(cur, u)
+    return {"msg": msg}
 
 
 def act_blocks(tg, b):
@@ -441,18 +613,19 @@ def act_blocks(tg, b):
         cur.execute("SELECT * FROM m_blocks ORDER BY id DESC LIMIT 25")
         rows = cur.fetchall()
     return {"blocks": [dict(id=r["id"], miner=r["miner_name"], level=r["miner_level"], reward=r["reward"],
-                            t=r["created_at"]) for r in rows]}
+                            t=r["created_at"], miners=r["miners"]) for r in rows]}
 
 
 def act_top(tg, b):
     with cursor() as cur:
-        cur.execute("SELECT id,name,level,total FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
+        cur.execute("SELECT id,name,level,total,hr FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
         rows = cur.fetchall()
         cur.execute("SELECT total FROM m_users WHERE id=?", (tg["id"],))
         mine = (cur.fetchone() or {}).get("total", 0)
         cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (mine,))
         rank = cur.fetchone()["r"]
-    return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], me=r["id"] == tg["id"]) for r in rows],
+    return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], tier=tier(r["hr"]),
+                         me=r["id"] == tg["id"]) for r in rows],
             "rank": rank, "mytotal": mine}
 
 
@@ -497,8 +670,8 @@ async def act_invoice(tg, b):
     return {"link": link}
 
 
-SYNC = {"me": act_me, "mining": act_mining, "daily": act_daily, "blocks": act_blocks, "top": act_top,
-        "redeem": act_redeem}
+SYNC = {"me": act_me, "mining": act_mining, "mode": act_mode, "daily": act_daily, "server": act_server,
+        "dex": act_dex, "blocks": act_blocks, "top": act_top, "redeem": act_redeem}
 ASYNC = {"task": act_task, "invoice": act_invoice}
 
 
@@ -766,19 +939,22 @@ h2{margin:0 0 6px;font-size:20px}h3{margin:0 0 10px;font-size:15px;color:var(--m
 .bar{height:9px;background:var(--bg);border-radius:9px;overflow:hidden;margin:6px 0 12px}
 .bar i{display:block;height:100%;border-radius:9px;transition:width .3s}
 .row{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px;color:var(--mut)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 .cell{background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:11px}
 .cell b{display:block;font-size:19px;color:var(--tx);direction:ltr;text-align:right}
+.mini{margin:0;cursor:pointer;padding:13px}
+.mini b{font-size:17px;display:block;direction:ltr;text-align:right}
 button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:14px;width:100%;margin-top:10px;cursor:pointer;color:var(--tx);background:var(--bg);border:1px solid var(--line)}
 button:active{transform:scale(.98)}button:disabled{opacity:.45}
 button.pri{background:var(--ac);color:#1e1307;border:0}button.stop{background:var(--red);color:#fff;border:0}
 button.sm{width:auto;margin:0;padding:8px 14px}
-.blk{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.blk{padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
 .blk:last-child{border:0}.blk b{font-size:14px}
-.tag{color:var(--ac);font-weight:700;direction:ltr}
+.tag{color:var(--ac);font-weight:700;direction:ltr;display:inline-block}
 .days{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .day{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:9px;text-align:center;font-size:13px;color:var(--mut)}
 .day.on{border-color:var(--ac);color:var(--ac)}.day b{display:block;color:var(--tx);font-size:15px}
+.day.wide{grid-column:1/-1}
 .kv{background:var(--bg);border:1px dashed var(--line);border-radius:12px;padding:10px;word-break:break-all;direction:ltr;text-align:left;font-size:12px;font-family:ui-monospace,Menlo,monospace}
 .nav{position:fixed;inset:auto 0 0 0;display:flex;background:var(--bg);border-top:1px solid var(--line);padding:6px 8px calc(6px + env(safe-area-inset-bottom));z-index:5}
 .nav div{flex:1;text-align:center;padding:6px 2px;color:var(--mut);font-size:12px;font-weight:700;cursor:pointer}
@@ -788,99 +964,182 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .rk .n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:700}
 .rk.me{color:var(--ac)}
 .inp{width:100%;padding:13px;border-radius:14px;border:1px solid var(--line);background:var(--bg);color:var(--tx);font:inherit;direction:ltr;text-align:center}
-#toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:20}
+.av{width:30px;height:30px;border-radius:50%;display:inline-grid;place-items:center;font-weight:800;font-size:12px;color:#fff;vertical-align:middle}
+.bdg{font-size:11px;border:1px solid;border-radius:8px;padding:0 7px;margin-inline:4px;font-weight:700}
+.turbo{color:var(--blue)}.nitro{color:var(--grn)}.super{color:var(--ac)}
+.live{color:var(--grn);border:1px solid var(--grn);border-radius:9px;padding:1px 9px;font-size:12px;font-weight:700}
+.off{color:var(--mut);border:1px solid var(--line);border-radius:9px;padding:1px 9px;font-size:12px}
+.up{color:var(--grn)}.dn{color:#ff6b81}
+.seg{display:flex;gap:8px}.seg button{margin:0}.seg button.on{background:var(--ac);color:#1e1307;border:0}
+.ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:flex-end;justify-content:center}
+.sh{width:100%;max-width:560px;background:var(--card);border:1px solid var(--line);border-radius:22px 22px 0 0;padding:16px;max-height:88vh;overflow:auto;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
+.cap{font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.15em;color:var(--mut);direction:ltr;text-align:right}
+#toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
 #toast.on{opacity:1}
 </style></head><body>
 <div class="w" id="app"><p class="h" style="text-align:center;margin-top:40vh">…</p></div>
-<div class="nav" id="nav"></div><div id="toast"></div>
+<div class="nav" id="nav"></div><div id="sh"></div><div id="toast"></div>
 <script>
 const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
-let S=null,B=[],TOP=null,tab='mine';
+let S=null,B=[],TOP=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
+const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const f=(n,d=2)=>Number(n).toLocaleString('en',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fi=n=>Number(n).toLocaleString('en',{maximumFractionDigits:0});
+const fk=n=>{n=Number(n);return n>=1e9?f(n/1e9)+'B':n>=1e6?f(n/1e6)+'M':n>=1e3?f(n/1e3)+'K':fi(n)};
+const bal=n=>{const s=f(n,4);return s.slice(0,-3)+'<small>'+s.slice(-3)+'</small>'};
+const badge=t=>t?`<span class="bdg ${t}">${TL[t]}</span>`:'';
+const av=n=>{let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="av" style="background:hsl(${h},55%,48%)">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`};
 function toast(m){const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
 async function api(p,b){
   const r=await fetch('/api/'+p,{method:b===undefined?'GET':'POST',headers:{'X-Init-Data':tg.initData,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
   if(!r.ok)throw new Error('HTTP '+r.status);
   const j=await r.json();if(!j.ok)throw new Error(j.error||'خطأ');return j}
 async function load(){
-  S=await api('me');
-  if(tab==='mine')B=(await api('blocks')).blocks;
-  if(tab==='top')TOP=await api('top');
+  const jobs=[api('me')];
+  if(tab==='mine')jobs.push(api('blocks'));
+  if(tab==='top')jobs.push(api('top'));
+  const r=await Promise.all(jobs);
+  S=r[0];if(tab==='mine')B=r[1].blocks;if(tab==='top')TOP=r[1];
   draw()}
-function go(t){tab=t;load().catch(e=>toast(e.message))}
+function go(t){tab=t;sheet=null;load().catch(e=>toast(e.message))}
+function openSheet(s){sheet=s;draw()}
+function closeSheet(){sheet=null;draw()}
 function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')setTimeout(()=>load(),1500)})).catch(e=>toast(e.message))}
 function redeem(){const c=$('cd').value.trim();if(!c)return;
   api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
-async function act(p,b){try{await api(p,b||{});await load()}catch(e){toast(e.message)}}
-function timeAgo(t){const s=Math.max(0,Math.floor(Date.now()/1000-t));return s<60?s+'ث':Math.floor(s/60)+'د'}
+async function act(p,b){try{const r=await api(p,b||{});if(r.msg)toast(r.msg);await load()}catch(e){toast(e.message)}}
+function dxPrev(){const v=parseFloat(dxVal)||0,p=S.dex.price;
+  return dxSide==='buy'?'≈ '+fi(v/p)+' ⚡':'≈ '+f(v*p*(1-S.dex.fee),4)+' HASH'}
+function dxGo(){api('dex',{side:dxSide,amount:parseFloat(dxVal)||0}).then(r=>{toast(r.msg);dxVal='';load()}).catch(e=>toast(e.message))}
+function fmtDate(t){return new Date(t*1000).toLocaleString('en-GB',{hour12:false}).replace(',','')}
 function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
+function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
+
+function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN VAULT</div>
+  <div class="row" style="margin-top:6px"><span>إجمالي الرصيد · HASH</span>${badge(S.tier)}</div>
+  <div class="big" id="bal">${bal(S.balance)}</div>
+  <div class="row" style="margin-top:12px"><span>XP · مستوى ${S.level}</span><span>${S.xp} / ${S.xp_need}</span></div>
+  <div class="bar"><i style="width:${Math.min(100,S.xp/S.xp_need*100)}%;background:var(--pur)"></i></div>
+  <div class="row"><span>ENERGY · +${S.regen}/د</span><span id="enx">${fi(S.energy)} / ${fi(S.max_energy)}</span></div>
+  <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
+  <button class="pri" onclick="openSheet('energy')">⚡ احصل على طاقة</button></div>`}
 
 function vMine(){
-  let h='';
+  let h=walletCard();
+  const D=S.dex;
+  h+=`<div class="grid"><div class="card mini" onclick="openSheet('dex')"><b>DEX β</b>
+    <span class="h">1 ⚡ ≈ ${f(D.price,5)} #</span><br><span class="${D.change>=0?'up':'dn'}" style="direction:ltr;display:inline-block">${D.change>=0?'▲':'▼'} ${f(Math.abs(D.change))}%</span><br><span class="h">اشترِ، بِع ← فتح</span></div>
+    <div class="card mini" onclick="openSheet('servers')"><b>🖥 الخوادم</b><span class="h">+${fi(S.srv)} H/s</span><br><span class="h">مركز إدارة الخوادم ← فتح</span></div></div>`;
+  h+=`<div class="card"><div class="row"><div><b style="color:var(--tx);font-size:16px">👑 كن راعي التعدين</b><br><span class="h">×2 مكافأة كل كتلة · 24h+</span></div>
+    <button class="sm pri" onclick="buy('patron')">⭐ ${S.prices.patron}</button></div>
+    ${S.patron_left>0?`<p class="h" style="margin-top:8px;color:var(--grn)">فعّال · المتبقي ${fmtWait(S.patron_left)}</p>`:''}</div>`;
+  h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">معلومات الكتلة <span class="tag">#${fi(S.next_block)}</span></b><span class="off">عادي</span></div>
+    <div class="grid" style="margin:12px 0 0"><div class="cell"><span class="h">الصعوبة</span><b>${fk(S.difficulty)}</b></div>
+    <div class="cell"><span class="h">إجمالي معدل الهاش</span><b>${fk(S.total_hr)}</b></div>
+    <div class="cell"><span class="h">المكافأة</span><b>${f(S.block_reward,1)} #</b></div>
+    <div class="cell"><span class="h">متصل</span><b>${fi(S.online)}</b></div></div></div>`;
   if(!S.permit){
     h+=`<div class="card"><h2>🔑 تصريح التعدين</h2><p class="h">لبدء التعدين تحتاج تصريحاً بدفعة واحدة.<br>النقاط افتراضية داخل اللعبة.</p>
     <button class="pri" onclick="buy('permit')">⭐ ادفع ${S.prices.permit} نجمة</button></div>`;
   }else{
-    h+=`<div class="card"><div class="row"><span>الرصيد (HASH)</span><span>⚡ ${S.online} معدّن نشط</span></div>
-    <div class="big" id="bal">${f(S.balance,4)}</div>
-    <div class="row" style="margin-top:12px"><span>XP · مستوى ${S.level}</span><span>${S.xp} / ${S.xp_need}</span></div>
-    <div class="bar"><i style="width:${Math.min(100,S.xp/S.xp_need*100)}%;background:var(--pur)"></i></div>
-    <div class="row"><span>الطاقة +${S.regen}/د</span><span id="enx">${fi(S.energy)} / ${fi(S.max_energy)}</span></div>
-    <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
-    ${S.mining?'<button class="stop" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
+    const m=S.modes[S.mode],nx=S.mode%3+1;
+    h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">⛏ تعدين</b>${S.mining?'<span class="live">قيد التشغيل</span>':'<span class="off">متوقف</span>'}</div>
+    <div class="grid" style="margin:12px 0 0"><div class="cell"><span class="h">معدل الهاش</span><b>${fk(S.hashrate)} H/s</b></div>
+    <div class="cell"><span class="h">هاش</span><b id="hs">${fk(S.hashes)}</b></div>
+    <div class="cell"><span class="h">أسهم</span><b>${fi(S.wins)}</b></div>
+    <div class="cell"><span class="h">الدخل</span><b>${f(S.income,1)} #</b></div></div>
+    <div class="grid" style="margin:0">${S.mining?'<button class="stop" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
       '<button class="pri" onclick="act(\'mining\',{on:true})">▶ بدء التعدين</button>'}
-    <div class="grid" style="margin-top:12px"><div class="cell"><span class="h">معدل الهاش</span><b>${fi(S.hashrate)} H/s</b></div>
-    <div class="cell"><span class="h">الربح</span><b>${f(S.rate*3600,1)}/س</b></div></div>
-    <div class="grid"><button onclick="buy('energy_up')">🚀 +2000 طاقة قصوى<br><small>⭐ ${S.prices.energy_up}</small></button>
-    <button onclick="buy('restore')">🔋 استعادة الطاقة<br><small>⭐ ${S.prices.restore}</small></button></div></div>`;
+    <button onclick="act('mode',{mode:${nx}})">الوضع: ${m.name} ×${m.mul}<br><small class="h">طاقة ×${m.cost}/ث</small></button></div>
+    <button onclick="openSheet('servers')">🖥 مركز إدارة الخوادم</button></div>`;
   }
-  h+=`<div class="card"><h3>آخر 25 كتلة</h3>`+(B.length?B.map(b=>`<div class="blk"><div><b>#${fi(b.id)}</b> · ${esc(b.miner)} <span class="h">Lv${b.level}</span></div>
-  <div><span class="tag">+${f(b.reward,1)}</span> <span class="h">${timeAgo(b.t)}</span></div></div>`).join(''):'<p class="h">لا توجد كتل بعد.</p>')+'</div>';
+  h+=`<div class="card"><h3>آخر 25 كتلة</h3>`+(B.length?B.map(b=>`<div class="blk"><div class="row" style="color:var(--tx)"><b>كتلة <span class="tag">#${fi(b.id)}</span></b><span class="tag">+${f(b.reward,1)} #</span></div>
+  <div style="margin-top:4px">${av(b.miner)} <b>${esc(b.miner)}</b> <span class="h">مستوى ${b.level} · ${fi(b.miners)} معدّن</span></div>
+  <div class="h" style="direction:ltr;text-align:right">${fmtDate(b.t)}</div></div>`).join(''):'<p class="h">لا توجد كتل بعد.</p>')+'</div>';
   return h}
+
 function vRefs(){return `<div class="card"><h2>👥 إحالاتك</h2><p class="h">ادعُ أصدقاءك: تحصل على <b>${S.ref_bonus}</b> نقطة عن كل صديق يشتري تصريح التعدين.</p>
   <div class="grid" style="margin-top:12px"><div class="cell"><span class="h">عدد المُحالين</span><b>${S.refs}</b></div></div>
-  <div class="kv" style="margin-top:12px">${esc(S.ref_link)}</div>
+  <div class="kv">${esc(S.ref_link)}</div>
   <button class="pri" onclick="tg.openTelegramLink('https://t.me/share/url?url='+encodeURIComponent(S.ref_link)+'&text='+encodeURIComponent('⛏ تعال نعدّن معاً!'))">📤 مشاركة الرابط</button>
   <button onclick="navigator.clipboard.writeText(S.ref_link).then(()=>toast('تم النسخ'))">📋 نسخ الرابط</button></div>`}
+
 function vTasks(){
-  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000','500 #'];
+  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000'];
   const ready=S.daily_wait<=0;
-  let h=`<div class="card"><h2>🎁 مكافآت يومية</h2><p class="h">عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى).</p><div class="days" style="margin-top:12px">`+
-  lab.map((l,i)=>`<div class="day ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>${i<6?'⚡ ':''}${l}</b>${i<S.day_idx?'✓':''}</div>`).join('')+`</div>
+  let h=`<div class="card"><div class="cap">DAILY · STREAK</div><h2>🎁 مكافآت يومية</h2><p class="h">عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى).</p><div class="days" style="margin-top:12px">`+
+  lab.map((l,i)=>`<div class="day ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>⚡ ${l}</b>${i<S.day_idx?'✓':'🔒'}</div>`).join('')+
+  `<div class="day wide ${S.day_idx>6?'on':''}"><span>اليوم 7</span><b style="color:var(--blue)">SLIM</b><span>خادم تعدين SLIM · 30 دقيقة</span></div></div>
   <button class="pri" ${ready?'':'disabled'} onclick="act('daily')">${ready?'🎁 استلم مكافأة اليوم':'التالية بعد '+fmtWait(S.daily_wait)}</button></div>`;
   if(S.tasks.length)h+=`<div class="card"><h3>المهام</h3>`+S.tasks.map(t=>`<div class="rk"><span class="n">${esc(t.title)}</span><span class="tag">+${t.reward}</span>
   ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
   return h}
+
 function vTop(){
   if(!TOP)return '<p class="h">…</p>';
   return `<div class="card"><h2>🏆 أفضل 100 معدّن</h2><p class="h">ترتيبك: #${TOP.rank} · ${f(TOP.mytotal,2)}</p></div><div class="card">`+
-  (TOP.top.length?TOP.top.map((r,i)=>`<div class="rk ${r.me?'me':''}"><i>${i+1}</i><span class="n">${esc(r.name)} <span class="h">Lv${r.level}</span></span><span class="tag">${fi(r.total)}</span></div>`).join(''):'<p class="h">لا أحد بعد.</p>')+'</div>'}
-function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${f(S.balance,4)}</div></div>
+  (TOP.top.length?TOP.top.map((r,i)=>`<div class="rk ${r.me?'me':''}"><i>${i+1}</i>${av(r.name)}<span class="n">${esc(r.name)}${badge(r.tier)}<span class="h">Lv${r.level}</span></span><span class="tag">${f(r.total,1)}</span></div>`).join(''):'<p class="h">لا أحد بعد.</p>')+'</div>'}
+
+function vWallet(){return `<div class="card"><div class="row"><span>الرصيد الإجمالي</span><span>HASH</span></div><div class="big">${bal(S.balance)}</div></div>
   <div class="card"><h3>🎁 لديك كود؟</h3>
   <input id="cd" class="inp" placeholder="TH-XXXXXXXX" autocapitalize="characters" autocomplete="off">
   <button class="pri" onclick="redeem()">استرداد</button></div>
   <div class="card"><h3>المتجر (نجوم تيليجرام)</h3>
   ${S.permit?'<p class="h">✅ تصريح التعدين مفعّل.</p>':`<button class="pri" onclick="buy('permit')">🔑 تصريح التعدين — ⭐ ${S.prices.permit}</button>`}
   <button onclick="buy('energy_up')">🚀 زيادة الطاقة القصوى (+2000، +5/د) — ⭐ ${S.prices.energy_up}</button>
-  <button onclick="buy('restore')">🔋 استعادة الطاقة — ⭐ ${S.prices.restore}</button></div>
+  <button onclick="buy('restore')">🔋 استعادة الطاقة — ⭐ ${S.prices.restore}</button>
+  <button onclick="buy('patron')">👑 راعي التعدين ×2 (24h) — ⭐ ${S.prices.patron}</button></div>
   <div class="card"><p class="h">ℹ️ النقاط افتراضية داخل اللعبة فقط، ولا تمثل عملة رقمية ولا يمكن سحبها أو تحويلها لمال.</p></div>`}
+
+function sheetHTML(){
+  if(!sheet)return '';
+  let b='';
+  if(sheet==='energy'){
+    b=`<div class="cap">ENERGY · UPGRADE</div><h2>زيادة الطاقة القصوى</h2>
+    <p class="h">ارفع احتياطي الطاقة القصوى باستخدام Telegram Stars. ستعود طاقتك الحالية إلى الحد الأقصى بعد الاستعادة.</p>
+    <div class="grid" style="margin-top:12px"><div class="cell"><span class="h">الطاقة القصوى</span><b>+2,000</b><span class="h">← ${fi(S.max_energy+2000)}</span></div>
+    <div class="cell"><span class="h">في الدقيقة</span><b>+5</b><span class="h">← ${S.regen+5}</span></div></div>
+    <button class="pri" onclick="buy('energy_up')">⭐ ادفع ${S.prices.energy_up} STARS</button>
+    <p class="h" style="text-align:center;margin:14px 0 0">— أو —</p>
+    <h3 style="margin-top:8px">استعادة الطاقة</h3><p class="h">استعد طاقتك الحالية إلى الحد الأقصى مقابل رسوم صغيرة.</p>
+    <button onclick="buy('restore')">⭐ ادفع ${S.prices.restore} STARS</button>`;
+  }else if(sheet==='servers'){
+    b=`<div class="cap">SERVER · CONTROL CENTER</div><h2>🖥 مركز إدارة الخوادم</h2>
+    <p class="h">كل خادم يزيد معدل الهاش دائماً. السعر يرتفع 25% مع كل نسخة. زيادتك الحالية: <b>+${fi(S.srv)} H/s</b></p>`+
+    S.temps.map(t=>`<div class="rk"><span class="n">${esc(t.title)} <span class="h">مؤقت</span></span><span class="tag">+${fi(t.hr)} H/s</span><span class="h">${fmtLeft(t.left)}</span></div>`).join('')+
+    S.servers.map(s=>`<div class="rk"><span class="n">${esc(s.title)} <span class="h">×${s.owned}/${s.max}</span><br><span class="h">+${fi(s.hr)} H/s</span></span>
+    <button class="sm pri" ${s.owned>=s.max?'disabled':''} onclick="act('server',{key:'${s.key}'})">${fi(s.cost)} #</button></div>`).join('');
+  }else if(sheet==='dex'){
+    const D=S.dex;
+    b=`<div class="cap">DEX · β</div><h2>تبادل HASH ⇄ طاقة</h2>
+    <p class="h">1 ⚡ ≈ <b style="color:var(--tx)">${f(D.price,5)}</b> # · <span class="${D.change>=0?'up':'dn'}" style="direction:ltr;display:inline-block">${D.change>=0?'▲':'▼'} ${f(Math.abs(D.change))}%</span> · عمولة البيع ${Math.round(D.fee*100)}%</p>
+    <div class="seg" style="margin:12px 0"><button class="${dxSide==='buy'?'on':''}" onclick="dxSide='buy';dxVal='';draw()">شراء طاقة</button>
+    <button class="${dxSide==='sell'?'on':''}" onclick="dxSide='sell';dxVal='';draw()">بيع طاقة</button></div>
+    <p class="h" style="margin-bottom:6px">${dxSide==='buy'?'المبلغ بـ HASH (رصيدك '+f(S.balance,2)+')':'كمية الطاقة (لديك '+fi(S.energy)+')'}</p>
+    <input id="dxi" class="inp" type="number" inputmode="decimal" placeholder="0" value="${esc(dxVal)}" oninput="dxVal=this.value;$('dxp').textContent=dxPrev()">
+    <p class="h" id="dxp" style="text-align:center;margin:8px 0 0">${dxPrev()}</p>
+    <button class="pri" onclick="dxGo()">${dxSide==='buy'?'شراء':'بيع'}</button>`;
+  }
+  return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="sh"><button class="sm" style="float:left;margin:0" onclick="closeSheet()">✕</button>${b}</div></div>`}
+
 const V={mine:vMine,refs:vRefs,tasks:vTasks,top:vTop,wallet:vWallet};
 function draw(){
   $('nav').innerHTML=TABS.map(t=>`<div class="${t[0]===tab?'on':''}" onclick="go('${t[0]}')"><span>${t[1]}</span>${t[2]}</div>`).join('');
-  $('app').innerHTML='<div class="w" style="padding:0">'+V[tab]()+'</div>'}
+  $('app').innerHTML='<div class="w" style="padding:0">'+V[tab]()+'</div>';
+  $('sh').innerHTML=sheetHTML()}
 setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if(!S||!S.mining||tab!=='mine')return;
   const dt=.25,run=Math.min(dt,S.energy/S.cost);
-  S.balance+=run*S.rate;S.energy-=run*S.cost;
-  if($('bal'))$('bal').textContent=f(S.balance,4);
+  S.balance+=run*S.rate;S.energy-=run*S.cost;S.hashes+=run*S.hashrate;
+  if($('bal'))$('bal').innerHTML=bal(S.balance);
+  if($('hs'))$('hs').textContent=fk(S.hashes);
   if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
-setInterval(()=>{if(S&&!document.hidden&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
+setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
 if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
 else load().catch(e=>{$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
