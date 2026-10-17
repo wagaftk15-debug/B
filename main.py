@@ -89,6 +89,8 @@ REF_MIN = 1000
 DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
 PATRON_SECS = 86400
 MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
+ENERGY_BASE = 2000      # الطاقة القصوى عند المستوى 1
+ENERGY_PER_LEVEL = 1000 # تزيد الطاقة القصوى بهذا المقدار مع كل مستوى (مستوى 2 = 3000 ...)
 STALE_SECS = 15         # أي معدّن لم تُحدَّث بياناته منذ هذه المدة تُحدَّث تلقائياً من السيرفر
 
 # أوضاع التعدين:
@@ -418,9 +420,15 @@ def ensure_user(cur, uid, name, username, ref=None):
         cur.execute("SELECT id FROM m_users WHERE id=?", (ref,))
         if cur.fetchone():
             ref_ok = ref
-    cur.execute("""INSERT INTO m_users(id,name,username,referrer,last_tick,created_at) VALUES(?,?,?,?,?,?)
+    cur.execute("""INSERT INTO m_users(id,name,username,referrer,last_tick,created_at,energy) VALUES(?,?,?,?,?,?,?)
         ON CONFLICT (id) DO UPDATE SET name=excluded.name, username=excluded.username""",
-                (uid, name, username, ref_ok, time.time(), int(time.time())))
+                (uid, name, username, ref_ok, time.time(), int(time.time()), ENERGY_BASE))
+
+
+def xmax_of(u):
+    """الطاقة القصوى = أساس المستوى + مشتريات الطاقة (max_energy-1000) + مكافأة الإحالات النشطة."""
+    return (ENERGY_BASE + ENERGY_PER_LEVEL * (u["level"] - 1)
+            + (u["max_energy"] - 1000) + REF_ENERGY * u.get("refs_act", 0))
 
 
 def lock_user(cur, uid):
@@ -431,8 +439,10 @@ def lock_user(cur, uid):
     cur.execute("SELECT kind FROM m_servers WHERE user_id=? AND (expires=0 OR expires>?)", (uid, time.time()))
     u["srv"] = sum(SERVERS[r["kind"]]["hr"] for r in cur.fetchall() if r["kind"] in SERVERS)
     cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND balance>?", (uid, REF_MIN))
-    u["xmax"] = u["max_energy"] + REF_ENERGY * cur.fetchone()["n"]       # الحد الأقصى الفعلي للطاقة
+    u["refs_act"] = cur.fetchone()["n"]
+    u["xmax"] = xmax_of(u)                  # الحد الأقصى الفعلي للطاقة
     settle(u)
+    u["xmax"] = xmax_of(u)                  # قد يتغير بعد الترقية لمستوى جديد
     return u
 
 
@@ -1111,7 +1121,7 @@ def _mark_refunded(p):
         elif k == "energy_up":
             u["max_energy"] = max(1000, u["max_energy"] - 2000)
             u["regen"] = max(30, u["regen"] - 5)
-            u["energy"] = min(u["energy"], u["max_energy"])
+            u["energy"] = min(u["energy"], xmax_of(u))
         elif k == "patron":
             u["patron"] = max(0, u["patron"] - PATRON_SECS)
         elif k.startswith("mode_"):
