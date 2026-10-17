@@ -257,6 +257,9 @@ def init_db():
             id {pk}, user_id BIGINT NOT NULL, kind TEXT NOT NULL,
             expires DOUBLE PRECISION NOT NULL DEFAULT 0)""")
         cur.execute("CREATE TABLE IF NOT EXISTS m_settings(k TEXT PRIMARY KEY, v TEXT)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS m_week_top(
+            week_id INT NOT NULL, pos INT NOT NULL, user_id BIGINT NOT NULL, name TEXT,
+            amount DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY(week_id, pos))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS m_block_rewards(
             block_id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
             PRIMARY KEY(block_id, user_id))""")
@@ -268,7 +271,8 @@ def init_db():
                          ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("modes", "TEXT NOT NULL DEFAULT '1'"),
                          ("banned", "INT NOT NULL DEFAULT 0"),
-                         ("ban_reason", "TEXT NOT NULL DEFAULT ''")])
+                         ("ban_reason", "TEXT NOT NULL DEFAULT ''"),
+                         ("week_base", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
     add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                           ("bhash", "TEXT NOT NULL DEFAULT ''"),
                           ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -595,6 +599,73 @@ def dex_info():
     return dict(price=p, change=(p / old - 1) * 100, fee=DEX_FEE)
 
 
+# ═══════════ 3.3) الترتيب الأسبوعي ═══════════
+# الأسبوع يبدأ كل اثنين 00:00 (بتوقيت TZ_OFFSET). ربح الأسبوع = total - week_base.
+WEEK_CACHE = [0.0, None]
+
+
+def week_id_of(ts):
+    return int(((ts + TZ_OFFSET * 3600) - 4 * 86400) // (7 * 86400))
+
+
+def week_bounds(now=None):
+    now = now or time.time()
+    wid = week_id_of(now)
+    st = wid * 7 * 86400 + 4 * 86400 - TZ_OFFSET * 3600
+    return wid, st, st + 7 * 86400
+
+
+def roll_week():
+    """يُغلق الأسبوع المنتهي: يحفظ أفضل 100 في m_week_top ثم يصفّر عدّاد الأسبوع. يرجع (رقم_الأسبوع, الصفوف) أو None."""
+    cw = week_id_of(time.time())
+    saved = get_setting("week_id")
+    if saved is None:                                   # أول تشغيل: يبدأ العدّ من الآن
+        with cursor() as cur:
+            cur.execute("UPDATE m_users SET week_base=total")
+        set_setting("week_id", cw)
+        return None
+    sw = int(saved)
+    if sw >= cw:
+        return None
+    with cursor() as cur:
+        cur.execute("DELETE FROM m_week_top WHERE week_id=?", (sw,))
+        cur.execute("SELECT id,name,total-week_base AS w FROM m_users WHERE banned=0 AND total-week_base>0 "
+                    "ORDER BY w DESC LIMIT 100")
+        rows = cur.fetchall()
+        for i, r in enumerate(rows, 1):
+            cur.execute("INSERT INTO m_week_top(week_id,pos,user_id,name,amount) VALUES(?,?,?,?,?)",
+                        (sw, i, r["id"], r["name"], r["w"]))
+        cur.execute("UPDATE m_users SET week_base=total")
+        cur.execute("INSERT INTO m_settings(k,v) VALUES('week_id',?) ON CONFLICT (k) DO UPDATE SET v=excluded.v",
+                    (str(cw),))
+    WEEK_CACHE[1] = None
+    return sw, rows
+
+
+def week_top_rows(limit=100):
+    with cursor() as cur:
+        cur.execute("SELECT id,name,level,mode,total-week_base AS w FROM m_users WHERE banned=0 AND "
+                    "total-week_base>0 ORDER BY w DESC LIMIT " + str(int(limit)))
+        return cur.fetchall()
+
+
+def weekly_data(tg):
+    now = time.time()
+    wid, st, en = week_bounds(now)
+    if WEEK_CACHE[1] is None or now - WEEK_CACHE[0] > 20:       # كاش 20 ثانية لتخفيف الضغط
+        WEEK_CACHE[:] = [now, week_top_rows(100)]
+    with cursor() as cur:
+        cur.execute("SELECT name,level,mode,total-week_base AS w FROM m_users WHERE id=?", (tg["id"],))
+        me = cur.fetchone() or dict(name=tg["name"], level=1, mode=1, w=0)
+        w = max(0.0, float(me["w"] or 0))
+        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE banned=0 AND total-week_base>?", (w,))
+        rank = cur.fetchone()["r"]
+    return dict(top=[dict(name=r["name"], level=r["level"], tier=tier(r["mode"]), total=r["w"],
+                          me=r["id"] == tg["id"]) for r in WEEK_CACHE[1]],
+                rank=rank, mine=dict(name=me["name"], level=me["level"], total=w, tier=tier(me["mode"])),
+                left=int(en - now), start=fmt_d(st), end=fmt_d(en - 1))
+
+
 # ═══════════ 3.2) أكواد الاسترداد ═══════════
 CODE_KINDS = {"energy": "طاقة", "hash": "نقاط HASH", "permit": "تصريح التعدين", "mode": "وضع تعدين"}
 
@@ -897,7 +968,7 @@ def act_blocks(tg, b):
     return {"blocks": out}
 
 
-def act_top(tg, b):
+def _act_top_all(tg, b):
     with cursor() as cur:
         cur.execute("SELECT id,name,level,total,mode FROM m_users WHERE total>0 AND banned=0 ORDER BY total DESC LIMIT 100")
         rows = cur.fetchall()
@@ -915,6 +986,13 @@ def act_top(tg, b):
             "chain": dict(holders=holders, emission=CHAIN["blocks"] * BLOCK_REWARD,
                           pct=min(100.0, mined / CHAIN["blocks"] * 100), mined=mined, blocks=CHAIN["blocks"],
                           start_date=fmt_d(CHAIN["start"]))}
+
+
+def act_top(tg, b):
+    res = _act_top_all(tg, b)
+    if b.get("week"):
+        res["week"] = weekly_data(tg)
+    return res
 
 
 def act_redeem(tg, b):
@@ -1045,6 +1123,24 @@ async def block_loop():
             await asyncio.to_thread(make_block)
         except Exception:
             log.exception("block loop")
+
+
+async def week_loop():
+    """كل دقيقة: يتحقق من انتهاء الأسبوع، فيحفظ أفضل 100 ويُبلغ الأدمن."""
+    while True:
+        try:
+            res = await asyncio.to_thread(roll_week)
+            if res and ADMIN_ID:
+                sw, rows = res
+                top3 = "\n".join(f"{i}. {html.escape(r['name'] or '—')} · {float(r['w']):,.0f}"
+                                 for i, r in enumerate(rows[:3], 1)) or "لا أحد"
+                await MAIN_APP.bot.send_message(
+                    ADMIN_ID, f"🏁 <b>انتهى الأسبوع</b> وتم حفظ أفضل {len(rows)}.\n\n{top3}\n\n"
+                              "لتهنئتهم: <code>/weeksend مبروك {name}! مركزك {rank} هذا الأسبوع 🎉</code>\n"
+                              "لعرض الترتيب: /weekly last")
+        except Exception:
+            log.exception("week loop")
+        await asyncio.sleep(60)
 
 
 async def settle_loop():
@@ -1390,7 +1486,7 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def wipe():
         with cursor() as cur:
-            for t in ("m_users", "m_tasks", "m_servers", "m_redeems", "m_codes", "m_block_rewards"):
+            for t in ("m_users", "m_tasks", "m_servers", "m_redeems", "m_codes", "m_block_rewards", "m_week_top"):
                 cur.execute(f"DELETE FROM {t}")
             if USE_PG:
                 cur.execute("TRUNCATE m_blocks RESTART IDENTITY")
@@ -1745,6 +1841,143 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+def _fmt_left(sec):
+    sec = max(0, int(sec))
+    return f"{sec // 86400} يوم و{sec % 86400 // 3600} ساعة"
+
+
+def _last_week_items():
+    with cursor() as cur:
+        cur.execute("SELECT MAX(week_id) AS m FROM m_week_top")
+        wid = (cur.fetchone() or {}).get("m")
+        if wid is None:
+            return None, []
+        cur.execute("SELECT pos,user_id,name,amount FROM m_week_top WHERE week_id=? ORDER BY pos", (wid,))
+        return wid, [dict(pos=r["pos"], uid=r["user_id"], name=r["name"], amount=r["amount"]) for r in cur.fetchall()]
+
+
+def _live_week_items():
+    return [dict(pos=i, uid=r["id"], name=r["name"], amount=r["w"]) for i, r in enumerate(week_top_rows(100), 1)]
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/weekly = ترتيب الأسبوع الحالي · /weekly last = ترتيب آخر أسبوع منتهٍ"""
+    if not _is_admin(update):
+        return
+    last = bool(context.args and context.args[0].lower() == "last")
+    if last:
+        wid, items = await asyncio.to_thread(_last_week_items)
+        if wid is None:
+            await update.message.reply_text("لا يوجد أسبوع منتهٍ محفوظ بعد.")
+            return
+        st = wid * 7 * 86400 + 4 * 86400 - TZ_OFFSET * 3600
+        head = f"🏁 <b>آخر أسبوع منتهٍ</b> ({fmt_d(st)} ← {fmt_d(st + 7 * 86400 - 1)})"
+    else:
+        items = await asyncio.to_thread(_live_week_items)
+        wid, st, en = week_bounds()
+        head = (f"📅 <b>الأسبوع الحالي</b> ({fmt_d(st)} ← {fmt_d(en - 1)})\n"
+                f"⏳ ينتهي بعد {_fmt_left(en - time.time())}")
+    lines = [head, ""]
+    lines += [f"{i['pos']}. {html.escape(i['name'] or '—')} · <code>{i['uid']}</code> · {float(i['amount']):,.0f}"
+              for i in items[:25]] or ["لا أحد بعد."]
+    if len(items) > 25:
+        lines.append(f"… و{len(items) - 25} آخرين (حتى {len(items)})")
+    lines += ["", "لإرسال تهنئة لهم: /weeksend"]
+    await update.message.reply_text("\n".join(lines))
+
+
+def _pers(text, it):
+    return (text.replace("{rank}", str(it["pos"])).replace("{name}", html.escape(it["name"] or ""))
+            .replace("{amount}", f"{float(it['amount']):,.0f}"))
+
+
+async def cmd_weeksend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/weeksend <الرسالة> ← لأفضل 100 في آخر أسبوع منتهٍ · /weeksend now <الرسالة> ← للأسبوع الجاري"""
+    if not _is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    live = False
+    if rest.split(None, 1)[:1] and rest.split(None, 1)[0].lower() == "now":
+        live = True
+        rest = rest.split(None, 1)[1].strip() if len(rest.split(None, 1)) > 1 else ""
+    if not rest:
+        await update.message.reply_text(
+            "🏆 <b>تهنئة أفضل 100 في الترتيب الأسبوعي</b>\n\n"
+            "<code>/weeksend مبروك {name}! مركزك {rank} هذا الأسبوع بـ {amount} نقطة 🎉</code>\n"
+            "← يُرسل لأفضل 100 في آخر أسبوع منتهٍ\n\n"
+            "<code>/weeksend now نص الرسالة</code> ← لترتيب الأسبوع الجاري الآن\n\n"
+            "المتغيرات (اختيارية): <code>{name}</code> الاسم · <code>{rank}</code> المركز · <code>{amount}</code> النقاط\n"
+            "ستظهر معاينة ثم أرسل /wkconfirm للإرسال أو /wkcancel للإلغاء.")
+        return
+    if live:
+        items, label = await asyncio.to_thread(_live_week_items), "الأسبوع الجاري"
+    else:
+        wid, items = await asyncio.to_thread(_last_week_items)
+        label = "آخر أسبوع منتهٍ"
+        if wid is None:
+            await update.message.reply_text("لا يوجد أسبوع منتهٍ محفوظ بعد. للأسبوع الجاري استخدم:\n"
+                                            "<code>/weeksend now نص الرسالة</code>")
+            return
+    if not items:
+        await update.message.reply_text("لا يوجد لاعبون في هذا الترتيب.")
+        return
+    context.bot_data["wk"] = dict(text=rest, items=items)
+    try:
+        await update.message.reply_text("🏆 <b>معاينة</b> (كما ستصل للمركز الأول):\n\n" + _pers(rest, items[0]))
+    except Exception as e:
+        context.bot_data.pop("wk", None)
+        await update.message.reply_text(f"❌ تعذّر عرض الرسالة: {html.escape(str(e))}")
+        return
+    await update.message.reply_text(f"👥 المستلمون: <b>{len(items)}</b> ({label})\n\n"
+                                    "للتأكيد: /wkconfirm\nللإلغاء: /wkcancel")
+
+
+async def cmd_wkcancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    context.bot_data.pop("wk", None)
+    await update.message.reply_text("تم الإلغاء.")
+
+
+async def _send_many(bot, pairs, admin_chat):
+    sent = failed = 0
+    kb = (InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=APP_URL))]])
+          if WEBAPP_URL else None)
+    for uid, txt in pairs:
+        for attempt in range(2):
+            try:
+                await bot.send_message(uid, txt, reply_markup=kb)
+                sent += 1
+                break
+            except RetryAfter as e:
+                ra = e.retry_after
+                ra = ra.total_seconds() if hasattr(ra, "total_seconds") else ra
+                await asyncio.sleep(float(ra) + 1)
+            except Exception:
+                failed += 1
+                break
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    try:
+        await bot.send_message(admin_chat, f"✅ انتهى الإرسال\n📨 وصلت: <b>{sent}</b>\n🚫 فشلت: {failed}")
+    except Exception:
+        pass
+
+
+async def cmd_wkconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    d = context.bot_data.pop("wk", None)
+    if not d:
+        await update.message.reply_text("لا توجد رسالة معلّقة. استخدم /weeksend أولاً.")
+        return
+    pairs = [(i["uid"], _pers(d["text"], i)) for i in d["items"]]
+    await update.message.reply_text(f"🚀 بدأ الإرسال إلى {len(pairs)} لاعب... سأبلغك عند الانتهاء.")
+    BG.append(asyncio.create_task(_send_many(context.bot, pairs, update.effective_chat.id)))
+
+
 async def post_init(app: Application):
     global MAIN_APP
     MAIN_APP = app
@@ -1768,7 +2001,9 @@ async def post_init(app: Application):
                                       BotCommand("broadcast", "📢 بث رسالة للجميع"),
                                       BotCommand("ban", "⛔ حظر مستخدم"),
                                       BotCommand("unban", "✅ إلغاء حظر"),
-                                      BotCommand("bans", "📋 قائمة المحظورين")]
+                                      BotCommand("bans", "📋 قائمة المحظورين"),
+                                      BotCommand("weekly", "🏆 الترتيب الأسبوعي"),
+                                      BotCommand("weeksend", "🎉 تهنئة أفضل 100 أسبوعياً")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -1777,6 +2012,7 @@ async def post_init(app: Application):
         log.warning("setup failed: %s", e)
     BG.append(asyncio.create_task(block_loop()))
     BG.append(asyncio.create_task(settle_loop()))
+    BG.append(asyncio.create_task(week_loop()))
     if ADMIN_ID:
         try:
             await app.bot.send_message(ADMIN_ID, f"✅ البوت يعمل.\n🗄 {'PostgreSQL' if USE_PG else 'SQLite'}\n"
@@ -2086,7 +2322,7 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
 try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
 function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
-let BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
+let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
 const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
@@ -2109,7 +2345,7 @@ async function api(p,b){
 async function load(){
   const jobs=[api('me')];
   if(tab==='mine')jobs.push(api('blocks'));
-  if(tab==='top')jobs.push(api('top'));
+  if(tab==='top')jobs.push(api('top',{week:topView==='week'?1:0}));
   if(tab==='refs')jobs.push(api('refs'));
   const r=await Promise.all(jobs);
   S=r[0];if(tab==='mine')B=r[1].blocks;if(tab==='top')TOP=r[1];if(tab==='refs')REFS=r[1].reftop;
@@ -2127,6 +2363,8 @@ function dxGo(){api('dex',{side:dxSide,amount:parseFloat(dxVal)||0}).then(r=>{to
 function donate(){const n=parseInt($('sp').value);if(!n||n<1)return toast('أدخل عدد النجوم');
   api('invoice',{item:'support',stars:n}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')toast('❤️ شكراً لدعمك!')})).catch(e=>toast(e.message))}
 function fmtDate(t){return new Date(t*1000).toLocaleString('en-GB',{hour12:false}).replace(',','')}
+function fmtDays(s){s=Math.max(0,s);return Math.floor(s/86400)+'ي '+Math.floor(s%86400/3600)+'س '+Math.floor(s%3600/60)+'د'}
+function setView(v){topView=v;load().catch(e=>toast(e.message))}
 function fmtWait(s){return Math.floor(s/3600)+'س '+Math.floor(s%3600/60)+'د'}
 function fmtLeft(s){return Math.floor(s/60)+'د '+(s%60)+'ث'}
 
@@ -2340,7 +2578,19 @@ const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
 function amt(n){const s=f(n,4);return '<i class="cn">#</i><span class="amt">'+s.slice(0,-3)+'<small>'+s.slice(-3)+'</small></span>'}
 function who(name,lv,t,tot){return `<div class="nm"><div class="nl"><b>${esc(name)}</b>${badge(t)}<span class="lv">مستوى ${lv}</span></div><div class="am">${amt(tot)}</div></div>`}
+function vTopWeek(){
+  const W=TOP&&TOP.week;if(!W)return '<p class="h">…</p>';
+  const M=W.mine,L=W.top;
+  return `<div class="stc"><div class="sth"><span class="stic or">${ic('trophy',14)}</span>ترتيبي هذا الأسبوع<span class="rb">#${fi(W.rank)}</span></div>
+  <div class="tmb"><div class="tr"><span class="mlb">ينتهي بعد</span><span class="pc" style="font-size:14px">${fmtDays(W.left)}</span></div>
+  <div class="mlb" style="margin-top:8px;direction:ltr;text-align:right">${esc(W.start)} → ${esc(W.end)}</div></div>
+  <div class="mb">${avs(M.name)}${who(M.name,M.level,M.tier,M.total)}</div></div>
+  <div class="stc"><div class="sth"><span class="stic">${ic('trophy',14)}</span>أفضل 100 هذا الأسبوع</div>`+
+  (L.length?L.map((r,i)=>`<div class="lr ${r.me?'me':''}"><span class="lrk ${i<3?'tp':''}">${String(i+1).padStart(2,'0')}</span>${avs(r.name)}${who(r.name,r.level,r.tier,r.total)}</div>`).join(''):'<p class="h" style="padding:14px">لا أحد بعد هذا الأسبوع.</p>')+'</div>'}
 function vTop(){
+  const seg=`<div class="seg" style="margin-bottom:12px"><button class="${topView==='all'?'on':''}" onclick="setView('all')">الإجمالي</button><button class="${topView==='week'?'on':''}" onclick="setView('week')">الأسبوعي</button></div>`;
+  return seg+(topView==='week'?vTopWeek():vTopAll())}
+function vTopAll(){
   if(!TOP)return '<p class="h">…</p>';
   const C=TOP.chain,M=TOP.mine;
   return `<div class="stc"><div class="sth"><span class="stic">${ic('trend',14)}</span>إحصائيات البلوكشين</div>
@@ -2463,6 +2713,10 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("bans", cmd_bans))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("weeksend", cmd_weeksend))
+    app.add_handler(CommandHandler("wkconfirm", cmd_wkconfirm))
+    app.add_handler(CommandHandler("wkcancel", cmd_wkcancel))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
     log.info("Bot started (polling)")
