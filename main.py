@@ -32,7 +32,7 @@ if _todo:
     if _missing():
         raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
-import os, sys, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random, re, datetime
+import os, sys, io, gzip, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random, re, datetime
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
@@ -85,8 +85,10 @@ XP_GROWTH = 1.10        # نسبة زيادة الصعوبة بعد المستو
 SUPPORT_MAX = 10000     # أقصى مبلغ دعم بالنجوم
 BLOCK_REWARD = 50       # إجمالي مكافأة الكتلة (كل 5 ثوانٍ)
 WINNER_PCT = 0.4        # حصة المعدّن الفائز بالقرعة من الكتلة (40%)؛ الباقي (60%) يُوزَّع على كل المعدّنين النشطين بنسبة هاشهم
-REF_ENERGY = 1000        # +طاقة قصوى لكل مُحال يملك أكثر من REF_MIN نقطة حالياً (تُسحب إن نزل رصيده)
-REF_MIN = 1000
+REF_ENERGY = 1000        # +طاقة قصوى لكل مُحال نشط (عدّن REF_SECS ثانية فعلية على الأقل)
+REF_MIN = 1000          # (قديم - لم يعد مستعملاً)
+REF_SECS = 3600         # مدة التعدين الفعلي اللازمة ليُحتسب المُحال (ساعة) — يمنع الإحالات الوهمية
+REF_MAX = 50            # أقصى عدد مُحالين نشطين تُحتسب لهم المكافأة
 DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
 PATRON_SECS = 86400
 MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
@@ -135,6 +137,13 @@ CHAIN = dict(start=NOT_SCHEDULED, blocks=DEFAULT_BLOCKS, done=False)  # يضبط
 DEFAULT_TITLE = "TotalHash"   # عنوان المقدمة الافتراضي (يتغير بالأمر /settitle)
 TITLE = DEFAULT_TITLE
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
+SESS = {}               # الجلسة الفعّالة لكل لاعب {id: session_id} — جلسة واحدة فقط لكل حساب
+try:
+    _h, _m = (os.environ.get("DAILY_REPORT_TIME", "08:00") or "08:00").replace(".", ":").split(":")
+    DAILY_MIN = int(_h) * 60 + int(_m)                      # موعد التقرير اليومي (بتوقيت TZ_OFFSET)
+except ValueError:
+    DAILY_MIN = 480
+DAILY_BACKUP = os.environ.get("DAILY_BACKUP", "1") != "0"   # إرفاق نسخة احتياطية مع التقرير اليومي
 BANNED = {}             # المحظورون: {id: السبب} (تُحمَّل من قاعدة البيانات عند التشغيل)
 
 
@@ -278,12 +287,16 @@ def init_db():
                          ("week_base", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("last_win", "BIGINT NOT NULL DEFAULT 0"),
                          ("last_win_at", "BIGINT NOT NULL DEFAULT 0"),
-                         ("week_wins", "INT NOT NULL DEFAULT 0")])
+                         ("week_wins", "INT NOT NULL DEFAULT 0"),
+                         ("mined_secs", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
     add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                           ("bhash", "TEXT NOT NULL DEFAULT ''"),
                           ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
                           ("miner_mode", "INT NOT NULL DEFAULT 1"),
                           ("shared", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
+    with cursor() as cur:          # ترحيل لمرة واحدة: تقدير وقت التعدين السابق من إجمالي الهاش
+        cur.execute("UPDATE m_users SET mined_secs = CASE WHEN hr>1 THEN hashes/hr ELSE hashes END "
+                    "WHERE mined_secs=0 AND hashes>0")
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_m_total ON m_users (total DESC)",
                 "CREATE INDEX IF NOT EXISTS ix_m_ref ON m_users (referrer)",
                 "CREATE INDEX IF NOT EXISTS ix_m_srv ON m_servers (user_id)"):
@@ -417,6 +430,7 @@ def settle(u):
         u["balance"] += earned
         u["total"] += earned
         u["hashes"] += run * hr
+        u["mined_secs"] = u.get("mined_secs", 0) + run
         u["xp"] += run * hr / XP_DIV
         while u["xp"] >= xp_need(u["level"]):
             u["xp"] -= xp_need(u["level"])
@@ -456,8 +470,8 @@ def lock_user(cur, uid):
         raise Err("user")
     cur.execute("SELECT kind FROM m_servers WHERE user_id=? AND (expires=0 OR expires>?)", (uid, time.time()))
     u["srv"] = sum(SERVERS[r["kind"]]["hr"] for r in cur.fetchall() if r["kind"] in SERVERS)
-    cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND balance>?", (uid, REF_MIN))
-    u["refs_act"] = cur.fetchone()["n"]
+    cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND mined_secs>=? AND banned=0", (uid, REF_SECS))
+    u["refs_act"] = min(cur.fetchone()["n"], REF_MAX)
     u["xmax"] = xmax_of(u)                  # الحد الأقصى الفعلي للطاقة
     settle(u)
     u["xmax"] = xmax_of(u)                  # قد يتغير بعد الترقية لمستوى جديد
@@ -467,11 +481,11 @@ def lock_user(cur, uid):
 def save_user(cur, u):
     # نحفظ الوضع الفعّال (المفتوح فعلاً) كي لا تظهر شارة وضع لم يشتره المستخدم
     cur.execute("""UPDATE m_users SET permit=?,level=?,xp=?,balance=?,total=?,energy=?,max_energy=?,
-        regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?,modes=?
-        WHERE id=?""",
+        regen=?,mining=?,last_tick=?,streak=?,last_daily=?,mode=?,hr=?,hashes=?,wins=?,income=?,patron=?,modes=?,
+        mined_secs=? WHERE id=?""",
                 (u["permit"], u["level"], u["xp"], u["balance"], u["total"], u["energy"], u["max_energy"],
                  u["regen"], u["mining"], u["last_tick"], u["streak"], u["last_daily"], cur_mode(u),
-                 hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["modes"], u["id"]))
+                 hashrate(u), u["hashes"], u["wins"], u["income"], u["patron"], u["modes"], u.get("mined_secs", 0), u["id"]))
 
 
 def daily_info(u):
@@ -814,8 +828,9 @@ def act_me(tg, b):
         save_user(cur, u)
         cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=?", (u["id"],))
         refs = cur.fetchone()["n"]
-        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND balance>?", (u["id"], REF_MIN))
-        ref_active = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND mined_secs>=? AND banned=0",
+                    (u["id"], REF_SECS))
+        ref_active = min(cur.fetchone()["n"], REF_MAX)
         cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(hr),0) AS h FROM m_users WHERE " + SQL_ACTIVE, (now,))
         a = cur.fetchone()
         cur.execute("SELECT MAX(id) AS m FROM m_blocks")
@@ -833,7 +848,7 @@ def act_me(tg, b):
                for k, v in SERVERS.items() if v["cost"] > 0]
     return dict(**state(u), refs=refs, online=a["n"], total_hr=a["h"], difficulty=a["h"] * 0.2,
                 block_reward=BLOCK_REWARD * (2 if u["patron"] > now else 1), next_block=last_block + 1,
-                ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_active=ref_active, daily=DAILY, dex=dex_info(), chain=chain_info(), servers=servers, temps=temps,
+                ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_hours=REF_SECS // 3600, ref_max=REF_MAX, ref_active=ref_active, daily=DAILY, dex=dex_info(), chain=chain_info(), servers=servers, temps=temps,
                 modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"], stars=v["stars"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
                 tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
@@ -952,9 +967,9 @@ def act_dex(tg, b):
 
 def act_refs(tg, b):
     with cursor() as cur:
-        cur.execute("SELECT referrer AS rid, COUNT(*) AS n, SUM(CASE WHEN balance>? THEN 1 ELSE 0 END) AS act "
+        cur.execute("SELECT referrer AS rid, COUNT(*) AS n, SUM(CASE WHEN mined_secs>=? THEN 1 ELSE 0 END) AS act "
                     "FROM m_users WHERE referrer IS NOT NULL GROUP BY referrer ORDER BY n DESC, referrer LIMIT 100",
-                    (REF_MIN,))
+                    (REF_SECS,))
         rows = cur.fetchall()
         info = {}
         if rows:
@@ -1105,6 +1120,12 @@ async def web_api(request):
         raise web.HTTPUnauthorized()
     if tg["id"] in BANNED:
         return web.json_response({"ok": False, "banned": True, "reason": BANNED[tg["id"]]})
+    sid = request.headers.get("X-Session", "")
+    if sid and tg["id"] != ADMIN_ID:                 # جلسة واحدة لكل حساب: الأحدث (فتحاً) تفصل الأقدم
+        if request.headers.get("X-Sess-New") == "1" or tg["id"] not in SESS:
+            SESS[tg["id"]] = sid
+        elif SESS[tg["id"]] != sid:
+            return web.json_response({"ok": False, "kicked": True})
     body = {}
     if request.method == "POST":
         try:
@@ -2238,6 +2259,251 @@ async def sched_loop():
             log.exception("sched loop")
 
 
+# ═══════════ 5.3) نسخ احتياطي · استرجاع · مشبوهون · تقرير يومي ═══════════
+BACKUP_TABLES = ["m_users", "m_payments", "m_tasks", "m_blocks", "m_codes", "m_redeems",
+                 "m_servers", "m_settings", "m_week_top", "m_sched"]
+SERIAL_TABLES = ["m_blocks", "m_servers", "m_sched"]
+
+
+def make_backup():
+    data = dict(v=1, ts=time.time(), tables={})
+    with cursor() as cur:
+        for t in BACKUP_TABLES:
+            cur.execute(f"SELECT * FROM {t}")
+            data["tables"][t] = cur.fetchall()
+    return gzip.compress(json.dumps(data, ensure_ascii=False).encode("utf-8")), len(data["tables"]["m_users"])
+
+
+def _table_cols(cur, t):
+    if USE_PG:
+        cur.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_name=?", (t,))
+    else:
+        cur.execute(f"PRAGMA table_info({t})")
+    return {r["name"] for r in cur.fetchall()}
+
+
+def reload_state():
+    """يعيد قراءة الإعدادات المخزّنة في الذاكرة (بعد الاسترجاع)."""
+    global TITLE
+    with cursor() as cur:
+        cur.execute("SELECT v FROM m_settings WHERE k='title'")
+        r = cur.fetchone()
+        TITLE = r["v"] if r and r["v"] else DEFAULT_TITLE
+    try:
+        CHAIN["start"] = float(get_setting("start_ts", NOT_SCHEDULED))
+        CHAIN["blocks"] = max(1, int(float(get_setting("blocks_total", DEFAULT_BLOCKS))))
+    except ValueError:
+        pass
+    CHAIN["done"] = blocks_mined() >= CHAIN["blocks"]
+    with cursor() as cur:
+        cur.execute("SELECT id, ban_reason FROM m_users WHERE banned=1")
+        BANNED.clear()
+        BANNED.update({r["id"]: r["ban_reason"] or "" for r in cur.fetchall()})
+    WEEK_CACHE[1] = None
+    SESS.clear()
+
+
+def restore_data(data):
+    tables = data.get("tables") or {}
+    if "m_users" not in tables:
+        raise ValueError("الملف لا يحتوي على جدول المستخدمين")
+    counts = {}
+    with cursor() as cur:
+        for t in BACKUP_TABLES:
+            if t not in tables:
+                continue
+            cols = _table_cols(cur, t)
+            cur.execute(f"DELETE FROM {t}")
+            rows = tables[t]
+            if t == "m_blocks" and USE_PG:
+                pass
+            if rows:
+                keys = [k for k in rows[0].keys() if k in cols]
+                tuples = [tuple(r.get(k) for k in keys) for r in rows]
+                if USE_PG:
+                    from psycopg2.extras import execute_values
+                    execute_values(cur.cur, f"INSERT INTO {t} ({','.join(keys)}) VALUES %s", tuples, page_size=1000)
+                else:
+                    cur.cur.executemany(f"INSERT INTO {t} ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
+                                        tuples)
+            counts[t] = len(rows)
+        if USE_PG:
+            for t in SERIAL_TABLES:
+                cur.execute(f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                            f"GREATEST(COALESCE((SELECT MAX(id) FROM {t}),0),1))")
+    reload_state()
+    return counts
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backup ← يرسل لك نسخة احتياطية مضغوطة بكل البيانات"""
+    if not _is_admin(update):
+        return
+    await update.message.reply_text("⏳ جاري تجهيز النسخة الاحتياطية...")
+    data, n = await asyncio.to_thread(make_backup)
+    if len(data) > 49 * 1024 * 1024:
+        await update.message.reply_text("⚠️ حجم النسخة أكبر من حد تيليجرام (50MB). تواصل معي لنقسّمها.")
+        return
+    fname = f"backup_{_local(time.time()).strftime('%Y%m%d_%H%M')}.json.gz"
+    await context.bot.send_document(update.effective_chat.id, io.BytesIO(data), filename=fname,
+                                    caption=f"💾 نسخة احتياطية · {n:,} لاعب · {len(data) / 1024:.0f}KB\n"
+                                            "للاسترجاع: أرسل الملف نفسه مع التعليق /restore تأكيد")
+
+
+async def cmd_restore_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await update.message.reply_text(
+        "♻️ <b>الاسترجاع</b>\n\nأرسل ملف النسخة (.json.gz) وفي التعليق اكتب:\n<code>/restore تأكيد</code>\n\n"
+        "⚠️ سيُحذف كل شيء حالي ويُستبدل بمحتوى النسخة. الأفضل تنفيذه في وقت هادئ، وخذ /backup قبله.\n"
+        "(حد تيليجرام لتنزيل الملف 20MB)")
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    cap = (update.message.caption or "").lower()
+    if "تأكيد" not in cap and "تاكيد" not in cap and "confirm" not in cap:
+        await cmd_restore_help(update, context)
+        return
+    doc = update.message.document
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("❌ الملف أكبر من 20MB (حد تنزيل البوتات). تواصل معي لحل بديل.")
+        return
+    await update.message.reply_text("⏳ جاري الاسترجاع...")
+    try:
+        f = await doc.get_file()
+        raw = bytes(await f.download_as_bytearray())
+        try:
+            data = json.loads(gzip.decompress(raw).decode("utf-8"))
+        except OSError:
+            data = json.loads(raw.decode("utf-8"))
+        counts = await asyncio.to_thread(restore_data, data)
+    except Exception as e:
+        log.exception("restore")
+        await update.message.reply_text(f"❌ فشل الاسترجاع (لم يتغير شيء): {html.escape(str(e))[:300]}")
+        return
+    await update.message.reply_text("✅ تم الاسترجاع:\n" + "\n".join(f"• {k}: {v:,}" for k, v in counts.items()))
+
+
+def find_suspects():
+    now = time.time()
+    with cursor() as cur:
+        cur.execute("SELECT referrer AS rid, COUNT(*) AS n, SUM(CASE WHEN mined_secs>=? THEN 1 ELSE 0 END) AS act, "
+                    "SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS recent FROM m_users "
+                    "WHERE referrer IS NOT NULL GROUP BY referrer HAVING COUNT(*)>=10 ORDER BY n DESC LIMIT 200",
+                    (REF_SECS, now - 86400))
+        rows = [dict(rid=r["rid"], n=int(r["n"]), act=int(r["act"] or 0), recent=int(r["recent"] or 0))
+                for r in cur.fetchall()]
+        rows = [r for r in rows if r["recent"] >= 15 or r["act"] * 5 < r["n"]][:15]
+        if rows:
+            cur.execute("SELECT id,name,banned FROM m_users WHERE id IN (" + ",".join("?" * len(rows)) + ")",
+                        tuple(r["rid"] for r in rows))
+            nm = {r["id"]: r for r in cur.fetchall()}
+            for r in rows:
+                r["name"] = (nm.get(r["rid"]) or {}).get("name") or "—"
+                r["banned"] = bool((nm.get(r["rid"]) or {}).get("banned"))
+    return rows
+
+
+async def cmd_suspects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/suspects ← مُحيلون مشتبه بهم (إحالات كثيرة جديدة، أو معظم مُحاليهم لم يعدّنوا)"""
+    if not _is_admin(update):
+        return
+    rows = await asyncio.to_thread(find_suspects)
+    if not rows:
+        await update.message.reply_text("✅ لا يوجد مشتبه بهم حالياً.")
+        return
+    await update.message.reply_text("⚠️ <b>مُحيلون مشتبه بهم</b>\n(10+ إحالات، وأقل من 20% منهم عدّن ساعة، أو 15+ جديدة خلال 24 ساعة)\n\n"
+        + "\n\n".join(f"👤 {html.escape(r['name'])} · <code>{r['rid']}</code>{' · ⛔ محظور' if r['banned'] else ''}\n"
+                      f"   مُحالون: {r['n']} · نشطون فعلاً: {r['act']} · جدد 24س: {r['recent']}\n"
+                      + ("" if r["banned"] else f"   <code>/ban {r['rid']} إحالات وهمية</code>") for r in rows))
+
+
+def _delta(a, b):
+    d = a - b
+    return "—" if d == 0 else (f"▲ +{d:,}" if d > 0 else f"▼ {d:,}")
+
+
+def build_daily():
+    now = time.time()
+    off = TZ_OFFSET * 3600
+    t0 = ((now + off) // 86400) * 86400 - off          # بداية اليوم الحالي
+    y0, p0 = t0 - 86400, t0 - 2 * 86400                # أمس · أول أمس
+    with cursor() as cur:
+        def one(sql, p=()):
+            cur.execute(sql, p)
+            return cur.fetchone()
+        new_y = one("SELECT COUNT(*) AS n FROM m_users WHERE created_at>=? AND created_at<?", (y0, t0))["n"]
+        new_p = one("SELECT COUNT(*) AS n FROM m_users WHERE created_at>=? AND created_at<?", (p0, y0))["n"]
+        pay_y = one("SELECT COUNT(*) AS n, COALESCE(SUM(stars),0) AS s FROM m_payments WHERE refunded=0 AND "
+                    "created_at>=? AND created_at<?", (y0, t0))
+        pay_p = one("SELECT COUNT(*) AS n, COALESCE(SUM(stars),0) AS s FROM m_payments WHERE refunded=0 AND "
+                    "created_at>=? AND created_at<?", (p0, y0))
+        cur.execute("SELECT item, COUNT(*) AS n, SUM(stars) AS s FROM m_payments WHERE refunded=0 AND created_at>=? "
+                    "AND created_at<? GROUP BY item ORDER BY s DESC LIMIT 5", (y0, t0))
+        items = cur.fetchall()
+        mining = one("SELECT COUNT(*) AS n, COALESCE(SUM(hr),0) AS h FROM m_users WHERE " + SQL_ACTIVE, (now,))
+        a24 = one("SELECT COUNT(*) AS n FROM m_users WHERE last_tick>=?", (now - 86400,))["n"]
+        tot = one("SELECT COUNT(*) AS n, SUM(CASE WHEN banned=1 THEN 1 ELSE 0 END) AS b FROM m_users")
+        payers = one("SELECT COUNT(DISTINCT user_id) AS n FROM m_payments WHERE refunded=0")["n"]
+        cur.execute("SELECT name,total-week_base AS w FROM m_users WHERE banned=0 AND total-week_base>0 "
+                    "ORDER BY w DESC LIMIT 3")
+        top = cur.fetchall()
+    I = lambda x: int(x or 0)
+    sus = len(find_suspects())
+    day = _local(y0 + 3600).strftime("%d.%m.%Y")
+    L = [f"🌅 <b>تقرير يوم {day}</b>", "",
+         f"👥 لاعبون جدد: <b>{I(new_y):,}</b>  ({_delta(I(new_y), I(new_p))} عن اليوم السابق)",
+         f"⭐ إيراد النجوم: <b>{I(pay_y['s']):,}</b> من {I(pay_y['n'])} عملية  ({_delta(I(pay_y['s']), I(pay_p['s']))})"]
+    if items:
+        L.append("   " + " · ".join(f"{html.escape(r['item'])} {I(r['s']):,}⭐" for r in items))
+    L += ["", f"⛏ معدّنون نشطون الآن: <b>{I(mining['n']):,}</b> · هاش الشبكة {float(mining['h']):,.0f}",
+          f"🟢 نشطون آخر 24 ساعة: {I(a24):,}",
+          f"📊 الإجمالي: {I(tot['n']):,} لاعب · دافعون {I(payers):,} · محظورون {I(tot['b']):,}"]
+    if sus:
+        L.append(f"⚠️ مُحيلون مشتبه بهم: <b>{sus}</b> ← /suspects")
+    if top:
+        L += ["", "🏆 صدارة الأسبوع: " + " · ".join(f"{html.escape(r['name'] or '—')} ({float(r['w']):,.0f})" for r in top)]
+    return "\n".join(L)
+
+
+async def _send_daily(bot, with_backup=True):
+    await bot.send_message(ADMIN_ID, await asyncio.to_thread(build_daily))
+    if with_backup and DAILY_BACKUP:
+        data, n = await asyncio.to_thread(make_backup)
+        if len(data) <= 49 * 1024 * 1024:
+            await bot.send_document(ADMIN_ID, io.BytesIO(data),
+                                    filename=f"backup_{_local(time.time()).strftime('%Y%m%d')}.json.gz",
+                                    caption=f"💾 نسخة احتياطية يومية · {n:,} لاعب")
+        else:
+            await bot.send_message(ADMIN_ID, "⚠️ النسخة الاحتياطية أكبر من 50MB ولم تُرسل.")
+
+
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/daily ← يعرض تقرير أمس الآن (بدون نسخة احتياطية)"""
+    if not _is_admin(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(build_daily))
+
+
+async def daily_loop():
+    """كل يوم في الساعة DAILY_REPORT_TIME: تقرير + نسخة احتياطية للأدمن."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if not ADMIN_ID:
+                continue
+            lt = _local(time.time())
+            today, cm = lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute
+            if 0 <= cm - DAILY_MIN <= 120:
+                if await asyncio.to_thread(get_setting, "daily_last") != today:
+                    await asyncio.to_thread(set_setting, "daily_last", today)
+                    await _send_daily(MAIN_APP.bot)
+        except Exception:
+            log.exception("daily loop")
+
+
 async def post_init(app: Application):
     global MAIN_APP
     MAIN_APP = app
@@ -2265,7 +2531,11 @@ async def post_init(app: Application):
                                       BotCommand("weekly", "🏆 الترتيب الأسبوعي"),
                                       BotCommand("weeksend", "🎉 تهنئة أفضل 100 أسبوعياً"),
                                       BotCommand("addsched", "⏰ جدولة رسالة يومية"),
-                                      BotCommand("schedules", "📋 الرسائل المجدولة")]
+                                      BotCommand("schedules", "📋 الرسائل المجدولة"),
+                                      BotCommand("daily", "🌅 تقرير أمس"),
+                                      BotCommand("backup", "💾 نسخة احتياطية"),
+                                      BotCommand("restore", "♻️ استرجاع نسخة"),
+                                      BotCommand("suspects", "⚠️ مُحيلون مشتبه بهم")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -2276,6 +2546,7 @@ async def post_init(app: Application):
     BG.append(asyncio.create_task(settle_loop()))
     BG.append(asyncio.create_task(week_loop()))
     BG.append(asyncio.create_task(sched_loop()))
+    BG.append(asyncio.create_task(daily_loop()))
     if ADMIN_ID:
         try:
             await app.bot.send_message(ADMIN_ID, f"✅ البوت يعمل.\n🗄 {'PostgreSQL' if USE_PG else 'SQLite'}\n"
@@ -2597,6 +2868,7 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 <div class="nav" id="nav"></div><div id="sh"></div><div id="toast"></div>
 <script>
 const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
+const SID=(()=>{try{const a=new Uint8Array(8);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return String(Math.random()).slice(2)+Date.now()}})();let SESSNEW=true;
 try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
 function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
 let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
@@ -2615,9 +2887,11 @@ const av=n=>{let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;retur
 function toast(m){if(!m)return;const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
 async function api(p,b){
   if(BANNED)throw new Error('');
-  const r=await fetch('/api/'+p,{method:b===undefined?'GET':'POST',headers:{'X-Init-Data':tg.initData,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
+  const r=await fetch('/api/'+p,{method:b===undefined?'GET':'POST',headers:{'X-Init-Data':tg.initData,'X-Session':SID,'X-Sess-New':SESSNEW?'1':'0','Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
   if(!r.ok)throw new Error('HTTP '+r.status);
   const j=await r.json();if(j.banned){showBan(j.reason||'');throw new Error('')}
+  if(j.kicked){showLock('kicked');throw new Error('')}
+  SESSNEW=false;
   if(!j.ok)throw new Error(j.error||'خطأ');return j}
 async function load(){
   const jobs=[api('me')];
@@ -2728,15 +3002,21 @@ function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN 
   <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
   <button class="pri" onclick="openSheet('energy')">⚡ احصل على طاقة</button></div>`}
 
-function showBan(reason){if(BANNED)return;BANNED=true;sheet=null;try{tg.BackButton.hide()}catch(e){}
+const LOCKS={ban:{tag:'ACCOUNT · BANNED',foot:'banned',title:'تم حظر حسابك',
+  desc:'تم إيقاف هذا الحساب بسبب مخالفة قواعد اللعبة، ولم يعد بإمكانك استخدام التطبيق.'},
+ kicked:{tag:'SESSION · KICKED',foot:'kicked',title:'تم اكتشاف جلسات متعددة',
+  desc:'سجّل الدخول إلى التطبيق من جهاز واحد فقط. تم فصل هذه الجلسة لأن جهازاً آخر فتح التطبيق.'}};
+function showLock(kind,reason){if(BANNED)return;BANNED=true;sheet=null;try{tg.BackButton.hide()}catch(e){}
+  const K=LOCKS[kind]||LOCKS.ban;
   const d=document.createElement('div');d.className='bnx';d.id='bn';
   d.innerHTML=`<div class="bnc"><i class="bk1"></i><i class="bk2"></i><i class="bk3"></i><i class="bk4"></i>
-  <div class="bnt"><span><i class="bnd"></i>ACCOUNT · BANNED</span><span class="bnf">fail</span></div>
-  <div class="bnb"><span class="bni">${ic('logout',24)}</span><h2>تم حظر حسابك</h2>
-  <p>تم إيقاف هذا الحساب بسبب مخالفة قواعد اللعبة، ولم يعد بإمكانك استخدام التطبيق.${reason?'<br><b>السبب:</b> '+esc(reason):''}</p>
+  <div class="bnt"><span><i class="bnd"></i>${K.tag}</span><span class="bnf">fail</span></div>
+  <div class="bnb"><span class="bni">${ic('logout',24)}</span><h2>${K.title}</h2>
+  <p>${K.desc}${reason?'<br><b>السبب:</b> '+esc(reason):''}</p>
   <button class="pri bnbtn" onclick="try{tg.close()}catch(e){}">إغلاق هذه النافذة ${ic('x',13)}</button></div>
-  <div class="bnt bnl"><span>TRACE</span><span>banned</span></div></div>`;
+  <div class="bnt bnl"><span>TRACE</span><span>${K.foot}</span></div></div>`;
   document.body.appendChild(d)}
+function showBan(reason){showLock('ban',reason)}
 function dparts(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
   return [p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear(),p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())]}
 function openBlk(i){BK=B[i];openSheet('blk')}
@@ -2807,7 +3087,7 @@ function vRefs(){
     <div class="lk"><span>${esc(link)}</span><button class="cp" onclick="navigator.clipboard.writeText(S.ref_link).then(()=>toast('تم النسخ'))">${ic('copy',17)}</button></div>
     <button class="inv" onclick="tg.openTelegramLink('https://t.me/share/url?url='+encodeURIComponent(S.ref_link)+'&text='+encodeURIComponent('⛏ تعال نعدّن معاً!'))">${ic('send',16)}دعوة</button></div>
   <div class="stc bn"><div class="bnr"><span class="stic or big">${ic('spark',18)}</span><div><span class="mlb cap2"><i class="dot"></i>قاعدة المكافأة</span><div class="bt">احصل على +${fi(S.ref_energy)} طاقة قصوى</div></div></div>
-    <p class="bd">تحصل على +${fi(S.ref_energy)} طاقة قصوى عن كل مُحال يملك حالياً أكثر من ${fi(S.ref_min)} نقطة. مباشرةً: إذا نزل رصيده تحت ${fi(S.ref_min)} تُسحب هذه الـ+${fi(S.ref_energy)}.</p></div>
+    <p class="bd">تحصل على +${fi(S.ref_energy)} طاقة قصوى عن كل مُحال يعدّن ${fi(S.ref_hours)} ساعة فعلية على الأقل (حتى ${fi(S.ref_max)} مُحال). المُحالون النشطون حالياً: <b style="color:var(--tx)">${fi(S.ref_active)}</b> / ${fi(S.ref_max)}. الإحالات الوهمية لا تُحتسب.</p></div>
   <div class="stc"><div class="sth lbh"><div><div class="lbt">أفضل 100 إحالة</div><div class="lbs">لوحة الصدارة</div></div><span class="lbn">${String(L.length).padStart(3,'0')}</span></div>${rows}</div>`}
 function vTasks(){
   const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000'];
@@ -3018,6 +3298,11 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("bans", cmd_bans))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("restore", cmd_restore_help))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"^/restore"), cmd_restore))
+    app.add_handler(CommandHandler("suspects", cmd_suspects))
+    app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("addsched", cmd_addsched))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("delsched", cmd_delsched))
