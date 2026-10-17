@@ -796,12 +796,12 @@ def redeem_code(tg, code):
 MAIN_APP, WEB_RUNNER, BG = None, None, []
 
 
-def verify_init_data(init_data, max_age=86400):
+def verify_init_data(init_data, max_age=86400, token=None):
     try:
         d = dict(parse_qsl(init_data, keep_blank_values=True))
         got = d.pop("hash", "")
         check = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        secret = hmac.new(b"WebAppData", (token or BOT_TOKEN).encode(), hashlib.sha256).digest()
         if not got or not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), got):
             return None
         if time.time() - int(d.get("auth_date", "0")) > max_age:
@@ -3247,7 +3247,7 @@ def _list_stories(n):
 
 def _total_stories():
     with ENV["cursor"]() as cur:
-        cur.execute("SELECT COUNT(*) AS n, SUM(CASE WHEN source='web' THEN 1 ELSE 0 END) AS w, "
+        cur.execute("SELECT COUNT(*) AS n, SUM(CASE WHEN source<>'bot' THEN 1 ELSE 0 END) AS w, "
                     "SUM(CASE WHEN public=1 THEN 1 ELSE 0 END) AS p, SUM(CASE WHEN anon=1 THEN 1 ELSE 0 END) AS a "
                     "FROM s_stories")
         return cur.fetchone()
@@ -3319,8 +3319,16 @@ async def _notify_admin(sid, kind, text, who, consent, src, can_reply):
 
 
 # ───────── بوت الحكايات (واجهة المستخدمين) ─────────
+def _story_url():
+    return f"{WEBAPP_URL}/?v={int(time.time())}" if WEBAPP_URL else ""   # v يمنع كاش تيليجرام للصفحة القديمة
+
+
 def _kinds_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton(v[0], callback_data=f"k:{k}")] for k, v in KINDS.items()])
+    rows = []
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton("🌐 افتح التطبيق", web_app=WebAppInfo(url=_story_url()))])
+    rows += [[InlineKeyboardButton(v[0], callback_data=f"k:{k}")] for k, v in KINDS.items()]
+    return InlineKeyboardMarkup(rows)
 
 
 def _opts_kb(anon, consent):
@@ -3432,6 +3440,12 @@ async def start_story(token):
             pass
         raise
     STORY_APP = app
+    if WEBAPP_URL:                                   # زر القائمة بجانب خانة الكتابة يفتح الموقع كتطبيق مصغّر
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="🌐 احكِ حكايتك", web_app=WebAppInfo(url=_story_url())))
+        except Exception as e:
+            slog.warning("story menu button failed: %s", e)
     return app.bot.username
 
 
@@ -3482,15 +3496,30 @@ async def story_send(request):
     if len(text) > MAX_LEN:
         return web.json_response({"ok": False, "error": f"النص طويل جداً (الحد {MAX_LEN} حرف)"})
     consent = bool(b.get("consent"))
-    name = " ".join(str(b.get("name") or "").split())[:40]
-    anon = bool(b.get("anon")) or not name
+    tgu = None                                       # مستخدم تيليجرام موثّق (إن فُتح الموقع من داخل البوت)
+    init = request.headers.get("X-Init-Data", "")
+    if init and STORY_APP:
+        tgu = verify_init_data(init, token=STORY_APP.bot.token)
+    anon = bool(b.get("anon"))
+    if tgu:
+        name = "" if anon else tgu["name"][:40]
+    else:
+        name = " ".join(str(b.get("name") or "").split())[:40]
+        anon = anon or not name
     if anon:
         name = ""
     if not _rate_ok(_client_ip(request)):
         return web.json_response({"ok": False, "error": "مهلاً ⏳ انتظر قليلاً قبل إرسال حكاية جديدة"})
-    sid = await asyncio.to_thread(_save_story, 0, name, "", kind, text, anon, consent, "web")
-    await _notify_admin(sid, kind, text, "🕶 مجهول" if anon else html.escape(name) + " (من الموقع، بلا حساب)",
-                        consent, "🌐 الموقع", False)
+    named_tg = bool(tgu) and not anon
+    uid, uname = (tgu["id"], tgu["username"]) if named_tg else (0, "")
+    sid = await asyncio.to_thread(_save_story, uid, name, uname, kind, text, anon, consent, "app" if tgu else "web")
+    if anon:
+        who = "🕶 مجهول"
+    elif named_tg:
+        who = html.escape(name) + (f" @{html.escape(uname)}" if uname else "") + f" · <code>{uid}</code>"
+    else:
+        who = html.escape(name) + " (من الموقع، بلا حساب)"
+    await _notify_admin(sid, kind, text, who, consent, "📱 التطبيق" if tgu else "🌐 الموقع", named_tg)
     return web.json_response({"ok": True})
 
 
@@ -3528,7 +3557,7 @@ async def cmd_setstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await asyncio.to_thread(ENV["set_setting"], "story_token", token)
     await wait.edit_text(f"✅ تم ربط بوت الحكايات: @{html.escape(uname)}\n"
-                         "🔒 حُذفت رسالتك التي فيها التوكن.\n\nجرّبه الآن بإرسال /start له."
+                         "🔒 حُذفت رسالتك التي فيها التوكن.\n\nجرّبه الآن بإرسال /start له: سيظهر زر «🌐 افتح التطبيق» وزر القائمة بجانب خانة الكتابة."
                          + (f"\n🌐 الموقع: {WEBAPP_URL}/" if WEBAPP_URL else ""))
 
 
@@ -3569,7 +3598,7 @@ async def cmd_stories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     out = ["📚 <b>آخر الحكايات</b>", ""]
     for r in rows:
-        flags = ("✅" if r["replied"] else "") + ("🌍" if r["public"] else "") + ("🌐" if r["source"] == "web" else "")
+        flags = ("✅" if r["replied"] else "") + ("🌍" if r["public"] else "") + ("🌐" if r["source"] != "bot" else "")
         out.append(f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> {flags} · {_who(r)}\n   {_preview(r)}\n   /story {r['id']}")
     await update.message.reply_text("\n".join(out))
 
@@ -3587,7 +3616,7 @@ async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     when = time.strftime("%Y-%m-%d %H:%M", time.gmtime((r["created_at"] or 0) + 3600))
     st = ("🌍 منشورة" if r["public"] else ("موافق على النشر: <code>/publish %d</code>" % r["id"] if r["consent"] else "غير مسموح بنشرها"))
     await update.message.reply_text(
-        f"{KIND_ICON.get(r['kind'], '📖')} <b>{KIND_NAME.get(r['kind'], r['kind'])} #{r['id']}</b> · {'🌐 الموقع' if r['source'] == 'web' else '🤖 البوت'}\n"
+        f"{KIND_ICON.get(r['kind'], '📖')} <b>{KIND_NAME.get(r['kind'], r['kind'])} #{r['id']}</b> · {'🌐 الموقع/التطبيق' if r['source'] != 'bot' else '🤖 البوت'}\n"
         f"👤 {_who(r)}\n🕒 {when}\n{st}\n\n{html.escape(r['text'])}\n\n"
         + ("للرد: <code>/storyreply %d نص الرد</code>" % r["id"] if r["user_id"] else "🕶 لا يمكن الرد"))
 
@@ -3713,6 +3742,7 @@ STORY_HTML = r"""<!doctype html>
 <meta name="description" content="مساحة هادئة لتحكي حلمك أو حكايتك أو اعترافك، باسمك أو كمجهول.">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{--bg:#0a0e1f;--glass:#ffffff0d;--line:#ffffff1f;--tx:#eef0ff;--mut:#9aa3c7;--gold:#ffc46b;--pink:#ff7eb6;--vio:#8b7bff;--grn:#4ee3a8}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -3807,6 +3837,8 @@ footer{text-align:center;color:var(--mut);font-size:12.5px;margin-top:34px}
 </div>
 <script>
 const BOT="__BOT__";
+const TGW=window.Telegram&&window.Telegram.WebApp,INIT=(TGW&&TGW.initData)||'',TGU=INIT&&TGW.initDataUnsafe&&TGW.initDataUnsafe.user;
+if(INIT){try{TGW.ready();TGW.expand();TGW.setHeaderColor('#0a0e1f');TGW.setBackgroundColor('#0a0e1f')}catch(e){}}
 const $=id=>document.getElementById(id);
 const KINDS={dream:['🌙','حلم وأهداف','احكيلي عن حلمك وأهدافك في هذه الحياة…'],story:['📖','حكاية','احكيلي حكايتك… ابدأ من حيث تشاء.'],confess:['🤫','اعتراف','اعترف لي بشيء لم تقله لأحد…']};
 let kind='dream',anon=true,consent=false,busy=false;
@@ -3820,15 +3852,16 @@ let kind='dream',anon=true,consent=false,busy=false;
  (function t(){const s=P[i];if(!d){j++;e.textContent=s.slice(0,j);if(j===s.length){d=true;return setTimeout(t,1800)}}else{j--;e.textContent=s.slice(0,j);if(j===0){d=false;i=(i+1)%P.length}}setTimeout(t,d?28:70)})()})();
 function setKind(k){kind=k;document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.dataset.k===k));$('ql').textContent=KINDS[k][2]}
 document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>setKind(c.dataset.k));setKind('dream');
-$('oa').onclick=()=>{anon=!anon;$('sa').classList.toggle('on',anon);$('nameRow').classList.toggle('hide',anon)};
+function hint(){if(TGU)$('oa').querySelector('small').textContent=anon?'لا يُحفظ اسمك ولا حسابك نهائياً.':'سيصل باسمك في تيليجرام، ويمكنني الرد عليك هناك.'}
+$('oa').onclick=()=>{anon=!anon;$('sa').classList.toggle('on',anon);$('nameRow').classList.toggle('hide',anon||!!TGU);hint()};hint();
 $('oc').onclick=()=>{consent=!consent;$('sc').classList.toggle('on',consent)};
 $('tx').oninput=()=>{$('cn').textContent=$('tx').value.length};
-if(BOT){const a=$('tg');a.href='https://t.me/'+BOT;a.style.display='flex'}
+if(BOT&&!INIT){const a=$('tg');a.href='https://t.me/'+BOT;a.style.display='flex'}
 $('go').onclick=async()=>{
  if(busy)return;const text=$('tx').value.trim();$('er').textContent='';
  if(text.length<5){$('er').textContent='اكتب شيئاً أطول قليلاً ✍️';return}
  busy=true;$('go').disabled=true;$('go').textContent='جاري الإرسال…';
- try{const r=await fetch('/sapi/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,text,anon,consent,name:$('nm').value,hp:$('hp').value})});
+ try{const r=await fetch('/sapi/send',{method:'POST',headers:{'Content-Type':'application/json','X-Init-Data':INIT},body:JSON.stringify({kind,text,anon,consent,name:$('nm').value,hp:$('hp').value})});
   const j=await r.json();
   if(j.ok){$('formv').style.display='none';$('donev').style.display='block';
    $('dm').textContent=(anon?'وصلت بدون أي اسم 🕶 ':'')+'شكراً لأنك شاركتني إياها.'+(consent?' ستُنشر في الجدار إن وافقت الإدارة.':'');
