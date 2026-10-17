@@ -44,7 +44,8 @@ from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, Labele
                       WebAppInfo, MenuButtonWebApp, BotCommand, BotCommandScopeChat)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CommandHandler, MessageHandler, PreCheckoutQueryHandler,
-                          ConversationHandler, ContextTypes, Defaults, filters)
+                          ConversationHandler, ContextTypes, Defaults, CallbackQueryHandler, filters)
+from telegram.error import BadRequest, RetryAfter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", stream=sys.stdout)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -134,6 +135,7 @@ CHAIN = dict(start=NOT_SCHEDULED, blocks=DEFAULT_BLOCKS, done=False)  # يضبط
 DEFAULT_TITLE = "TotalHash"   # عنوان المقدمة الافتراضي (يتغير بالأمر /settitle)
 TITLE = DEFAULT_TITLE
 SQL_ACTIVE = "mining=1 AND energy-(?-last_tick)>1"
+BANNED = {}             # المحظورون: {id: السبب} (تُحمَّل من قاعدة البيانات عند التشغيل)
 
 
 # ═══════════ 2) قاعدة البيانات (PostgreSQL، وإلا SQLite) ═══════════
@@ -264,7 +266,9 @@ def init_db():
                          ("wins", "INT NOT NULL DEFAULT 0"),
                          ("income", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                          ("patron", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
-                         ("modes", "TEXT NOT NULL DEFAULT '1'")])
+                         ("modes", "TEXT NOT NULL DEFAULT '1'"),
+                         ("banned", "INT NOT NULL DEFAULT 0"),
+                         ("ban_reason", "TEXT NOT NULL DEFAULT ''")])
     add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                           ("bhash", "TEXT NOT NULL DEFAULT ''"),
                           ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -291,6 +295,10 @@ def init_db():
     except ValueError:
         CHAIN["blocks"] = DEFAULT_BLOCKS
     CHAIN["done"] = blocks_mined() >= CHAIN["blocks"]
+    with cursor() as cur:
+        cur.execute("SELECT id, ban_reason FROM m_users WHERE banned=1")
+        BANNED.clear()
+        BANNED.update({r["id"]: r["ban_reason"] or "" for r in cur.fetchall()})
     log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
 
 
@@ -891,13 +899,13 @@ def act_blocks(tg, b):
 
 def act_top(tg, b):
     with cursor() as cur:
-        cur.execute("SELECT id,name,level,total,mode FROM m_users WHERE total>0 ORDER BY total DESC LIMIT 100")
+        cur.execute("SELECT id,name,level,total,mode FROM m_users WHERE total>0 AND banned=0 ORDER BY total DESC LIMIT 100")
         rows = cur.fetchall()
         cur.execute("SELECT name,level,total,mode FROM m_users WHERE id=?", (tg["id"],))
         me = cur.fetchone() or dict(name=tg["name"], level=1, total=0, mode=1)
-        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>?", (me["total"],))
+        cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE total>? AND banned=0", (me["total"],))
         rank = cur.fetchone()["r"]
-        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE total>0")
+        cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE total>0 AND banned=0")
         holders = cur.fetchone()["n"]
     mined = blocks_mined()
     return {"top": [dict(name=r["name"], level=r["level"], total=r["total"], tier=tier(r["mode"]),
@@ -991,6 +999,8 @@ async def web_api(request):
     tg = verify_init_data(request.headers.get("X-Init-Data", ""))
     if not tg:
         raise web.HTTPUnauthorized()
+    if tg["id"] in BANNED:
+        return web.json_response({"ok": False, "banned": True, "reason": BANNED[tg["id"]]})
     body = {}
     if request.method == "POST":
         try:
@@ -1075,7 +1085,8 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount_ok = 1 <= q.total_amount <= SUPPORT_MAX
         else:
             amount_ok = key in ITEMS and q.total_amount == ITEMS[key]["stars"]
-        ok = key in ITEMS and int(uid) == q.from_user.id and q.currency == "XTR" and amount_ok
+        ok = (key in ITEMS and int(uid) == q.from_user.id and q.currency == "XTR" and amount_ok
+              and q.from_user.id not in BANNED)
     except Exception:
         ok = False
     await q.answer(ok=ok, error_message=None if ok else "بيانات الدفع غير صحيحة")
@@ -1388,6 +1399,7 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("DELETE FROM sqlite_sequence WHERE name='m_blocks'")
         set_setting("start_ts", NOT_SCHEDULED)
         CHAIN["start"], CHAIN["done"] = NOT_SCHEDULED, False
+        BANNED.clear()
     await asyncio.to_thread(wipe)
     await update.message.reply_text(
         "🗑 تم حذف كل شيء. اللعبة الآن في حالة «لم تبدأ».\n\nلتحديد الموعد: <code>/setstart 12.00 11.11.2026</code>\n"
@@ -1474,12 +1486,263 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("الاستعمال: <code>/redeem CODE</code>")
         return
     u = update.effective_user
+    if u.id in BANNED:
+        await update.message.reply_text("⛔ تم حظر حسابك.")
+        return
     tg = dict(id=u.id, name=u.full_name, username=u.username or "", ref=None)
     try:
         msg = await asyncio.to_thread(redeem_code, tg, context.args[0])
         await update.message.reply_text("✅ " + msg)
     except Err as e:
         await update.message.reply_text("❌ " + html.escape(str(e)))
+
+
+# ═══════════ 5.1) الحظر · البث · لوحة الإحصائيات (للأدمن) ═══════════
+def _is_admin(update):
+    return bool(ADMIN_ID) and update.effective_user and update.effective_user.id == ADMIN_ID
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ban <id> [السبب]  ← يحظر المستخدم؛ تظهر له نافذة الحظر في التطبيق"""
+    if not _is_admin(update):
+        return
+    a = context.args
+    if not a or not a[0].isdigit():
+        await update.message.reply_text("الاستعمال:\n<code>/ban 123456789 سبب الحظر</code>\n"
+                                        "لإلغاء الحظر: <code>/unban 123456789</code> · القائمة: /bans")
+        return
+    uid = int(a[0])
+    if uid == ADMIN_ID:
+        await update.message.reply_text("❌ لا يمكنك حظر نفسك.")
+        return
+    reason = " ".join(a[1:])[:200]
+
+    def work():
+        with cursor() as cur:
+            cur.execute("UPDATE m_users SET banned=1, ban_reason=?, mining=0 WHERE id=?", (reason, uid))
+            if cur.rowcount != 1:
+                return None
+            cur.execute("SELECT name FROM m_users WHERE id=?", (uid,))
+            return (cur.fetchone() or {}).get("name") or "—"
+    name = await asyncio.to_thread(work)
+    if name is None:
+        await update.message.reply_text("❌ المستخدم غير موجود في القاعدة (لم يفتح اللعبة بعد).")
+        return
+    BANNED[uid] = reason
+    await update.message.reply_text(f"⛔ تم حظر {html.escape(name)} (<code>{uid}</code>)"
+                                    + (f"\nالسبب: {html.escape(reason)}" if reason else "")
+                                    + f"\n\nلإلغاء الحظر: <code>/unban {uid}</code>")
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unban <id>  ← يلغي الحظر"""
+    if not _is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/unban 123456789</code>")
+        return
+    uid = int(context.args[0])
+
+    def work():
+        with cursor() as cur:
+            cur.execute("UPDATE m_users SET banned=0, ban_reason='' WHERE id=?", (uid,))
+            return cur.rowcount
+    n = await asyncio.to_thread(work)
+    BANNED.pop(uid, None)
+    await update.message.reply_text(f"✅ تم إلغاء حظر <code>{uid}</code>" if n else "❌ المستخدم غير موجود.")
+
+
+async def cmd_bans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bans  ← قائمة المحظورين"""
+    if not _is_admin(update):
+        return
+
+    def rows():
+        with cursor() as cur:
+            cur.execute("SELECT id,name,ban_reason FROM m_users WHERE banned=1 ORDER BY id LIMIT 50")
+            return cur.fetchall()
+    rs = await asyncio.to_thread(rows)
+    if not rs:
+        await update.message.reply_text("لا يوجد محظورون.")
+        return
+    await update.message.reply_text("⛔ <b>المحظورون</b>\n\n" + "\n".join(
+        f"• {html.escape(r['name'] or '—')} · <code>{r['id']}</code>"
+        + (f" · {html.escape(r['ban_reason'])}" if r["ban_reason"] else "")
+        + f"\n   <code>/unban {r['id']}</code>" for r in rs))
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <الرسالة>  ← معاينة ثم /bcconfirm للإرسال لكل اللاعبين"""
+    if not _is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "📢 <b>البث</b>\n\nاكتب الرسالة بعد الأمر:\n<code>/broadcast نص الرسالة هنا</code>\n\n"
+            "ستظهر لك معاينة، ثم أرسل /bcconfirm للإرسال أو /bccancel للإلغاء.\n"
+            "(يدعم التنسيق: عريض، مائل، روابط…)")
+        return
+    txt = parts[1].strip()
+    context.bot_data["bc"] = txt
+
+    def count():
+        with cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE banned=0")
+            return cur.fetchone()["n"]
+    n = await asyncio.to_thread(count)
+    try:
+        await update.message.reply_text(f"📢 <b>معاينة الرسالة:</b>\n\n{txt}")
+    except Exception as e:
+        context.bot_data.pop("bc", None)
+        await update.message.reply_text(f"❌ تعذّر عرض الرسالة: {html.escape(str(e))}")
+        return
+    await update.message.reply_text(f"👥 عدد المستلمين: <b>{n:,}</b>\n\nللتأكيد: /bcconfirm\nللإلغاء: /bccancel")
+
+
+async def cmd_bccancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    context.bot_data.pop("bc", None)
+    await update.message.reply_text("تم إلغاء البث.")
+
+
+async def _broadcast(bot, txt, ids, admin_chat):
+    sent = failed = 0
+    kb = (InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=APP_URL))]])
+          if WEBAPP_URL else None)
+    for uid in ids:
+        for attempt in range(2):
+            try:
+                await bot.send_message(uid, txt, reply_markup=kb)
+                sent += 1
+                break
+            except RetryAfter as e:
+                ra = e.retry_after
+                ra = ra.total_seconds() if hasattr(ra, "total_seconds") else ra
+                await asyncio.sleep(float(ra) + 1)
+            except Exception:
+                failed += 1
+                break
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)           # ~20 رسالة/ثانية (الحد المسموح 30)
+    try:
+        await bot.send_message(admin_chat, f"✅ انتهى البث\n📨 وصلت: <b>{sent:,}</b>\n🚫 فشلت (حظروا البوت أو غيره): {failed:,}")
+    except Exception:
+        pass
+
+
+async def cmd_bcconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    txt = context.bot_data.pop("bc", None)
+    if not txt:
+        await update.message.reply_text("لا توجد رسالة معلّقة. استخدم /broadcast أولاً.")
+        return
+
+    def ids():
+        with cursor() as cur:
+            cur.execute("SELECT id FROM m_users WHERE banned=0 ORDER BY id")
+            return [r["id"] for r in cur.fetchall()]
+    lst = await asyncio.to_thread(ids)
+    await update.message.reply_text(f"🚀 بدأ الإرسال إلى {len(lst):,} مستخدم... سأبلغك عند الانتهاء.")
+    BG.append(asyncio.create_task(_broadcast(context.bot, txt, lst, update.effective_chat.id)))
+
+
+def build_stats():
+    now = time.time()
+    off = TZ_OFFSET * 3600
+    today = ((now + off) // 86400) * 86400 - off
+    week = now - 7 * 86400
+    with cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(balance),0) AS bal, COALESCE(SUM(total),0) AS tot,"
+                    " SUM(CASE WHEN permit=1 THEN 1 ELSE 0 END) AS permits,"
+                    " SUM(CASE WHEN banned=1 THEN 1 ELSE 0 END) AS bans,"
+                    " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS new_today,"
+                    " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS new_week,"
+                    " SUM(CASE WHEN last_tick>=? THEN 1 ELSE 0 END) AS a1h,"
+                    " SUM(CASE WHEN last_tick>=? THEN 1 ELSE 0 END) AS a24,"
+                    " SUM(CASE WHEN referrer IS NOT NULL THEN 1 ELSE 0 END) AS reffed FROM m_users",
+                    (today, week, now - 3600, now - 86400))
+        u = cur.fetchone()
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(hr),0) AS h FROM m_users WHERE " + SQL_ACTIVE, (now,))
+        act = cur.fetchone()
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(stars),0) AS s, COUNT(DISTINCT user_id) AS payers "
+                    "FROM m_payments WHERE refunded=0")
+        pay = cur.fetchone()
+        cur.execute("SELECT COALESCE(SUM(stars),0) AS s FROM m_payments WHERE refunded=0 AND created_at>=?", (today,))
+        pay_today = cur.fetchone()["s"]
+        cur.execute("SELECT COALESCE(SUM(stars),0) AS s FROM m_payments WHERE refunded=0 AND created_at>=?", (week,))
+        pay_week = cur.fetchone()["s"]
+        cur.execute("SELECT COALESCE(SUM(stars),0) AS s FROM m_payments WHERE refunded=1")
+        refunded = cur.fetchone()["s"]
+        cur.execute("SELECT item, COUNT(*) AS n, SUM(stars) AS s FROM m_payments WHERE refunded=0 "
+                    "GROUP BY item ORDER BY s DESC LIMIT 6")
+        items = cur.fetchall()
+        cur.execute("SELECT COUNT(*) AS n FROM m_servers WHERE expires=0")
+        servers = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM m_codes")
+        codes = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM m_redeems")
+        redeems = cur.fetchone()["n"]
+        cur.execute("SELECT name,level,total FROM m_users WHERE banned=0 ORDER BY total DESC LIMIT 5")
+        top = cur.fetchall()
+    mined = blocks_mined()
+    I = lambda x: int(x or 0)
+    st = "🏁 اكتملت" if CHAIN["done"] else ("⏳ لم تبدأ" if now < CHAIN["start"] else "✅ تعمل")
+    lines = [
+        "📊 <b>لوحة الإحصائيات</b>",
+        "",
+        "👥 <b>اللاعبون</b>",
+        f"• الإجمالي: <b>{I(u['n']):,}</b> (لديهم تصريح: {I(u['permits']):,})",
+        f"• جدد اليوم: {I(u['new_today']):,} · خلال 7 أيام: {I(u['new_week']):,}",
+        f"• نشطون آخر ساعة: {I(u['a1h']):,} · آخر 24 ساعة: {I(u['a24']):,}",
+        f"• معدّنون الآن: <b>{I(act['n']):,}</b> · هاش الشبكة: {float(act['h']):,.0f}",
+        f"• جاؤوا بالإحالة: {I(u['reffed']):,} · محظورون: {I(u['bans']):,}",
+        "",
+        "⛓ <b>السلسلة</b>",
+        f"• الحالة: {st} · البداية: {fmt_dt(CHAIN['start'])}",
+        f"• الكتل: {mined:,} / {CHAIN['blocks']:,} ({mined / CHAIN['blocks'] * 100:.2f}%)",
+        "",
+        "💰 <b>الاقتصاد</b>",
+        f"• أرصدة اللاعبين الآن: {float(u['bal']):,.0f}",
+        f"• إجمالي ما عُدِّن: {float(u['tot']):,.0f}",
+        f"• خوادم مشتراة: {servers:,} · أكواد: {codes:,} (استُرد {redeems:,})",
+        "",
+        "⭐ <b>الإيرادات (نجوم)</b>",
+        f"• الإجمالي: <b>{I(pay['s']):,}</b> من {I(pay['n']):,} عملية ({I(pay['payers']):,} دافع)",
+        f"• اليوم: {I(pay_today):,} · 7 أيام: {I(pay_week):,} · مُسترجع: {I(refunded):,}",
+    ]
+    if items:
+        lines.append("• الأكثر مبيعاً: " + " · ".join(f"{html.escape(r['item'])} ({I(r['s']):,}⭐ ×{I(r['n'])})" for r in items))
+    if top:
+        lines += ["", "🏆 <b>أفضل 5</b>"]
+        lines += [f"{i}. {html.escape(r['name'] or '—')} · مستوى {r['level']} · {float(r['total']):,.0f}"
+                  for i, r in enumerate(top, 1)]
+    lines += ["", f"🕒 {_local(now).strftime('%H:%M:%S')} · 🗄 {'PostgreSQL' if USE_PG else 'SQLite'}"]
+    return "\n".join(lines)
+
+
+STATS_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تحديث", callback_data="stats")]])
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats  ← لوحة إحصائيات الأدمن"""
+    if not _is_admin(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(build_stats), reply_markup=STATS_KB)
+
+
+async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not ADMIN_ID or q.from_user.id != ADMIN_ID:
+        await q.answer()
+        return
+    await q.answer("تم التحديث")
+    try:
+        await q.edit_message_text(await asyncio.to_thread(build_stats), reply_markup=STATS_KB)
+    except BadRequest:
+        pass
 
 
 async def post_init(app: Application):
@@ -1500,7 +1763,12 @@ async def post_init(app: Application):
                                       BotCommand("resetall", "🗑 حذف كل البيانات"),
                                       BotCommand("setblocks", "🧱 عدد الكتل"),
                                       BotCommand("chain", "⛓ حالة السلسلة"),
-                                      BotCommand("refund", "💸 استرجاع دفعة")]
+                                      BotCommand("refund", "💸 استرجاع دفعة"),
+                                      BotCommand("stats", "📊 لوحة الإحصائيات"),
+                                      BotCommand("broadcast", "📢 بث رسالة للجميع"),
+                                      BotCommand("ban", "⛔ حظر مستخدم"),
+                                      BotCommand("unban", "✅ إلغاء حظر"),
+                                      BotCommand("bans", "📋 قائمة المحظورين")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -1685,6 +1953,25 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .bkd{font:400 11px var(--mono);color:#8b9098;direction:ltr}
 .rar{font:700 10px var(--mono);letter-spacing:.08em;border:1px solid #4a4e53;border-radius:5px;padding:2px 10px;color:#9aa0a6;background:#ffffff08;white-space:nowrap}
 .rar.gr{color:#3ecf8e;border-color:#3ecf8eb0;background:#3ecf8e1f}
+/* ── نافذة الحظر ── */
+.bnx{position:fixed;inset:0;z-index:200;background:#0c0d0ee6;display:flex;align-items:center;justify-content:center;padding:18px}
+.bnc{position:relative;width:100%;max-width:520px;border:1px solid #33363a;border-radius:14px;overflow:hidden;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#25282b}
+.bnc::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent)}
+.bnc>i{position:absolute;width:8px;height:8px;border:0 solid #5a5f66}
+.bnc>i.bk1{top:8px;left:8px;border-top-width:1px;border-left-width:1px}
+.bnc>i.bk2{top:8px;right:8px;border-top-width:1px;border-right-width:1px}
+.bnc>i.bk3{bottom:8px;left:8px;border-bottom-width:1px;border-left-width:1px}
+.bnc>i.bk4{bottom:8px;right:8px;border-bottom-width:1px;border-right-width:1px}
+.bnt{display:flex;justify-content:space-between;align-items:center;padding:16px 20px 0;font:400 10px var(--mono);letter-spacing:.14em;color:#8b9098;direction:ltr}
+.bnd{display:inline-block;width:5px;height:5px;border-radius:50%;background:#ff5b5b;margin-right:7px;vertical-align:middle}
+.bnf{color:#ff5b5b;letter-spacing:.05em}
+.bnb{padding:22px 22px 20px;text-align:center}
+.bni{width:54px;height:54px;margin:0 auto 18px;border-radius:13px;display:grid;place-items:center;background:#3a2426;border:1px solid #6b3a3d;color:#ff5b5b}
+.bnb h2{margin:0 0 10px;font:700 19px var(--disp);color:#f4f4f4}
+.bnb p{margin:0;font-size:12.5px;line-height:1.75;color:#8b9098}
+.bnb p b{color:#c3c6c9}
+.bnbtn{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:20px;font-size:13px;padding:13px}
+.bnl{border-top:1px solid #303337;padding:12px 20px 14px}
 /* ── نافذة تفاصيل الكتلة ── */
 .bm{position:relative;border:1px solid #3a3d41;border-radius:16px;overflow:hidden;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;max-height:86vh;overflow-y:auto}
 .bm::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent)}
@@ -1799,7 +2086,7 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
 try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
 function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
-let S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
+let BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
 const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
@@ -1812,11 +2099,13 @@ const bal=n=>{const s=f(n,4);return s.slice(0,-3)+'<small>'+s.slice(-3)+'</small
 const badge=t=>{if(!t||!S||!S.modes||!S.modes[t])return '';const c=(MC[t]||MC[1])[1];
   return `<span class="bdg" style="color:${c};background:${c}1f;border-color:${c}b0">${esc(S.modes[t].name)}</span>`};
 const av=n=>{let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="av" style="background:hsl(${h},55%,48%)">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`};
-function toast(m){const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
+function toast(m){if(!m)return;const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
 async function api(p,b){
+  if(BANNED)throw new Error('');
   const r=await fetch('/api/'+p,{method:b===undefined?'GET':'POST',headers:{'X-Init-Data':tg.initData,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
   if(!r.ok)throw new Error('HTTP '+r.status);
-  const j=await r.json();if(!j.ok)throw new Error(j.error||'خطأ');return j}
+  const j=await r.json();if(j.banned){showBan(j.reason||'');throw new Error('')}
+  if(!j.ok)throw new Error(j.error||'خطأ');return j}
 async function load(){
   const jobs=[api('me')];
   if(tab==='mine')jobs.push(api('blocks'));
@@ -1924,6 +2213,15 @@ function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN 
   <div class="bar"><i id="enb" style="width:${Math.min(100,S.energy/S.max_energy*100)}%;background:var(--blue)"></i></div>
   <button class="pri" onclick="openSheet('energy')">⚡ احصل على طاقة</button></div>`}
 
+function showBan(reason){if(BANNED)return;BANNED=true;sheet=null;try{tg.BackButton.hide()}catch(e){}
+  const d=document.createElement('div');d.className='bnx';d.id='bn';
+  d.innerHTML=`<div class="bnc"><i class="bk1"></i><i class="bk2"></i><i class="bk3"></i><i class="bk4"></i>
+  <div class="bnt"><span><i class="bnd"></i>ACCOUNT · BANNED</span><span class="bnf">fail</span></div>
+  <div class="bnb"><span class="bni">${ic('logout',24)}</span><h2>تم حظر حسابك</h2>
+  <p>تم إيقاف هذا الحساب بسبب مخالفة قواعد اللعبة، ولم يعد بإمكانك استخدام التطبيق.${reason?'<br><b>السبب:</b> '+esc(reason):''}</p>
+  <button class="pri bnbtn" onclick="try{tg.close()}catch(e){}">إغلاق هذه النافذة ${ic('x',13)}</button></div>
+  <div class="bnt bnl"><span>TRACE</span><span>banned</span></div></div>`;
+  document.body.appendChild(d)}
 function dparts(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
   return [p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear(),p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())]}
 function openBlk(i){BK=B[i];openSheet('blk')}
@@ -2034,7 +2332,7 @@ Object.assign(ICO,{
  x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
  sliders:'<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>',
  server:'<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/>'});
-Object.assign(ICO,{share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98"/><path d="m15.41 6.51-6.82 3.98"/>',chev:'<path d="m15 18-6-6 6-6"/>',
+Object.assign(ICO,{logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98"/><path d="m15.41 6.51-6.82 3.98"/>',chev:'<path d="m15 18-6-6 6-6"/>',
  user:'<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
  link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>'});
 const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
@@ -2129,7 +2427,7 @@ setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
   if(e)e.textContent=(d?d+'ي ':'')+p(h)+':'+p(m)+':'+p(s)},1000);
 if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
-else load().catch(e=>{$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
+else load().catch(e=>{if(BANNED)return;$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
 """
 
@@ -2157,6 +2455,14 @@ def main():
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("delcode", cmd_delcode))
     app.add_handler(CommandHandler("redeem", cmd_redeem))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CallbackQueryHandler(cb_stats, pattern="^stats$"))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("bcconfirm", cmd_bcconfirm))
+    app.add_handler(CommandHandler("bccancel", cmd_bccancel))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("bans", cmd_bans))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
     log.info("Bot started (polling)")
