@@ -32,7 +32,7 @@ if _todo:
     if _missing():
         raise SystemExit("تعذّر تثبيت المكتبات: " + ", ".join(_missing()))
 
-import os, sys, io, gzip, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random, re, datetime
+import os, sys, io, gzip, json, hmac, hashlib, time, asyncio, sqlite3, logging, threading, html, secrets, math, random, re, datetime, csv
 from contextlib import contextmanager
 from urllib.parse import parse_qsl
 
@@ -2194,7 +2194,7 @@ async def sched_loop():
 
 # ═══════════ 5.3) نسخ احتياطي · استرجاع · مشبوهون · تقرير يومي ═══════════
 BACKUP_TABLES = ["m_users", "m_payments", "m_tasks", "m_blocks", "m_codes", "m_redeems",
-                 "m_servers", "m_settings", "m_week_top", "m_sched", "s_stories"]
+                 "m_servers", "m_settings", "m_week_top", "m_sched", "s_stories", "s_bans"]
 SERIAL_TABLES = ["m_blocks", "m_servers", "m_sched", "s_stories"]
 
 
@@ -2234,6 +2234,10 @@ def reload_state():
         BANNED.update({r["id"]: r["ban_reason"] or "" for r in cur.fetchall()})
     WEEK_CACHE[1] = None
     SESS.clear()
+    try:
+        story_load_settings()
+    except Exception:
+        log.exception("story settings reload")
 
 
 def restore_data(data):
@@ -2383,6 +2387,9 @@ def build_daily():
         cur.execute("SELECT name,total-week_base AS w FROM m_users WHERE banned=0 AND total-week_base>0 "
                     "ORDER BY w DESC LIMIT 3")
         top = cur.fetchall()
+        st_new = one("SELECT COUNT(*) AS n FROM s_stories WHERE created_at>=? AND created_at<?", (y0, t0))["n"]
+        st_pend = one("SELECT COUNT(*) AS n FROM s_stories WHERE consent=1 AND public=0")["n"]
+        st_unrep = one("SELECT COUNT(*) AS n FROM s_stories WHERE user_id>0 AND replied=0")["n"]
     I = lambda x: int(x or 0)
     sus = len(find_suspects())
     day = _local(y0 + 3600).strftime("%d.%m.%Y")
@@ -2393,7 +2400,8 @@ def build_daily():
         L.append("   " + " · ".join(f"{html.escape(r['item'])} {I(r['s']):,}⭐" for r in items))
     L += ["", f"⛏ معدّنون نشطون الآن: <b>{I(mining['n']):,}</b> · هاش الشبكة {float(mining['h']):,.0f}",
           f"🟢 نشطون آخر 24 ساعة: {I(a24):,}",
-          f"📊 الإجمالي: {I(tot['n']):,} لاعب · دافعون {I(payers):,} · محظورون {I(tot['b']):,}"]
+          f"📊 الإجمالي: {I(tot['n']):,} لاعب · دافعون {I(payers):,} · محظورون {I(tot['b']):,}",
+          f"📖 حكايات جديدة أمس: <b>{I(st_new):,}</b> · بانتظار النشر: {I(st_pend):,} · بلا ردّ: {I(st_unrep):,}"]
     if sus:
         L.append(f"⚠️ مُحيلون مشتبه بهم: <b>{sus}</b> ← /suspects")
     if top:
@@ -2472,7 +2480,25 @@ async def post_init(app: Application):
                                       BotCommand("storybot", "📖 بوت الحكايات"),
                                       BotCommand("setstorybot", "🔗 ربط بوت الحكايات"),
                                       BotCommand("stories", "📚 آخر الحكايات"),
-                                      BotCommand("publish", "🌍 نشر حكاية في الجدار")]
+                                      BotCommand("publish", "🌍 نشر حكاية في الجدار"),
+                                      BotCommand("unpublish", "🙈 إخفاء حكاية من الجدار"),
+                                      BotCommand("publishall", "🌍 نشر كل الموافَق عليها"),
+                                      BotCommand("pending", "⏳ حكايات بانتظار النشر"),
+                                      BotCommand("unreplied", "📭 حكايات بلا ردّ"),
+                                      BotCommand("storysearch", "🔎 بحث في الحكايات"),
+                                      BotCommand("storyfilter", "🗂 عرض حسب النوع"),
+                                      BotCommand("storyedit", "✏️ تعديل نص حكاية"),
+                                      BotCommand("storyreply", "💌 الرد على حكاية"),
+                                      BotCommand("storymsg", "✉️ مراسلة مستخدم"),
+                                      BotCommand("storybroadcast", "📢 بث لكتّاب الحكايات"),
+                                      BotCommand("storythanks", "🌟 شكر أصحاب الحكايات المنشورة"),
+                                      BotCommand("storystats", "📊 إحصائيات الحكايات"),
+                                      BotCommand("storyoff", "⏸ إيقاف استقبال الحكايات"),
+                                      BotCommand("storyon", "▶️ تشغيل استقبال الحكايات"),
+                                      BotCommand("setcooldown", "⏳ مدة الانتظار بين الحكايات"),
+                                      BotCommand("storyban", "⛔ منع مستخدم من الحكايات"),
+                                      BotCommand("storybans", "📋 الممنوعون من الحكايات"),
+                                      BotCommand("exportstories", "📤 تصدير الحكايات")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -3187,10 +3213,18 @@ STORY_APP = None    # تطبيق بوت الحكايات الشغّال حالي
 ENV = {}            # يملؤها main(): cursor, get_setting, set_setting, admin_id, main_token
 STORY_RATE = {}     # حدّ الإرسال من الموقع لكل IP
 STORY_MENU = "لم يُضبط بعد"   # حالة زر القائمة (للتشخيص)
-STORY_VERSION = "v3 · تطبيق مصغّر"
+STORY_VERSION = "v4 · إدارة كاملة"
 LAST_MSG = {}       # آخر وقت أرسل فيه كل مستخدم حكاية من البوت
 MAX_LEN = 3500
-COOLDOWN = 15       # ثواني بين حكاية وأخرى (البوت)
+COOLDOWN_DEFAULT = 15
+COOLDOWN = COOLDOWN_DEFAULT   # ثواني بين حكاية وأخرى (البوت) — يتغير بالأمر /setcooldown
+STORY_CLOSED = False          # True = استقبال الحكايات متوقف (/storyoff)
+STORY_BANNED = set()          # المحظورون من إرسال الحكايات (/storyban)
+CLOSED_MSG = "🌙 استقبال الحكايات متوقف مؤقتاً، عُد لاحقاً وسنكون هنا لنسمعك 🤍"
+DEFAULT_THANKS = ("🌟 <b>شكراً {name}!</b>\n\nحكايتك #{id} نُشرت الآن في جدار الحكايات، "
+                  "وكلماتك ستلمس قلوباً كثيرة 🤍\nيمكنك مشاركة حكاية أخرى متى شئت.")
+KIND_ALIAS = {"dream": "dream", "حلم": "dream", "أحلام": "dream", "story": "story", "حكاية": "story",
+              "حكايات": "story", "confess": "confess", "اعتراف": "confess", "اعترافات": "confess"}
 slog = logging.getLogger("story-bot")
 
 KINDS = {
@@ -3220,10 +3254,30 @@ def story_ensure_tables(cursor, pk):
             id {pk}, user_id BIGINT NOT NULL, name TEXT, username TEXT,
             kind TEXT NOT NULL DEFAULT 'story', text TEXT NOT NULL,
             replied INT NOT NULL DEFAULT 0, created_at BIGINT)""")
+    with cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS s_bans(user_id BIGINT PRIMARY KEY, "
+                    "reason TEXT NOT NULL DEFAULT '', created_at BIGINT)")
     add_cols("s_stories", [("anon", "INT NOT NULL DEFAULT 0"),
                            ("consent", "INT NOT NULL DEFAULT 0"),
                            ("public", "INT NOT NULL DEFAULT 0"),
-                           ("source", "TEXT NOT NULL DEFAULT 'bot'")])
+                           ("source", "TEXT NOT NULL DEFAULT 'bot'"),
+                           ("edited", "INT NOT NULL DEFAULT 0"),
+                           ("thanked", "INT NOT NULL DEFAULT 0")])
+    story_load_settings()
+
+
+def story_load_settings():
+    """يقرأ إعدادات بوت الحكايات من القاعدة (مدة الانتظار، حالة الاستقبال، المحظورون)."""
+    global COOLDOWN, STORY_CLOSED
+    try:
+        COOLDOWN = max(0, min(3600, int(float(get_setting("story_cooldown", COOLDOWN_DEFAULT)))))
+    except (ValueError, TypeError):
+        COOLDOWN = COOLDOWN_DEFAULT
+    STORY_CLOSED = str(get_setting("story_closed", "0")) == "1"
+    with cursor() as cur:
+        cur.execute("SELECT user_id FROM s_bans")
+        STORY_BANNED.clear()
+        STORY_BANNED.update(int(r["user_id"]) for r in cur.fetchall())
 
 
 def _save_story(uid, name, username, kind, text, anon, consent, source):
@@ -3380,6 +3434,12 @@ async def s_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+    if u.id in STORY_BANNED:
+        await update.message.reply_text("⛔ لا يمكنك إرسال حكايات عبر هذا البوت.")
+        return
+    if STORY_CLOSED:
+        await update.message.reply_text(CLOSED_MSG)
+        return
     now = time.time()
     if now - LAST_MSG.get(u.id, 0) < COOLDOWN:
         await update.message.reply_text("⏳ مهلاً قليلاً، انتظر بضع ثوانٍ ثم أرسل حكايتك التالية.")
@@ -3405,8 +3465,155 @@ async def s_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _notify_admin(sid, kind, text, who, consent, "🤖 البوت", not anon)
 
 
+# ───────── أوامر المستخدمين (على بوت الحكايات) ─────────
+HELP_TEXT = (
+    "📖 <b>مساعدة بوت الحكايات</b>\n\n"
+    "اضغط /start ثم اختر ما تحب أن تشاركه (حلم، حكاية، اعتراف) واكتب رسالتك.\n"
+    "يمكنك الإرسال باسمك أو <b>كمجهول</b>، وتسمح أو لا تسمح بنشرها في جدار الحكايات.\n\n"
+    "<b>الأوامر:</b>\n"
+    "/start ← بدء حكاية جديدة\n"
+    "/mystories ← حكاياتك المرسلة باسمك وحالتها\n"
+    "/delete ← حذف حكاياتك من الأرشيف\n"
+    "/privacy ← ما الذي نحفظه وما الذي لا نحفظه\n"
+    "/help ← هذه الرسالة")
+PRIVACY_TEXT = (
+    "🔒 <b>الخصوصية</b>\n\n"
+    "🕶 <b>الإرسال كمجهول:</b> لا نحفظ اسمك ولا معرّف حسابك أبداً، ولا يمكن لأحد ربط الحكاية بك "
+    "(لذلك لا يمكن الرد عليها ولا حذفها لاحقاً من طرفك).\n\n"
+    "👤 <b>الإرسال باسمك:</b> نحفظ اسمك ومعرّف حسابك مع الحكاية، وقد يصلك ردّ خاص من صاحب البوت. "
+    "يمكنك حذف حكاياتك في أي وقت بالأمر /delete.\n\n"
+    "🌍 <b>النشر في الجدار:</b> لا تُنشر أي حكاية إلا إذا سمحت أنت ثم وافقت الإدارة، ويظهر الاسم الأول فقط "
+    "أو «مجهول».\n\n"
+    "ℹ️ ما تكتبه يصل إلى صاحب البوت ليقرأه، فلا تكتب كلمات مرور أو بيانات سرّية.")
+STORY_STATUS = {"pub": "🌍 منشورة", "pend": "⏳ بانتظار موافقة النشر", "priv": "🔒 خاصة"}
+
+
+def _my_stories(uid):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM s_stories WHERE user_id=?", (uid,))
+        n = cur.fetchone()["n"]
+        cur.execute("SELECT id,kind,text,consent,public,replied,created_at FROM s_stories "
+                    "WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
+        return int(n or 0), cur.fetchall()
+
+
+def _delete_user_stories(uid):
+    with ENV["cursor"]() as cur:
+        cur.execute("DELETE FROM s_stories WHERE user_id=? AND user_id>0", (uid,))
+        return cur.rowcount
+
+
+def _delete_one_owned(uid, sid):
+    with ENV["cursor"]() as cur:
+        cur.execute("DELETE FROM s_stories WHERE id=? AND user_id=? AND user_id>0", (sid, uid))
+        return cur.rowcount
+
+
+def _owned_story(uid, sid):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT id FROM s_stories WHERE id=? AND user_id=? AND user_id>0", (sid, uid))
+        return cur.fetchone()
+
+
+async def _admin_note(text):
+    mb, admin = ENV.get("main_bot"), ENV.get("admin_id")
+    if mb and admin:
+        try:
+            await mb.send_message(admin, text)
+        except Exception:
+            slog.exception("admin note")
+
+
+async def s_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def s_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(PRIVACY_TEXT)
+
+
+async def s_mystories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    n, rows = await asyncio.to_thread(_my_stories, uid)
+    if not n:
+        await update.message.reply_text(
+            "📭 لا توجد حكايات محفوظة باسمك.\n\n"
+            "ملاحظة: الحكايات المرسلة كمجهول لا تظهر هنا لأننا لا نحفظ هويتك فيها.\n"
+            "اضغط /start لتحكي حكاية جديدة.")
+        return
+    out = [f"📚 <b>حكاياتك</b> ({n})", ""]
+    for r in rows:
+        st = STORY_STATUS["pub"] if r["public"] else (STORY_STATUS["pend"] if r["consent"] else STORY_STATUS["priv"])
+        if r["replied"]:
+            st += " · ✅ تم الرد"
+        t = (r["text"] or "").replace("\n", " ")
+        out.append(f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> · {fmt_d(r['created_at'] or 0)} · {st}\n"
+                   f"   {html.escape(t[:60] + ('…' if len(t) > 60 else ''))}")
+    if n > len(rows):
+        out.append(f"\n… وهناك {n - len(rows)} حكاية أقدم.")
+    out.append("\nللحذف: /delete أو /delete رقم_الحكاية")
+    await update.message.reply_text("\n".join(out))
+
+
+async def s_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if context.args:
+        a0 = context.args[0].lstrip("#")
+        if not a0.isdigit():
+            await update.message.reply_text("الاستعمال:\n/delete ← حذف كل حكاياتك\n/delete 12 ← حذف حكاية واحدة")
+            return
+        if not await asyncio.to_thread(_owned_story, uid, int(a0)):
+            await update.message.reply_text("❌ لا توجد حكاية بهذا الرقم باسمك. استخدم /mystories لترى أرقامك.")
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 نعم، احذفها", callback_data=f"del:y:{int(a0)}"),
+                                    InlineKeyboardButton("إلغاء", callback_data="del:n")]])
+        await update.message.reply_text(f"⚠️ سيتم حذف الحكاية <b>#{int(a0)}</b> نهائياً (وتُزال من الجدار إن كانت منشورة).",
+                                        reply_markup=kb)
+        return
+    n, _ = await asyncio.to_thread(_my_stories, uid)
+    if not n:
+        await update.message.reply_text("📭 لا توجد حكايات باسمك لتُحذف.\n(المجهولة لا يمكن ربطها بك، لذلك لا يمكن حذفها.)")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 نعم، احذف الكل ({n})", callback_data="del:y:all"),
+                                InlineKeyboardButton("إلغاء", callback_data="del:n")]])
+    await update.message.reply_text(
+        f"⚠️ سيتم حذف <b>{n}</b> حكاية محفوظة باسمك نهائياً، وتُزال من الجدار إن كانت منشورة.\n"
+        "الحكايات المجهولة لا تتأثر لأنها غير مرتبطة بك.", reply_markup=kb)
+
+
+async def s_delcb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    d = (q.data or "").split(":")
+    uid = q.from_user.id
+    if len(d) < 3 or d[1] != "y":
+        await q.answer("تم الإلغاء")
+        try:
+            await q.edit_message_text("تم الإلغاء، لم يُحذف شيء.")
+        except BadRequest:
+            pass
+        return
+    if d[2] == "all":
+        n = await asyncio.to_thread(_delete_user_stories, uid)
+    elif d[2].isdigit():
+        n = await asyncio.to_thread(_delete_one_owned, uid, int(d[2]))
+    else:
+        n = 0
+    await q.answer("تم الحذف" if n else "لا شيء للحذف")
+    try:
+        await q.edit_message_text(f"🗑 تم حذف {n} حكاية." if n else "لا توجد حكايات للحذف.")
+    except BadRequest:
+        pass
+    if n:
+        await _admin_note(f"🗑 المستخدم <code>{uid}</code> حذف {n} من حكاياته بنفسه.")
+
+
 def _add_story_handlers(app):
     app.add_handler(CommandHandler("start", s_start))
+    app.add_handler(CommandHandler("help", s_help))
+    app.add_handler(CommandHandler("privacy", s_privacy))
+    app.add_handler(CommandHandler("mystories", s_mystories))
+    app.add_handler(CommandHandler("delete", s_delete))
+    app.add_handler(CallbackQueryHandler(s_delcb, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(s_pick, pattern=r"^k:"))
     app.add_handler(CallbackQueryHandler(s_opt, pattern=r"^(a:|p:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, s_text))
@@ -3458,6 +3665,14 @@ async def start_story(token):
         raise
     STORY_APP = app
     await _apply_menu(app.bot)                       # زر القائمة بجانب خانة الكتابة يفتح الموقع كتطبيق مصغّر
+    try:                                             # قائمة أوامر المستخدمين
+        await app.bot.set_my_commands([BotCommand("start", "🏠 احكِ حكايتك"),
+                                       BotCommand("mystories", "📚 حكاياتي وحالتها"),
+                                       BotCommand("delete", "🗑 حذف حكاياتي"),
+                                       BotCommand("privacy", "🔒 الخصوصية"),
+                                       BotCommand("help", "❓ مساعدة")])
+    except Exception as e:
+        slog.warning("story commands failed: %s", e)
     return app.bot.username
 
 
@@ -3503,6 +3718,8 @@ async def story_send(request):
         b = {}
     if str(b.get("hp") or "").strip():                      # فخّ للروبوتات: نتجاهل بصمت
         return web.json_response({"ok": True})
+    if STORY_CLOSED:
+        return web.json_response({"ok": False, "error": CLOSED_MSG})
     kind = b.get("kind") if b.get("kind") in KINDS else "story"
     text = str(b.get("text") or "").strip()
     if len(text) < 5:
@@ -3514,6 +3731,8 @@ async def story_send(request):
     init = request.headers.get("X-Init-Data", "")
     if init and STORY_APP:
         tgu = verify_init_data(init, token=STORY_APP.bot.token)
+    if tgu and tgu["id"] in STORY_BANNED:
+        return web.json_response({"ok": False, "error": "⛔ لا يمكنك إرسال حكايات."})
     anon = bool(b.get("anon"))
     if tgu:
         name = "" if anon else tgu["name"][:40]
@@ -3603,8 +3822,17 @@ async def cmd_storybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = f"🟢 يعمل: @{html.escape(STORY_APP.bot.username)}" if STORY_APP else "🔴 متوقف (استخدم /setstorybot)"
     await update.message.reply_text(
         f"📖 <b>الحكايات</b> · {STORY_VERSION}\n{st}\n🌐 الموقع: {WEBAPP_URL + '/' if WEBAPP_URL else '❌ WEBAPP_URL غير مضبوط'}\n🔘 {html.escape(STORY_MENU)}\n\n"
+        f"📥 الاستقبال: {'⏸ متوقف' if STORY_CLOSED else '▶️ مفتوح'} · ⏳ الانتظار: {COOLDOWN} ث · ⛔ محظورون: {len(STORY_BANNED)}\n\n"
         f"📚 الإجمالي: <b>{I(t['n']):,}</b> (من الموقع {I(t['w']):,}) · 🕶 مجهول {I(t['a']):,} · 🌍 منشورة {I(t['p']):,}\n\n"
-        "/stories · /story ID · /storyreply ID نص · /publish ID · /unpublish ID · /delstory ID · /setstorywelcome نص")
+        "<b>الإدارة:</b>\n"
+        "/stories · /story ID · /storyreply ID نص · /storymsg ID نص\n"
+        "/storysearch كلمة · /storyfilter النوع · /unreplied · /pending\n"
+        "/publish ID · /unpublish ID · /publishall · /storyedit ID نص · /delstory ID\n\n"
+        "<b>التواصل:</b>\n"
+        "/storybroadcast نص · /storythanks · /setstorythanks نص · /setstorywelcome نص\n\n"
+        "<b>التحكم:</b>\n"
+        "/storystats · /storyoff · /storyon · /setcooldown ثواني\n"
+        "/storyban ID · /storyunban ID · /storybans · /exportstories")
 
 
 def _preview(r, n=70):
@@ -3722,6 +3950,647 @@ async def cmd_setstorywelcome(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("✅ تم تحديث رسالة الترحيب." if new else "✅ رجعت الرسالة الافتراضية.")
 
 
+# ───────── أوامر الأدمن الإضافية: إدارة · تواصل · إحصائيات · حماية ─────────
+def _row_line(r):
+    flags = (("✅" if r["replied"] else "") + ("🌍" if r["public"] else "")
+             + ("✏️" if r.get("edited") else "") + ("🌐" if r["source"] != "bot" else ""))
+    return (f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> {flags} · {_who(r)}\n"
+            f"   {_preview(r)}\n   /story {r['id']}")
+
+
+async def _long_reply(update, text):
+    """يقسّم الرسائل الطويلة على حدّ تيليجرام (4096 حرف) دون كسر الوسوم."""
+    chunk = ""
+    for line in text.split("\n"):
+        if chunk and len(chunk) + len(line) + 1 > 3800:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await update.message.reply_text(chunk)
+
+
+def _q_rows(where, params=(), n=15):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT * FROM s_stories WHERE " + where + " ORDER BY id DESC LIMIT " + str(int(n)), params)
+        return cur.fetchall()
+
+
+def _q_count(where, params=()):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM s_stories WHERE " + where, params)
+        return int(cur.fetchone()["n"] or 0)
+
+
+def _q_both(where, params, n):
+    return _q_rows(where, params, n), _q_count(where, params)
+
+
+async def _list_cmd(update, title, where, params, empty, footer="", n=15):
+    rows, total = await asyncio.to_thread(_q_both, where, params, n)
+    if not rows:
+        await update.message.reply_text(empty)
+        return
+    out = [f"{title} ({total})", ""] + [_row_line(r) for r in rows]
+    if total > len(rows):
+        out.append(f"\n… و{total - len(rows)} أخرى (يُعرض أحدث {len(rows)}).")
+    if footer:
+        out.append("\n" + footer)
+    await _long_reply(update, "\n".join(out))
+
+
+def _like(word):
+    esc = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + esc + "%"
+
+
+async def cmd_storysearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storysearch كلمة ← بحث في نص الحكايات"""
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text or "").split(None, 1)
+    word = parts[1].strip() if len(parts) > 1 else ""
+    if len(word) < 2:
+        await update.message.reply_text("الاستعمال: <code>/storysearch كلمة</code>\n(حرفان على الأقل)")
+        return
+    await _list_cmd(update, f"🔎 <b>نتائج البحث عن «{html.escape(word[:40])}»</b>",
+                    "LOWER(text) LIKE LOWER(?) ESCAPE '\\'", (_like(word),), "لا توجد نتائج.")
+
+
+async def cmd_storyfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storyfilter dream|story|confess [العدد]"""
+    if not _s_is_admin(update):
+        return
+    k = KIND_ALIAS.get((context.args[0] if context.args else "").strip().lower())
+    if not k:
+        await update.message.reply_text("الاستعمال: <code>/storyfilter dream</code>\n"
+                                        "الأنواع: <code>dream</code> (حلم) · <code>story</code> (حكاية) · "
+                                        "<code>confess</code> (اعتراف)\nاختياري: عدد النتائج <code>/storyfilter story 25</code>")
+        return
+    n = 15
+    if len(context.args) > 1 and context.args[1].isdigit():
+        n = max(1, min(30, int(context.args[1])))
+    await _list_cmd(update, f"{KIND_ICON[k]} <b>{KIND_NAME[k]}</b>", "kind=?", (k,),
+                    "لا توجد حكايات من هذا النوع.", n=n)
+
+
+async def cmd_unreplied(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unreplied ← حكايات أصحابها معروفون ولم تُرد عليهم بعد"""
+    if not _s_is_admin(update):
+        return
+    await _list_cmd(update, "📭 <b>بلا ردّ</b>", "user_id>0 AND replied=0", (),
+                    "✅ رددتَ على الجميع.", "للرد: <code>/storyreply ID نص الرد</code>")
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pending ← حكايات وافق أصحابها على نشرها ولم تُنشر بعد"""
+    if not _s_is_admin(update):
+        return
+    await _list_cmd(update, "⏳ <b>بانتظار النشر</b>", "consent=1 AND public=0", (),
+                    "لا توجد حكايات بانتظار النشر.",
+                    "للنشر: <code>/publish ID</code> · الكل دفعة واحدة: /publishall")
+
+
+def _pending_rows():
+    return _q_rows("consent=1 AND public=0", (), 500)
+
+
+def _publish_ids(ids):
+    n = 0
+    with ENV["cursor"]() as cur:
+        for i in range(0, len(ids), 400):
+            part = ids[i:i + 400]
+            cur.execute("UPDATE s_stories SET public=1 WHERE consent=1 AND id IN (" + ",".join("?" * len(part)) + ")",
+                        tuple(part))
+            n += cur.rowcount
+    return n
+
+
+async def cmd_publishall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/publishall ← معاينة ثم /pubconfirm لنشر كل الحكايات الموافَق عليها"""
+    if not _s_is_admin(update):
+        return
+    rows = await asyncio.to_thread(_pending_rows)
+    if not rows:
+        await update.message.reply_text("لا توجد حكايات بانتظار النشر.")
+        return
+    context.bot_data["pubs"] = [r["id"] for r in rows]
+    out = [f"🌍 <b>نشر دفعة واحدة</b>\nسيتم نشر <b>{len(rows)}</b> حكاية وافق أصحابها على نشرها.", "",
+           "<b>أحدث 5 للمعاينة:</b>"] + [_row_line(r) for r in rows[:5]]
+    out.append("\n💡 راجعها أولاً، ويمكنك تعديل أي نص بـ /storyedit قبل التأكيد.\n"
+               "للتأكيد: /pubconfirm\nللإلغاء: /pubcancel")
+    await _long_reply(update, "\n".join(out))
+
+
+async def cmd_pubconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    ids = context.bot_data.pop("pubs", None)
+    if not ids:
+        await update.message.reply_text("لا توجد عملية معلّقة. استخدم /publishall أولاً.")
+        return
+    n = await asyncio.to_thread(_publish_ids, ids)
+    await update.message.reply_text(f"🌍 نُشرت <b>{n}</b> حكاية في الجدار.")
+
+
+async def cmd_pubcancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    context.bot_data.pop("pubs", None)
+    await update.message.reply_text("تم إلغاء النشر الجماعي.")
+
+
+def _edit_story(sid, new):
+    """يرجع النص القديم، أو None إن لم توجد الحكاية."""
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT text FROM s_stories WHERE id=?", (sid,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        cur.execute("UPDATE s_stories SET text=?, edited=1 WHERE id=?", (new, sid))
+        return r["text"]
+
+
+async def cmd_storyedit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storyedit ID النص الجديد ← تعديل نص حكاية (مثلاً حذف اسم أو معلومة حساسة قبل النشر)"""
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await update.message.reply_text(
+            "✏️ <b>تعديل حكاية</b>\n<code>/storyedit 12 النص الجديد كاملاً</code>\n\n"
+            "يُستبدل النص كله بما تكتبه، ثم أرسل لك النص القديم لتتراجع عند الحاجة.")
+        return
+    new = parts[2].strip()
+    if len(new) < 2:
+        await update.message.reply_text("❌ النص قصير جداً.")
+        return
+    if len(new) > MAX_LEN:
+        await update.message.reply_text(f"❌ النص أطول من {MAX_LEN} حرف.")
+        return
+    sid = int(parts[1])
+    old = await asyncio.to_thread(_edit_story, sid, new)
+    if old is None:
+        await update.message.reply_text("غير موجودة.")
+        return
+    await update.message.reply_text(f"✅ تم تعديل الحكاية <b>#{sid}</b> ✏️\nللمراجعة: /story {sid}")
+    if len(old) <= 3300:
+        await update.message.reply_text("↩️ للتراجع انسخ الأمر التالي وأرسله:\n\n"
+                                        f"<code>/storyedit {sid} {html.escape(old)}</code>")
+    else:
+        await update.message.reply_text("ℹ️ النص القديم طويل جداً فلا يمكن عرضه كأمر تراجع.")
+
+
+# ───────── التواصل ─────────
+def _story_audience():
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT user_id, MAX(name) AS name FROM s_stories WHERE user_id>0 AND anon=0 "
+                    "GROUP BY user_id ORDER BY user_id")
+        return [(int(r["user_id"]), r["name"] or "") for r in cur.fetchall() if int(r["user_id"]) not in STORY_BANNED]
+
+
+def _first(name):
+    return html.escape((name or "").split(" ")[0])
+
+
+async def _story_send_many(sbot, mbot, pairs, admin_chat, label=""):
+    """pairs = [(user_id, نص, مفتاح)] ← يرسل عبر بوت الحكايات ويبلغ الأدمن عبر بوت التعدين. يرجع مفاتيح الناجحة."""
+    sent = failed = 0
+    ok_keys = []
+    kb = _kinds_kb()
+    for uid, txt, key in pairs:
+        for attempt in range(2):
+            try:
+                await sbot.send_message(uid, txt, reply_markup=kb)
+                sent += 1
+                ok_keys.append(key)
+                break
+            except RetryAfter as e:
+                ra = e.retry_after
+                ra = ra.total_seconds() if hasattr(ra, "total_seconds") else ra
+                await asyncio.sleep(float(ra) + 1)
+            except Exception:
+                failed += 1
+                break
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    try:
+        await mbot.send_message(admin_chat, f"✅ انتهى الإرسال{label}\n📨 وصلت: <b>{sent}</b>\n"
+                                            f"🚫 فشلت (حظروا البوت أو غيره): {failed}")
+    except Exception:
+        pass
+    return ok_keys
+
+
+async def cmd_storybroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storybroadcast نص ← بث لكل من أرسل حكاية باسمه (المجهولون لا يمكن مراسلتهم)"""
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "📢 <b>بث لكتّاب الحكايات</b>\n\n<code>/storybroadcast نص الرسالة {name}</code>\n"
+            "(<code>{name}</code> = اسم المستلم الأول، ويدعم التنسيق)\n\n"
+            "يصل فقط لمن أرسل حكاية <b>باسمه</b> (المجهولون لا نحفظ هويتهم).\n"
+            "ستظهر معاينة ثم /sbconfirm للإرسال أو /sbcancel للإلغاء.")
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    txt = parts[1].strip()
+    n = len(await asyncio.to_thread(_story_audience))
+    context.bot_data["sbc"] = txt
+    try:
+        await update.message.reply_text("📢 <b>معاينة الرسالة:</b>\n\n"
+                                        + txt.replace("{name}", _first(update.effective_user.full_name)))
+    except Exception as e:
+        context.bot_data.pop("sbc", None)
+        await update.message.reply_text(f"❌ تعذّر عرض الرسالة: {html.escape(str(e))}")
+        return
+    await update.message.reply_text(f"👥 عدد المستلمين: <b>{n:,}</b>\n\nللتأكيد: /sbconfirm\nللإلغاء: /sbcancel")
+
+
+async def cmd_sbconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    txt = context.bot_data.pop("sbc", None)
+    if not txt:
+        await update.message.reply_text("لا توجد رسالة معلّقة. استخدم /storybroadcast أولاً.")
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    aud = await asyncio.to_thread(_story_audience)
+    pairs = [(uid, txt.replace("{name}", _first(nm)), None) for uid, nm in aud]
+    await update.message.reply_text(f"🚀 بدأ الإرسال إلى {len(pairs):,} مستخدم... سأبلغك عند الانتهاء.")
+    BG.append(asyncio.create_task(_story_send_many(STORY_APP.bot, context.bot, pairs,
+                                                   update.effective_chat.id, " (بث الحكايات)")))
+
+
+async def cmd_sbcancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    context.bot_data.pop("sbc", None)
+    await update.message.reply_text("تم إلغاء البث.")
+
+
+def _thanks_tpl():
+    return ENV["get_setting"]("story_thanks") or DEFAULT_THANKS
+
+
+def _fmt_thanks(tpl, name, sid):
+    return tpl.replace("{name}", _first(name)).replace("{id}", str(sid))
+
+
+def _unthanked_rows():
+    return _q_rows("public=1 AND thanked=0 AND user_id>0 AND anon=0", (), 500)
+
+
+def _mark_thanked(ids):
+    if not ids:
+        return
+    with ENV["cursor"]() as cur:
+        for i in range(0, len(ids), 400):
+            part = ids[i:i + 400]
+            cur.execute("UPDATE s_stories SET thanked=1 WHERE id IN (" + ",".join("?" * len(part)) + ")", tuple(part))
+
+
+async def _thanks_job(sbot, mbot, pairs, admin_chat):
+    ok = await _story_send_many(sbot, mbot, pairs, admin_chat, " (رسائل الشكر)")
+    await asyncio.to_thread(_mark_thanked, [k for k in ok if k])
+
+
+async def cmd_storythanks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storythanks ID ← شكر صاحب حكاية منشورة · /storythanks ← معاينة ثم /thconfirm لشكر كل من نُشرت حكايته ولم يُشكر"""
+    if not _s_is_admin(update):
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    tpl = await asyncio.to_thread(_thanks_tpl)
+    if context.args and context.args[0].isdigit():
+        r = await asyncio.to_thread(_get_story, int(context.args[0]))
+        if not r:
+            await update.message.reply_text("غير موجودة.")
+            return
+        if not r["public"]:
+            await update.message.reply_text("🚫 هذه الحكاية غير منشورة بعد.")
+            return
+        if not r["user_id"]:
+            await update.message.reply_text("🕶 صاحبها مجهول، لا يمكن مراسلته.")
+            return
+        try:
+            await STORY_APP.bot.send_message(r["user_id"], _fmt_thanks(tpl, r["name"], r["id"]),
+                                             reply_markup=_kinds_kb())
+        except Exception as e:
+            await update.message.reply_text(f"❌ تعذّر الإرسال (ربما حظر البوت): {html.escape(str(e))[:200]}")
+            return
+        await asyncio.to_thread(_mark_thanked, [r["id"]])
+        await update.message.reply_text("✅ وصلته رسالة الشكر.")
+        return
+    rows = await asyncio.to_thread(_unthanked_rows)
+    if not rows:
+        await update.message.reply_text("لا توجد حكايات منشورة لم يُشكر أصحابها.\n"
+                                        "(لتغيير نص الشكر: <code>/setstorythanks نص {name} {id}</code>)")
+        return
+    context.bot_data["thx"] = [(int(r["user_id"]), r["id"], r["name"] or "") for r in rows]
+    try:
+        await update.message.reply_text("🌟 <b>معاينة رسالة الشكر</b> (كما ستصل لأول مستلم):\n\n"
+                                        + _fmt_thanks(tpl, rows[0]["name"], rows[0]["id"]))
+    except Exception as e:
+        context.bot_data.pop("thx", None)
+        await update.message.reply_text(f"❌ تعذّر عرض الرسالة: {html.escape(str(e))}")
+        return
+    await update.message.reply_text(f"👥 المستلمون: <b>{len(rows)}</b>\n\nللتأكيد: /thconfirm\nللإلغاء: /thcancel")
+
+
+async def cmd_thconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    items = context.bot_data.pop("thx", None)
+    if not items:
+        await update.message.reply_text("لا توجد عملية معلّقة. استخدم /storythanks أولاً.")
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    tpl = await asyncio.to_thread(_thanks_tpl)
+    pairs = [(uid, _fmt_thanks(tpl, nm, sid), sid) for uid, sid, nm in items]
+    await update.message.reply_text(f"🚀 بدأ إرسال {len(pairs)} رسالة شكر... سأبلغك عند الانتهاء.")
+    BG.append(asyncio.create_task(_thanks_job(STORY_APP.bot, context.bot, pairs, update.effective_chat.id)))
+
+
+async def cmd_thcancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    context.bot_data.pop("thx", None)
+    await update.message.reply_text("تم الإلغاء.")
+
+
+async def cmd_setstorythanks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setstorythanks نص الشكر ({name} الاسم الأول · {id} رقم الحكاية)"""
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        cur_t = await asyncio.to_thread(_thanks_tpl)
+        await update.message.reply_text(
+            "✏️ <code>/setstorythanks نص الشكر {name} {id}</code>\n(<code>{name}</code> = الاسم الأول · "
+            "<code>{id}</code> = رقم الحكاية)\nللعودة للافتراضي: <code>/setstorythanks reset</code>\n\n"
+            "<b>النص الحالي:</b>\n\n" + cur_t)
+        return
+    new = parts[1].strip()
+    if new.lower() in ("reset", "default", "افتراضي"):
+        new = ""
+    await asyncio.to_thread(ENV["set_setting"], "story_thanks", new)
+    await update.message.reply_text("✅ تم تحديث رسالة الشكر." if new else "✅ رجعت الرسالة الافتراضية.")
+
+
+async def cmd_storymsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storymsg USER_ID نص ← مراسلة مستخدم مباشرة عبر بوت الحكايات"""
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 2)
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].strip():
+        await update.message.reply_text("الاستعمال: <code>/storymsg 123456789 نص الرسالة</code>\n"
+                                        "(يصل فقط لمن سبق أن فتح بوت الحكايات)")
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    try:
+        await STORY_APP.bot.send_message(int(parts[1]), "💌 <b>رسالة من صاحب البوت:</b>\n\n" + parts[2].strip())
+    except Exception as e:
+        await update.message.reply_text(f"❌ تعذّر الإرسال (ربما لم يبدأ البوت أو حظره): {html.escape(str(e))[:200]}")
+        return
+    await update.message.reply_text("✅ وصلت رسالتك.")
+
+
+# ───────── الإحصائيات ─────────
+def _story_stats():
+    now = time.time()
+    off = TZ_OFFSET * 3600
+    today = ((now + off) // 86400) * 86400 - off
+    week = now - 7 * 86400
+    with ENV["cursor"]() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n,"
+            " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS today,"
+            " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS week,"
+            " SUM(CASE WHEN kind='dream' THEN 1 ELSE 0 END) AS dream,"
+            " SUM(CASE WHEN kind='story' THEN 1 ELSE 0 END) AS story,"
+            " SUM(CASE WHEN kind='confess' THEN 1 ELSE 0 END) AS confess,"
+            " SUM(CASE WHEN anon=1 THEN 1 ELSE 0 END) AS anon,"
+            " SUM(CASE WHEN user_id>0 THEN 1 ELSE 0 END) AS named,"
+            " SUM(CASE WHEN consent=1 THEN 1 ELSE 0 END) AS consent,"
+            " SUM(CASE WHEN public=1 THEN 1 ELSE 0 END) AS pub,"
+            " SUM(CASE WHEN consent=1 AND public=0 THEN 1 ELSE 0 END) AS pend,"
+            " SUM(CASE WHEN replied=1 THEN 1 ELSE 0 END) AS replied,"
+            " SUM(CASE WHEN user_id>0 AND replied=0 THEN 1 ELSE 0 END) AS unrep,"
+            " SUM(CASE WHEN source='bot' THEN 1 ELSE 0 END) AS s_bot,"
+            " SUM(CASE WHEN source='app' THEN 1 ELSE 0 END) AS s_app,"
+            " SUM(CASE WHEN source='web' THEN 1 ELSE 0 END) AS s_web,"
+            " COUNT(DISTINCT CASE WHEN user_id>0 THEN user_id END) AS writers"
+            " FROM s_stories", (today, week))
+        return cur.fetchone()
+
+
+async def cmd_storystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storystats ← إحصائيات تفصيلية للحكايات"""
+    if not _s_is_admin(update):
+        return
+    s = await asyncio.to_thread(_story_stats)
+    I = lambda x: int(x or 0)
+    n = I(s["n"])
+    pc = lambda a, b: f"{I(a) / b * 100:.0f}%" if b else "—"
+    st = f"🟢 @{html.escape(STORY_APP.bot.username)}" if STORY_APP else "🔴 البوت متوقف"
+    await update.message.reply_text(
+        "📊 <b>إحصائيات الحكايات</b>\n\n"
+        f"📚 الإجمالي: <b>{n:,}</b> · اليوم: {I(s['today']):,} · آخر 7 أيام: {I(s['week']):,}\n"
+        f"✍️ كتّاب معروفون: {I(s['writers']):,}\n\n"
+        "🗂 <b>الأنواع</b>\n"
+        f"🌙 حلم/أهداف: {I(s['dream']):,} ({pc(s['dream'], n)})\n"
+        f"📖 حكاية: {I(s['story']):,} ({pc(s['story'], n)})\n"
+        f"🤫 اعتراف: {I(s['confess']):,} ({pc(s['confess'], n)})\n\n"
+        "🕶 <b>الخصوصية</b>\n"
+        f"• مجهول: {I(s['anon']):,} ({pc(s['anon'], n)}) · باسمهم: {I(s['named']):,}\n"
+        f"• وافقوا على النشر: {I(s['consent']):,} ({pc(s['consent'], n)})\n"
+        f"• منشورة: <b>{I(s['pub']):,}</b> · بانتظار النشر: {I(s['pend']):,}\n\n"
+        "💌 <b>الردود</b>\n"
+        f"• تم الرد على: {I(s['replied']):,} من {I(s['named']):,} ({pc(s['replied'], I(s['named']))})\n"
+        f"• بلا ردّ: <b>{I(s['unrep']):,}</b> ← /unreplied\n\n"
+        "📡 <b>المصدر</b>\n"
+        f"🤖 البوت: {I(s['s_bot']):,} · 📱 التطبيق: {I(s['s_app']):,} · 🌐 الموقع: {I(s['s_web']):,}\n\n"
+        f"🛡 الاستقبال: {'⏸ متوقف' if STORY_CLOSED else '▶️ مفتوح'} · ⏳ الانتظار: {COOLDOWN} ث · "
+        f"⛔ محظورون: {len(STORY_BANNED)}\n{st}")
+
+
+# ───────── الحماية والتحكم ─────────
+async def _set_closed(update, val):
+    global STORY_CLOSED
+    await asyncio.to_thread(ENV["set_setting"], "story_closed", "1" if val else "0")
+    STORY_CLOSED = val
+    await update.message.reply_text("⏸ تم إيقاف استقبال الحكايات (البوت والتطبيق والموقع).\nلإعادته: /storyon"
+                                    if val else "▶️ تم تشغيل استقبال الحكايات.")
+
+
+async def cmd_storyoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    await _set_closed(update, True)
+
+
+async def cmd_storyon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    await _set_closed(update, False)
+
+
+async def cmd_setcooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setcooldown ثواني ← مدة الانتظار بين حكاية وأخرى في بوت الحكايات"""
+    global COOLDOWN
+    if not _s_is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"⏳ مدة الانتظار الحالية: <b>{COOLDOWN}</b> ثانية (الافتراضي {COOLDOWN_DEFAULT})\n\n"
+            "لتغييرها: <code>/setcooldown 30</code>\nللإلغاء: <code>/setcooldown 0</code>\n"
+            "(تسري على البوت. الموقع له حدّه الخاص: حكاية كل 45 ثانية و5 في الساعة لكل IP)")
+        return
+    try:
+        n = int(float(context.args[0]))
+    except ValueError:
+        await update.message.reply_text("❌ أرسل رقماً بالثواني، مثال: <code>/setcooldown 30</code>")
+        return
+    if not 0 <= n <= 3600:
+        await update.message.reply_text("❌ القيمة من 0 إلى 3600 ثانية.")
+        return
+    await asyncio.to_thread(ENV["set_setting"], "story_cooldown", n)
+    COOLDOWN = n
+    await update.message.reply_text(f"✅ مدة الانتظار الآن: <b>{n}</b> ثانية" + (" (بلا انتظار)" if n == 0 else ""))
+
+
+def _sban_add(uid, reason):
+    with ENV["cursor"]() as cur:
+        cur.execute("INSERT INTO s_bans(user_id,reason,created_at) VALUES(?,?,?) "
+                    "ON CONFLICT (user_id) DO UPDATE SET reason=excluded.reason", (uid, reason, int(time.time())))
+
+
+def _sban_del(uid):
+    with ENV["cursor"]() as cur:
+        cur.execute("DELETE FROM s_bans WHERE user_id=?", (uid,))
+        return cur.rowcount
+
+
+def _sban_list():
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT user_id, reason FROM s_bans ORDER BY created_at DESC LIMIT 50")
+        return cur.fetchall()
+
+
+async def cmd_storyban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storyban USER_ID [السبب] ← يمنع مستخدماً من إرسال الحكايات (يشمل الإرسال كمجهول)"""
+    if not _s_is_admin(update):
+        return
+    a = context.args
+    if not a or not a[0].isdigit():
+        await update.message.reply_text(
+            "الاستعمال: <code>/storyban 123456789 سبب المنع</code>\n"
+            "لإلغاء المنع: <code>/storyunban 123456789</code> · القائمة: /storybans\n\n"
+            "ℹ️ تجد ايدي صاحب الحكاية من <code>/story ID</code>. الحكايات المجهولة لا تحمل ايدي، "
+            "لكن المنع بالايدي يمنع صاحبه حتى لو أرسل كمجهول لاحقاً.")
+        return
+    uid = int(a[0])
+    if uid == ENV.get("admin_id"):
+        await update.message.reply_text("❌ لا يمكنك منع نفسك.")
+        return
+    reason = " ".join(a[1:])[:200]
+    await asyncio.to_thread(_sban_add, uid, reason)
+    STORY_BANNED.add(uid)
+    await update.message.reply_text(f"⛔ تم منع <code>{uid}</code> من إرسال الحكايات"
+                                    + (f"\nالسبب: {html.escape(reason)}" if reason else "")
+                                    + f"\n\nلإلغاء المنع: <code>/storyunban {uid}</code>")
+
+
+async def cmd_storyunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/storyunban 123456789</code>")
+        return
+    uid = int(context.args[0])
+    n = await asyncio.to_thread(_sban_del, uid)
+    STORY_BANNED.discard(uid)
+    await update.message.reply_text(f"✅ تم إلغاء منع <code>{uid}</code>" if n else "❌ غير موجود في قائمة المنع.")
+
+
+async def cmd_storybans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    rs = await asyncio.to_thread(_sban_list)
+    if not rs:
+        await update.message.reply_text("لا يوجد ممنوعون.")
+        return
+    await _long_reply(update, "⛔ <b>الممنوعون من إرسال الحكايات</b>\n\n" + "\n".join(
+        f"• <code>{r['user_id']}</code>" + (f" · {html.escape(r['reason'])}" if r["reason"] else "")
+        + f"\n   <code>/storyunban {r['user_id']}</code>" for r in rs))
+
+
+# ───────── التصدير ─────────
+EXPORT_FIELDS = ["id", "created", "kind", "name", "username", "user_id", "anon", "consent", "public",
+                 "replied", "edited", "thanked", "source", "text"]
+
+
+def _export_items():
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT * FROM s_stories ORDER BY id")
+        rows = cur.fetchall()
+    return [dict(id=r["id"], created=fmt_dt(r["created_at"] or 0), kind=r["kind"], name=r["name"] or "",
+                 username=r["username"] or "", user_id=r["user_id"], anon=r["anon"], consent=r["consent"],
+                 public=r["public"], replied=r["replied"], edited=r.get("edited", 0), thanked=r.get("thanked", 0),
+                 source=r["source"], text=r["text"] or "") for r in rows]
+
+
+def _csv_safe(v):
+    """يمنع تنفيذ الصيغ عند فتح الملف في Excel (قيمة تبدأ بـ = + - @)."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
+
+
+def _export_bytes(items, fmt):
+    if fmt == "json":
+        return json.dumps(items, ensure_ascii=False, indent=1).encode("utf-8")
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=EXPORT_FIELDS)
+    w.writeheader()
+    for it in items:
+        w.writerow({k: _csv_safe(v) for k, v in it.items()})
+    return buf.getvalue().encode("utf-8-sig")        # BOM كي يعرض Excel العربية صحيحة
+
+
+async def cmd_exportstories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/exportstories [csv|json] ← ملف بكل الحكايات"""
+    if not _s_is_admin(update):
+        return
+    fmt = (context.args[0].lower() if context.args else "csv")
+    if fmt not in ("csv", "json"):
+        await update.message.reply_text("الاستعمال: <code>/exportstories csv</code> أو <code>/exportstories json</code>")
+        return
+    items = await asyncio.to_thread(_export_items)
+    if not items:
+        await update.message.reply_text("لا توجد حكايات للتصدير.")
+        return
+    data = await asyncio.to_thread(_export_bytes, items, fmt)
+    if len(data) > 49 * 1024 * 1024:
+        await update.message.reply_text("⚠️ الملف أكبر من حدّ تيليجرام (50MB).")
+        return
+    fname = f"stories_{_local(time.time()).strftime('%Y%m%d_%H%M')}.{fmt}"
+    await context.bot.send_document(update.effective_chat.id, io.BytesIO(data), filename=fname,
+                                    caption=f"📤 {len(items):,} حكاية · {len(data) / 1024:.0f}KB")
+
+
 # ───────── نقاط الربط مع بقية الملف ─────────
 def story_register(app, env):
     """تُستدعى مرة واحدة في main(): تسجّل أوامر الأدمن على بوت التعدين."""
@@ -3730,7 +4599,21 @@ def story_register(app, env):
                      ("storybot", cmd_storybot), ("stories", cmd_stories), ("story", cmd_story),
                      ("storyreply", cmd_storyreply), ("publish", cmd_publish), ("unpublish", cmd_unpublish),
                      ("delstory", cmd_delstory), ("setstorywelcome", cmd_setstorywelcome),
-                     ("storymenu", cmd_storymenu)):
+                     ("storymenu", cmd_storymenu),
+                     # إدارة
+                     ("storysearch", cmd_storysearch), ("storyfilter", cmd_storyfilter),
+                     ("unreplied", cmd_unreplied), ("pending", cmd_pending),
+                     ("publishall", cmd_publishall), ("pubconfirm", cmd_pubconfirm), ("pubcancel", cmd_pubcancel),
+                     ("storyedit", cmd_storyedit),
+                     # تواصل
+                     ("storybroadcast", cmd_storybroadcast), ("sbconfirm", cmd_sbconfirm), ("sbcancel", cmd_sbcancel),
+                     ("storythanks", cmd_storythanks), ("thconfirm", cmd_thconfirm), ("thcancel", cmd_thcancel),
+                     ("setstorythanks", cmd_setstorythanks), ("storymsg", cmd_storymsg),
+                     # إحصائيات وحماية وتصدير
+                     ("storystats", cmd_storystats), ("storyoff", cmd_storyoff), ("storyon", cmd_storyon),
+                     ("setcooldown", cmd_setcooldown), ("storyban", cmd_storyban),
+                     ("storyunban", cmd_storyunban), ("storybans", cmd_storybans),
+                     ("exportstories", cmd_exportstories)):
         app.add_handler(CommandHandler(name, fn))
 
 
