@@ -89,9 +89,9 @@ REF_ENERGY = 1000        # +طاقة قصوى لكل مُحال نشط (عدّن
 REF_MIN = 1000          # (قديم - لم يعد مستعملاً)
 REF_SECS = 3600         # مدة التعدين الفعلي اللازمة ليُحتسب المُحال (ساعة) — يمنع الإحالات الوهمية
 REF_MAX = 50            # أقصى عدد مُحالين نشطين تُحتسب لهم المكافأة
-DAILY = [1000, 2000, 3000, 5000, 7500, 12000]   # اليوم 7: خادم SLIM لمدة 30 دقيقة
+DAILY = [1000, 2000, 3000, 5000, 7500, 12000, 20000]   # طاقة المكافأة اليومية (اليوم 7 = 20000)
 PATRON_SECS = 86400
-MAX_SRV = 10            # أقصى عدد من كل نوع خادم دائم
+MAX_SRV = 10            # (الخوادم معطّلة حالياً)
 ENERGY_BASE = 2000      # الطاقة القصوى عند المستوى 1
 ENERGY_PER_LEVEL = 1000 # تزيد الطاقة القصوى بهذا المقدار مع كل مستوى (مستوى 2 = 3000 ...)
 STALE_SECS = 15         # أي معدّن لم تُحدَّث بياناته منذ هذه المدة تُحدَّث تلقائياً من السيرفر
@@ -116,7 +116,8 @@ for _k, _m in MODES.items():            # كل وضع مدفوع يصبح عنص
         ITEMS[f"mode_{_k}"] = dict(stars=_m["stars"], title=f"وضع {_m['name']}",
                                    desc=f"يفتح وضع التعدين {_m['name']} (×{_m['mul']:g} هاش).")
 
-# الخوادم: hr = زيادة الهاش، cost بنقاط HASH (0 = مكافأة فقط)، mins = مدة مؤقتة
+# الخوادم (معطّلة حالياً: الواجهة والـ API محذوفان؛ التعريف باقٍ لإعادة التفعيل لاحقاً)
+# hr = زيادة الهاش، cost بنقاط HASH (0 = مكافأة فقط)، mins = مدة مؤقتة
 SERVERS = {
     "slim": dict(title="SLIM", hr=500, cost=0, mins=30),
     "nano": dict(title="NANO", hr=800, cost=1000, mins=0),
@@ -124,8 +125,8 @@ SERVERS = {
     "rack": dict(title="RACK", hr=12000, cost=20000, mins=0),
     "farm": dict(title="FARM", hr=50000, cost=80000, mins=0),
 }
-DEX_BASE = 0.008        # سعر طاقة واحدة بنقاط HASH
-DEX_FEE = 0.03          # عمولة البيع
+DEX_BASE = 0.008        # (DEX معطّل حالياً)
+DEX_FEE = 0.03          # (DEX معطّل حالياً)
 TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
 try:
     TZ_OFFSET = float(os.environ.get("TZ_OFFSET", "1"))    # فرق التوقيت عن UTC لتواريخ الأدمن (الجزائر = 1)
@@ -468,8 +469,7 @@ def lock_user(cur, uid):
     u = cur.fetchone()
     if not u:
         raise Err("user")
-    cur.execute("SELECT kind FROM m_servers WHERE user_id=? AND (expires=0 OR expires>?)", (uid, time.time()))
-    u["srv"] = sum(SERVERS[r["kind"]]["hr"] for r in cur.fetchall() if r["kind"] in SERVERS)
+    u["srv"] = 0                            # الخوادم معطّلة حالياً (لا أثر لها على الهاش)
     cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE referrer=? AND mined_secs>=? AND banned=0", (uid, REF_SECS))
     u["refs_act"] = min(cur.fetchone()["n"], REF_MAX)
     u["xmax"] = xmax_of(u)                  # الحد الأقصى الفعلي للطاقة
@@ -610,7 +610,7 @@ def settle_stale():
             log.exception("settle_stale %s", i)
 
 
-# ═══════════ 3.1) DEX: تبادل HASH ↔ طاقة ═══════════
+# ═══════════ 3.1) DEX (معطّل حالياً — الدوال باقية لإعادة التفعيل لاحقاً) ═══════════
 def dex_price(t):
     return DEX_BASE * (1 + 0.06 * math.sin(t / 1800) + 0.03 * math.sin(t / 421 + 1))
 
@@ -837,18 +837,9 @@ def act_me(tg, b):
         last_block = (cur.fetchone() or {}).get("m") or 0
         cur.execute("SELECT task FROM m_tasks WHERE user_id=?", (u["id"],))
         done = {r["task"] for r in cur.fetchall()}
-        cur.execute("SELECT kind, COUNT(*) AS n FROM m_servers WHERE user_id=? AND expires=0 GROUP BY kind",
-                    (u["id"],))
-        owned = {r["kind"]: r["n"] for r in cur.fetchall()}
-        cur.execute("SELECT kind, expires FROM m_servers WHERE user_id=? AND expires>?", (u["id"], now))
-        temps = [dict(title=SERVERS[r["kind"]]["title"], hr=SERVERS[r["kind"]]["hr"],
-                      left=int(r["expires"] - now)) for r in cur.fetchall() if r["kind"] in SERVERS]
-    servers = [dict(key=k, title=v["title"], hr=v["hr"], owned=owned.get(k, 0),
-                    cost=int(v["cost"] * 1.25 ** owned.get(k, 0)), max=MAX_SRV)
-               for k, v in SERVERS.items() if v["cost"] > 0]
     return dict(**state(u), refs=refs, online=a["n"], total_hr=a["h"], difficulty=a["h"] * 0.2,
                 block_reward=BLOCK_REWARD * (2 if u["patron"] > now else 1), next_block=last_block + 1,
-                ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_hours=REF_SECS // 3600, ref_max=REF_MAX, ref_active=ref_active, daily=DAILY, dex=dex_info(), chain=chain_info(), servers=servers, temps=temps,
+                ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_hours=REF_SECS // 3600, ref_max=REF_MAX, ref_active=ref_active, daily=DAILY, chain=chain_info(),
                 modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"], stars=v["stars"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
                 tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
@@ -898,71 +889,10 @@ def act_daily(tg, b):
         if wait > 0:
             raise Err("المكافأة التالية لم تحن بعد")
         idx = streak % 7
-        if idx < 6:
-            u["energy"] += DAILY[idx]          # قد تتجاوز الحد الأقصى كمكافأة
-        else:
-            sv = SERVERS["slim"]
-            cur.execute("INSERT INTO m_servers(user_id,kind,expires) VALUES(?,?,?)",
-                        (u["id"], "slim", time.time() + sv["mins"] * 60))
-            u["srv"] += sv["hr"]
+        u["energy"] += DAILY[idx]              # قد تتجاوز الحد الأقصى كمكافأة
         u["streak"], u["last_daily"] = streak + 1, time.time()
         save_user(cur, u)
     return {}
-
-
-def act_server(tg, b):
-    key = b.get("key")
-    sv = SERVERS.get(key)
-    if not sv or sv["cost"] <= 0:
-        raise Err("خادم غير معروف")
-    with cursor() as cur:
-        u = touch(cur, tg)
-        cur.execute("SELECT COUNT(*) AS n FROM m_servers WHERE user_id=? AND kind=? AND expires=0",
-                    (u["id"], key))
-        owned = cur.fetchone()["n"]
-        if owned >= MAX_SRV:
-            raise Err("وصلت للحد الأقصى من هذا الخادم")
-        cost = int(sv["cost"] * 1.25 ** owned)
-        if u["balance"] < cost:
-            raise Err("رصيد HASH غير كافٍ")
-        u["balance"] -= cost
-        cur.execute("INSERT INTO m_servers(user_id,kind,expires) VALUES(?,?,0)", (u["id"], key))
-        u["srv"] += sv["hr"]
-        save_user(cur, u)
-    return {"msg": f"✅ تم شراء خادم {sv['title']}"}
-
-
-def act_dex(tg, b):
-    side = b.get("side")
-    try:
-        amt = float(b.get("amount"))
-    except (TypeError, ValueError):
-        raise Err("مقدار غير صحيح")
-    if not (amt > 0) or amt > 1e12 or amt != amt:
-        raise Err("مقدار غير صحيح")
-    p = dex_price(time.time())
-    with cursor() as cur:
-        u = touch(cur, tg)
-        if side == "buy":
-            if u["balance"] < amt:
-                raise Err("رصيد HASH غير كافٍ")
-            gain = amt / p
-            if u["energy"] + gain > u.get("xmax", u["max_energy"]) + 0.5:
-                raise Err("تتجاوز الحد الأقصى للطاقة")
-            u["balance"] -= amt
-            u["energy"] += gain
-            msg = f"✅ +{gain:,.0f} ⚡"
-        elif side == "sell":
-            if u["energy"] < amt:
-                raise Err("طاقة غير كافية")
-            got = amt * p * (1 - DEX_FEE)
-            u["energy"] -= amt
-            u["balance"] += got
-            msg = f"✅ +{got:,.4f} HASH"
-        else:
-            raise Err("عملية غير صحيحة")
-        save_user(cur, u)
-    return {"msg": msg}
 
 
 def act_refs(tg, b):
@@ -1093,8 +1023,8 @@ async def act_invoice(tg, b):
     return {"link": link}
 
 
-SYNC = {"me": act_me, "mining": act_mining, "mode": act_mode, "daily": act_daily, "server": act_server,
-        "dex": act_dex, "refs": act_refs, "blocks": act_blocks, "top": act_top, "redeem": act_redeem}
+SYNC = {"me": act_me, "mining": act_mining, "mode": act_mode, "daily": act_daily,
+        "refs": act_refs, "blocks": act_blocks, "top": act_top, "redeem": act_redeem}
 ASYNC = {"task": act_task, "invoice": act_invoice}
 
 
@@ -2871,7 +2801,7 @@ const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
 const SID=(()=>{try{const a=new Uint8Array(8);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return String(Math.random()).slice(2)+Date.now()}})();let SESSNEW=true;
 try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
 function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
-let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,dxSide='buy',dxVal='';
+let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null;
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
 const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
@@ -2908,9 +2838,6 @@ function buy(item){api('invoice',{item}).then(r=>tg.openInvoice(r.link,s=>{if(s=
 function redeem(){const c=$('cd').value.trim();if(!c)return;
   api('redeem',{code:c}).then(r=>{toast(r.msg);load()}).catch(e=>toast(e.message))}
 async function act(p,b){try{const r=await api(p,b||{});if(r.msg)toast(r.msg);await load()}catch(e){toast(e.message)}}
-function dxPrev(){const v=parseFloat(dxVal)||0,p=S.dex.price;
-  return dxSide==='buy'?'≈ '+fi(v/p)+' ⚡':'≈ '+f(v*p*(1-S.dex.fee),4)+' HASH'}
-function dxGo(){api('dex',{side:dxSide,amount:parseFloat(dxVal)||0}).then(r=>{toast(r.msg);dxVal='';load()}).catch(e=>toast(e.message))}
 function donate(){const n=parseInt($('sp').value);if(!n||n<1)return toast('أدخل عدد النجوم');
   api('invoice',{item:'support',stars:n}).then(r=>tg.openInvoice(r.link,s=>{if(s==='paid')toast('❤️ شكراً لدعمك!')})).catch(e=>toast(e.message))}
 function fmtDate(t){return new Date(t*1000).toLocaleString('en-GB',{hour12:false}).replace(',','')}
@@ -3046,10 +2973,6 @@ function vMine(){
   if(!S.chain.started)h+=S.chain.scheduled?`<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">ينطلق في <b>${esc(S.chain.start_txt)}</b></p><div class="big" id="cdn" style="font-size:30px;text-align:center;margin-top:10px">--:--:--</div></div>`:
     `<div class="card"><div class="cap">LAUNCH</div><h2>⏳ التعدين لم يبدأ بعد</h2><p class="h">سيُعلن عن موعد الانطلاق قريباً.</p></div>`;
   else if(S.chain.done)h+=`<div class="card"><h2>🏁 اكتمل التعدين</h2><p class="h">تم تعدين جميع الكتل (${fi(S.chain.blocks)}).</p></div>`;
-  const D=S.dex;
-  h+=`<div class="grid"><div class="card mini" onclick="openSheet('dex')"><b>DEX β</b>
-    <span class="h">1 ⚡ ≈ ${f(D.price,5)} #</span><br><span class="${D.change>=0?'up':'dn'}" style="direction:ltr;display:inline-block">${D.change>=0?'▲':'▼'} ${f(Math.abs(D.change))}%</span><br><span class="h">اشترِ، بِع ← فتح</span></div>
-    <div class="card mini" onclick="openSheet('servers')"><b>🖥 الخوادم</b><span class="h">+${fi(S.srv)} H/s</span><br><span class="h">مركز إدارة الخوادم ← فتح</span></div></div>`;
   h+=`<div class="card"><div class="row"><div><b style="color:var(--tx);font-size:16px">👑 كن راعي التعدين</b><br><span class="h">×2 مكافأة كل كتلة · 24h+</span></div>
     <button class="sm pri" onclick="buy('patron')">⭐ ${S.prices.patron}</button></div>
     ${S.patron_left>0?`<p class="h" style="margin-top:8px;color:var(--grn)">فعّال · المتبقي ${fmtWait(S.patron_left)}</p>`:''}</div>`;
@@ -3070,8 +2993,7 @@ function vMine(){
     <div class="cell"><span class="h">الدخل</span><b>${f(S.income,1)} #</b></div></div>
     <div class="grid ctl" style="margin-top:0">${S.mining?'<button class="stop sbtn" onclick="act(\'mining\',{on:false})">⏹ إيقاف التعدين</button>':
       '<button class="pri sbtn" '+((S.chain.started&&!S.chain.done)?'':'disabled ')+'onclick="act(\'mining\',{on:true})"><span class="pbx">'+ic('play',16)+'</span>بدء التعدين</button>'}
-    <button class="mdb" onclick="openSheet('modes')"><span class="mdi">${ic(mc[0],18)}</span><span class="mdt"><small>الوضع</small><b>${esc(m.name)}</b></span><span class="mdx">×${m.mul}</span>${ic('sliders',17)}</button></div>
-    <button class="runb" onclick="openSheet('servers')">${ic('server',16)}مركز إدارة الخوادم</button></div>`;
+    <button class="mdb" onclick="openSheet('modes')"><span class="mdi">${ic(mc[0],18)}</span><span class="mdt"><small>الوضع</small><b>${esc(m.name)}</b></span><span class="mdx">×${m.mul}</span>${ic('sliders',17)}</button></div></div>`;
   }
   h+=`<h3 style="margin:4px 2px 10px">آخر 25 كتلة</h3>`+(B.length?B.map(blkCard).join(''):'<div class="card"><p class="h">لا توجد كتل بعد.</p></div>');
   return h}
@@ -3090,11 +3012,11 @@ function vRefs(){
     <p class="bd">تحصل على +${fi(S.ref_energy)} طاقة قصوى عن كل مُحال يعدّن ${fi(S.ref_hours)} ساعة فعلية على الأقل (حتى ${fi(S.ref_max)} مُحال). المُحالون النشطون حالياً: <b style="color:var(--tx)">${fi(S.ref_active)}</b> / ${fi(S.ref_max)}. الإحالات الوهمية لا تُحتسب.</p></div>
   <div class="stc"><div class="sth lbh"><div><div class="lbt">أفضل 100 إحالة</div><div class="lbs">لوحة الصدارة</div></div><span class="lbn">${String(L.length).padStart(3,'0')}</span></div>${rows}</div>`}
 function vTasks(){
-  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000'];
+  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000','+20,000'];
   const ready=S.daily_wait<=0;
   let h=`<div class="card"><div class="cap">DAILY · STREAK</div><h2>🎁 مكافآت يومية</h2><p class="h">عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى).</p><div class="days" style="margin-top:12px">`+
-  lab.map((l,i)=>`<div class="day ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>⚡ ${l}</b>${i<S.day_idx?'✓':'🔒'}</div>`).join('')+
-  `<div class="day wide ${S.day_idx>6?'on':''}"><span>اليوم 7</span><b style="color:var(--blue)">SLIM</b><span>خادم تعدين SLIM · 30 دقيقة</span></div></div>
+  lab.map((l,i)=>`<div class="day ${i==6?'wide':''} ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>⚡ ${l}</b>${i<S.day_idx?'✓':'🔒'}</div>`).join('')+
+  `</div>
   <button class="pri" ${ready?'':'disabled'} onclick="act('daily')">${ready?'🎁 استلم مكافأة اليوم':'التالية بعد '+fmtWait(S.daily_wait)}</button></div>`;
   if(S.tasks.length)h+=`<div class="card"><h3>المهام</h3>`+S.tasks.map(t=>`<div class="rk"><span class="n">${esc(t.title)}</span><span class="tag">+${t.reward}</span>
   ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
@@ -3215,22 +3137,6 @@ function sheetHTML(){
     <p class="h" style="text-align:center;margin:14px 0 0">— أو —</p>
     <h3 style="margin-top:8px">استعادة الطاقة</h3><p class="h">استعد طاقتك الحالية إلى الحد الأقصى مقابل رسوم صغيرة.</p>
     <button onclick="buy('restore')">⭐ ادفع ${S.prices.restore} STARS</button>`;
-  }else if(sheet==='servers'){
-    b=`<div class="cap">SERVER · CONTROL CENTER</div><h2>🖥 مركز إدارة الخوادم</h2>
-    <p class="h">كل خادم يزيد معدل الهاش دائماً. السعر يرتفع 25% مع كل نسخة. زيادتك الحالية: <b>+${fi(S.srv)} H/s</b></p>`+
-    S.temps.map(t=>`<div class="rk"><span class="n">${esc(t.title)} <span class="h">مؤقت</span></span><span class="tag">+${fi(t.hr)} H/s</span><span class="h">${fmtLeft(t.left)}</span></div>`).join('')+
-    S.servers.map(s=>`<div class="rk"><span class="n">${esc(s.title)} <span class="h">×${s.owned}/${s.max}</span><br><span class="h">+${fi(s.hr)} H/s</span></span>
-    <button class="sm pri" ${s.owned>=s.max?'disabled':''} onclick="act('server',{key:'${s.key}'})">${fi(s.cost)} #</button></div>`).join('');
-  }else if(sheet==='dex'){
-    const D=S.dex;
-    b=`<div class="cap">DEX · β</div><h2>تبادل HASH ⇄ طاقة</h2>
-    <p class="h">1 ⚡ ≈ <b style="color:var(--tx)">${f(D.price,5)}</b> # · <span class="${D.change>=0?'up':'dn'}" style="direction:ltr;display:inline-block">${D.change>=0?'▲':'▼'} ${f(Math.abs(D.change))}%</span> · عمولة البيع ${Math.round(D.fee*100)}%</p>
-    <div class="seg" style="margin:12px 0"><button class="${dxSide==='buy'?'on':''}" onclick="dxSide='buy';dxVal='';draw()">شراء طاقة</button>
-    <button class="${dxSide==='sell'?'on':''}" onclick="dxSide='sell';dxVal='';draw()">بيع طاقة</button></div>
-    <p class="h" style="margin-bottom:6px">${dxSide==='buy'?'المبلغ بـ HASH (رصيدك '+f(S.balance,2)+')':'كمية الطاقة (لديك '+fi(S.energy)+')'}</p>
-    <input id="dxi" class="inp" type="number" inputmode="decimal" placeholder="0" value="${esc(dxVal)}" oninput="dxVal=this.value;$('dxp').textContent=dxPrev()">
-    <p class="h" id="dxp" style="text-align:center;margin:8px 0 0">${dxPrev()}</p>
-    <button class="pri" onclick="dxGo()">${dxSide==='buy'?'شراء':'بيع'}</button>`;
   }else if(sheet==='modes'){
     const ks=Object.keys(S.modes).map(Number).sort((a,b)=>a-b),tot=ks.length*TEST_SECS;
     b=`<div class="cap cap2"><i class="dot"></i>MINING · MODES</div><h2>أوضاع التعدين</h2>
@@ -3255,7 +3161,7 @@ setInterval(()=>{ // تحديث محلي سلس بين طلبات السيرفر
   if($('enx'))$('enx').textContent=fi(S.energy)+' / '+fi(S.max_energy);
   if($('enb'))$('enb').style.width=Math.min(100,S.energy/S.max_energy*100)+'%';
   if(S.energy<=0)load().catch(()=>{})},250);
-setInterval(()=>{if(S&&!document.hidden&&sheet!=='dex'&&sheet!=='modes'&&sheet!=='blk'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
+setInterval(()=>{if(S&&!document.hidden&&sheet!=='modes'&&sheet!=='blk'&&document.activeElement.tagName!=='INPUT')load().catch(()=>{})},6000);
 setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
