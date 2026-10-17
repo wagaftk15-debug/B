@@ -3186,6 +3186,8 @@ else load().catch(e=>{if(BANNED)return;$('app').innerHTML='<p class="h" style="t
 STORY_APP = None    # تطبيق بوت الحكايات الشغّال حالياً
 ENV = {}            # يملؤها main(): cursor, get_setting, set_setting, admin_id, main_token
 STORY_RATE = {}     # حدّ الإرسال من الموقع لكل IP
+STORY_MENU = "لم يُضبط بعد"   # حالة زر القائمة (للتشخيص)
+STORY_VERSION = "v3 · تطبيق مصغّر"
 LAST_MSG = {}       # آخر وقت أرسل فيه كل مستخدم حكاية من البوت
 MAX_LEN = 3500
 COOLDOWN = 15       # ثواني بين حكاية وأخرى (البوت)
@@ -3423,6 +3425,21 @@ async def stop_story():
             slog.exception("stop story step")
 
 
+async def _apply_menu(bot):
+    global STORY_MENU
+    if not WEBAPP_URL:
+        STORY_MENU = "❌ WEBAPP_URL غير مضبوط (لا يوجد دومين للموقع)"
+        return STORY_MENU
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+            text="🌐 احكِ حكايتك", web_app=WebAppInfo(url=_story_url())))
+        STORY_MENU = "✅ تم ضبط زر القائمة"
+    except Exception as e:
+        STORY_MENU = "❌ فشل ضبط زر القائمة: " + str(e)[:150]
+        slog.warning("story menu button failed: %s", e)
+    return STORY_MENU
+
+
 async def start_story(token):
     """يشغّل بوت الحكايات بالتوكن المعطى ويرجع اسم المستخدم. يرمي استثناء إن كان التوكن خاطئاً."""
     global STORY_APP
@@ -3440,12 +3457,7 @@ async def start_story(token):
             pass
         raise
     STORY_APP = app
-    if WEBAPP_URL:                                   # زر القائمة بجانب خانة الكتابة يفتح الموقع كتطبيق مصغّر
-        try:
-            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
-                text="🌐 احكِ حكايتك", web_app=WebAppInfo(url=_story_url())))
-        except Exception as e:
-            slog.warning("story menu button failed: %s", e)
+    await _apply_menu(app.bot)                       # زر القائمة بجانب خانة الكتابة يفتح الموقع كتطبيق مصغّر
     return app.bot.username
 
 
@@ -3561,6 +3573,18 @@ async def cmd_setstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          + (f"\n🌐 الموقع: {WEBAPP_URL}/" if WEBAPP_URL else ""))
 
 
+async def cmd_storymenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/storymenu ← يعيد ضبط زر الموقع في بوت الحكايات ويعرض النتيجة"""
+    if not _s_is_admin(update):
+        return
+    if not STORY_APP:
+        await update.message.reply_text("🔴 بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    res = await _apply_menu(STORY_APP.bot)
+    await update.message.reply_text(html.escape(res) + (f"\n🌐 {WEBAPP_URL}/" if WEBAPP_URL else "")
+                                    + "\n\nالآن أرسل /start لبوت الحكايات من جديد.")
+
+
 async def cmd_stopstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _s_is_admin(update):
         return
@@ -3576,7 +3600,7 @@ async def cmd_storybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     I = lambda x: int(x or 0)
     st = f"🟢 يعمل: @{html.escape(STORY_APP.bot.username)}" if STORY_APP else "🔴 متوقف (استخدم /setstorybot)"
     await update.message.reply_text(
-        f"📖 <b>الحكايات</b>\n{st}\n🌐 الموقع: {WEBAPP_URL + '/' if WEBAPP_URL else 'WEBAPP_URL غير مضبوط'}\n\n"
+        f"📖 <b>الحكايات</b> · {STORY_VERSION}\n{st}\n🌐 الموقع: {WEBAPP_URL + '/' if WEBAPP_URL else '❌ WEBAPP_URL غير مضبوط'}\n🔘 {html.escape(STORY_MENU)}\n\n"
         f"📚 الإجمالي: <b>{I(t['n']):,}</b> (من الموقع {I(t['w']):,}) · 🕶 مجهول {I(t['a']):,} · 🌍 منشورة {I(t['p']):,}\n\n"
         "/stories · /story ID · /storyreply ID نص · /publish ID · /unpublish ID · /delstory ID · /setstorywelcome نص")
 
@@ -3703,7 +3727,8 @@ def story_register(app, env):
     for name, fn in (("setstorybot", cmd_setstorybot), ("stopstorybot", cmd_stopstorybot),
                      ("storybot", cmd_storybot), ("stories", cmd_stories), ("story", cmd_story),
                      ("storyreply", cmd_storyreply), ("publish", cmd_publish), ("unpublish", cmd_unpublish),
-                     ("delstory", cmd_delstory), ("setstorywelcome", cmd_setstorywelcome)):
+                     ("delstory", cmd_delstory), ("setstorywelcome", cmd_setstorywelcome),
+                     ("storymenu", cmd_storymenu)):
         app.add_handler(CommandHandler(name, fn))
 
 
