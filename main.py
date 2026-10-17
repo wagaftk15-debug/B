@@ -323,6 +323,7 @@ def init_db():
         cur.execute("SELECT id, ban_reason FROM m_users WHERE banned=1")
         BANNED.clear()
         BANNED.update({r["id"]: r["ban_reason"] or "" for r in cur.fetchall()})
+    story_ensure_tables(cursor, pk)
     log.info("DB ready (%s)", "PostgreSQL" if USE_PG else "SQLite")
 
 
@@ -2191,8 +2192,8 @@ async def sched_loop():
 
 # ═══════════ 5.3) نسخ احتياطي · استرجاع · مشبوهون · تقرير يومي ═══════════
 BACKUP_TABLES = ["m_users", "m_payments", "m_tasks", "m_blocks", "m_codes", "m_redeems",
-                 "m_servers", "m_settings", "m_week_top", "m_sched"]
-SERIAL_TABLES = ["m_blocks", "m_servers", "m_sched"]
+                 "m_servers", "m_settings", "m_week_top", "m_sched", "s_stories"]
+SERIAL_TABLES = ["m_blocks", "m_servers", "m_sched", "s_stories"]
 
 
 def make_backup():
@@ -2465,13 +2466,17 @@ async def post_init(app: Application):
                                       BotCommand("daily", "🌅 تقرير أمس"),
                                       BotCommand("backup", "💾 نسخة احتياطية"),
                                       BotCommand("restore", "♻️ استرجاع نسخة"),
-                                      BotCommand("suspects", "⚠️ مُحيلون مشتبه بهم")]
+                                      BotCommand("suspects", "⚠️ مُحيلون مشتبه بهم"),
+                                      BotCommand("storybot", "📖 بوت الحكايات"),
+                                      BotCommand("setstorybot", "🔗 ربط بوت الحكايات"),
+                                      BotCommand("stories", "📚 آخر الحكايات")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
                 text="⛏ تعدين", web_app=WebAppInfo(url=APP_URL)))
     except Exception as e:
         log.warning("setup failed: %s", e)
+    await story_autostart(app.bot)
     BG.append(asyncio.create_task(block_loop()))
     BG.append(asyncio.create_task(settle_loop()))
     BG.append(asyncio.create_task(week_loop()))
@@ -2486,6 +2491,7 @@ async def post_init(app: Application):
 
 
 async def post_shutdown(app: Application):
+    await story_shutdown()
     for t in BG:
         t.cancel()
     if WEB_RUNNER:
@@ -3173,6 +3179,382 @@ else load().catch(e=>{if(BANNED)return;$('app').innerHTML='<p class="h" style="t
 """
 
 
+# ═══════════ 6.5) بوت «احكِ لي حكايتك» (يُربط بتوكن من أمر الأدمن /setstorybot) ═══════════
+STORY_APP = None    # تطبيق بوت الحكايات الشغّال حالياً
+slog = logging.getLogger("story-bot")
+
+ENV = {}            # يملؤها الملف الرئيسي: cursor, get_setting, set_setting, admin_id, main_token, pk
+LAST_MSG = {}       # آخر وقت أرسل فيه كل مستخدم حكاية (لمنع الإزعاج)
+
+MAX_LEN = 3500
+COOLDOWN = 15       # ثواني بين حكاية وأخرى
+
+KINDS = {
+    "dream": ("🌙 حلمي وأهدافي", "🌙 <b>احكيلي عن حلمك وأهدافك في هذه الحياة…</b>\n\nما الذي تتمنى أن تصل إليه؟ اكتب بحرّية."),
+    "story": ("📖 حكايتي", "📖 <b>احكيلي حكايتك…</b>\n\nأي قصة مرّت بك أو تحب أن تحكيها، ابدأ من حيث تشاء."),
+    "confess": ("🤫 اعتراف", "🤫 <b>اعترف لي بشيء…</b>\n\nشيء تحمله في قلبك ولم تقله لأحد، اكتبه هنا."),
+}
+KIND_ICON = {"dream": "🌙", "story": "📖", "confess": "🤫"}
+KIND_NAME = {"dream": "حلم/أهداف", "story": "حكاية", "confess": "اعتراف"}
+
+DEFAULT_WELCOME = (
+    "👋 أهلاً <b>{name}</b>!\n\n"
+    "احكيلي حكايتك ✨\n"
+    "اختر ما تحب أن تشاركه، ثم اكتب لي رسالتك:\n\n"
+    "🌙 حلمك وأهدافك في هذه الحياة\n"
+    "📖 قصة من حياتك\n"
+    "🤫 اعتراف بشيء لم تقله لأحد\n\n"
+    "ℹ️ <i>ما تكتبه يصل إلى صاحب البوت ليقرأه، فلا تكتب بيانات سرّية مثل كلمات المرور.</i>"
+)
+
+
+# ═══════════ قاعدة البيانات ═══════════
+def story_ensure_tables(cursor, pk):
+    with cursor() as cur:
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS s_stories(
+            id {pk}, user_id BIGINT NOT NULL, name TEXT, username TEXT,
+            kind TEXT NOT NULL DEFAULT 'story', text TEXT NOT NULL,
+            replied INT NOT NULL DEFAULT 0, created_at BIGINT)""")
+
+
+def _save_story(u, kind, text):
+    cursor = ENV["cursor"]
+    with cursor() as cur:
+        cur.execute("INSERT INTO s_stories(user_id,name,username,kind,text,created_at) VALUES(?,?,?,?,?,?)",
+                    (u.id, u.full_name, u.username or "", kind, text, int(time.time())))
+        cur.execute("SELECT MAX(id) AS m FROM s_stories")
+        return (cur.fetchone() or {}).get("m") or 0
+
+
+def _count_user(uid):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM s_stories WHERE user_id=?", (uid,))
+        return cur.fetchone()["n"]
+
+
+def _get_story(sid):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT * FROM s_stories WHERE id=?", (sid,))
+        return cur.fetchone()
+
+
+def _list_stories(n):
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT * FROM s_stories ORDER BY id DESC LIMIT " + str(int(n)))
+        return cur.fetchall()
+
+
+def _total_stories():
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM s_stories")
+        return cur.fetchone()
+
+
+def _mark_replied(sid):
+    with ENV["cursor"]() as cur:
+        cur.execute("UPDATE s_stories SET replied=1 WHERE id=?", (sid,))
+
+
+def _del_story(sid):
+    with ENV["cursor"]() as cur:
+        cur.execute("DELETE FROM s_stories WHERE id=?", (sid,))
+        return cur.rowcount
+
+
+def _welcome_text(name):
+    raw = ENV["get_setting"]("story_welcome") or DEFAULT_WELCOME
+    return raw.replace("{name}", html.escape(name or ""))
+
+
+# ═══════════ بوت الحكايات (واجهة المستخدمين) ═══════════
+def _kinds_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(v[0], callback_data=f"k:{k}")] for k, v in KINDS.items()])
+
+
+async def s_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("kind", None)
+    name = update.effective_user.first_name or update.effective_user.full_name
+    text = await asyncio.to_thread(_welcome_text, name)
+    await update.message.reply_text(text, reply_markup=_kinds_kb())
+
+
+async def s_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    key = (q.data or "")[2:]
+    if key not in KINDS:
+        await q.answer()
+        return
+    context.user_data["kind"] = key
+    await q.answer()
+    await q.message.reply_text(KINDS[key][1] + "\n\n<i>اكتب رسالتك الآن 👇</i>")
+
+
+async def s_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    now = time.time()
+    if now - LAST_MSG.get(u.id, 0) < COOLDOWN:
+        await update.message.reply_text("⏳ مهلاً قليلاً، انتظر بضع ثوانٍ ثم أرسل حكايتك التالية.")
+        return
+    if len(text) > MAX_LEN:
+        await update.message.reply_text(f"✂️ حكايتك طويلة جداً ({len(text)} حرف). الحد الأقصى {MAX_LEN} حرف، "
+                                        "قسّمها على رسالتين من فضلك.")
+        return
+    kind = context.user_data.pop("kind", "story")
+    LAST_MSG[u.id] = now
+    sid = await asyncio.to_thread(_save_story, u, kind, text)
+    n = await asyncio.to_thread(_count_user, u.id)
+    await update.message.reply_text(
+        "💌 وصلتني حكايتك، شكراً لأنك شاركتني إياها.\n\nتريد أن تحكي شيئاً آخر؟ اختر 👇",
+        reply_markup=_kinds_kb())
+    # إشعار الأدمن عبر بوت التعدين
+    mb, admin = ENV.get("main_bot"), ENV.get("admin_id")
+    if mb and admin:
+        try:
+            uname = f" @{html.escape(u.username)}" if u.username else ""
+            body = html.escape(text if len(text) <= 1500 else text[:1500] + "…")
+            await mb.send_message(
+                admin,
+                f"{KIND_ICON.get(kind, '📖')} <b>{KIND_NAME.get(kind, kind)} جديد #{sid}</b>\n"
+                f"👤 {html.escape(u.full_name)}{uname} · <code>{u.id}</code> · (حكايته رقم {n})\n\n"
+                f"{body}\n\n"
+                f"للرد: <code>/storyreply {sid} نص الرد</code>")
+        except Exception:
+            slog.exception("notify admin")
+
+
+def _add_story_handlers(app):
+    app.add_handler(CommandHandler("start", s_start))
+    app.add_handler(CallbackQueryHandler(s_pick, pattern=r"^k:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, s_text))
+
+
+# ═══════════ تشغيل/إيقاف بوت الحكايات ═══════════
+async def stop_story():
+    global STORY_APP
+    app, STORY_APP = STORY_APP, None
+    if not app:
+        return
+    for step in (app.updater.stop, app.stop, app.shutdown):
+        try:
+            await step()
+        except Exception:
+            slog.exception("stop story step")
+
+
+async def start_story(token):
+    """يشغّل بوت الحكايات بالتوكن المعطى ويرجع اسم المستخدم. يرمي استثناء إن كان التوكن خاطئاً."""
+    global STORY_APP
+    await stop_story()
+    app = (Application.builder().token(token).defaults(Defaults(parse_mode=ParseMode.HTML)).build())
+    _add_story_handlers(app)
+    try:
+        await app.initialize()                       # يتحقق من التوكن (getMe)
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except Exception:
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+        raise
+    STORY_APP = app
+    try:
+        await app.bot.set_my_commands([])           # لا أوامر ظاهرة، الأزرار تكفي
+    except Exception:
+        pass
+    return app.bot.username
+
+
+# ═══════════ أوامر الأدمن (على بوت التعدين) ═══════════
+def _s_is_admin(update):
+    a = ENV.get("admin_id")
+    return bool(a) and update.effective_user is not None and update.effective_user.id == a
+
+
+async def cmd_setstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "🔗 <b>ربط بوت الحكايات</b>\n\n1) أنشئ بوتاً جديداً من @BotFather وانسخ التوكن.\n"
+            "2) أرسل هنا:\n<code>/setstorybot 123456:ABC...</code>\n\n"
+            "سأحذف رسالتك فوراً حتى لا يبقى التوكن ظاهراً في المحادثة.")
+        return
+    token = context.args[0].strip()
+    try:                                             # حماية التوكن: نحذف رسالة الأدمن
+        await update.message.delete()
+    except Exception:
+        pass
+    chat = update.effective_chat.id
+    if token == ENV.get("main_token"):
+        await context.bot.send_message(chat, "❌ هذا توكن بوت التعدين نفسه! أنشئ بوتاً جديداً من @BotFather.")
+        return
+    wait = await context.bot.send_message(chat, "⏳ جاري التحقق من التوكن وتشغيل البوت...")
+    try:
+        uname = await start_story(token)
+    except Exception as e:
+        slog.warning("story start failed: %s", e)
+        await wait.edit_text("❌ فشل التشغيل: التوكن غير صحيح أو مستخدم في مكان آخر.\n"
+                             f"<code>{html.escape(str(e))[:200]}</code>")
+        return
+    await asyncio.to_thread(ENV["set_setting"], "story_token", token)
+    await wait.edit_text(f"✅ تم ربط بوت الحكايات: @{html.escape(uname)}\n"
+                         "🔒 حُذفت رسالتك التي فيها التوكن.\n\nجرّبه الآن بإرسال /start له.")
+
+
+async def cmd_stopstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    await stop_story()
+    await asyncio.to_thread(ENV["set_setting"], "story_token", "")
+    await update.message.reply_text("⏹ تم إيقاف بوت الحكايات وحذف التوكن. الحكايات المحفوظة باقية.")
+
+
+async def cmd_storybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    tot = await asyncio.to_thread(_total_stories)
+    st = f"🟢 يعمل: @{html.escape(STORY_APP.bot.username)}" if STORY_APP else "🔴 متوقف (استخدم /setstorybot)"
+    await update.message.reply_text(
+        f"📖 <b>بوت الحكايات</b>\n{st}\n\n"
+        f"📚 الحكايات: <b>{tot['n']:,}</b> من {tot['u']:,} شخص\n\n"
+        "/stories · /story ID · /storyreply ID نص · /delstory ID · /setstorywelcome نص")
+
+
+def _preview(r, n=70):
+    t = (r["text"] or "").replace("\n", " ")
+    return html.escape(t[:n] + ("…" if len(t) > n else ""))
+
+
+async def cmd_stories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    n = 10
+    if context.args and context.args[0].isdigit():
+        n = max(1, min(30, int(context.args[0])))
+    rows = await asyncio.to_thread(_list_stories, n)
+    if not rows:
+        await update.message.reply_text("لا توجد حكايات بعد.")
+        return
+    out = ["📚 <b>آخر الحكايات</b>", ""]
+    for r in rows:
+        out.append(f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> {'✅' if r['replied'] else ''} · "
+                   f"{html.escape(r['name'] or '—')} · <code>{r['user_id']}</code>\n   {_preview(r)}\n   /story {r['id']}")
+    await update.message.reply_text("\n".join(out))
+
+
+async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/story 12</code>")
+        return
+    r = await asyncio.to_thread(_get_story, int(context.args[0]))
+    if not r:
+        await update.message.reply_text("غير موجودة.")
+        return
+    uname = f" @{html.escape(r['username'])}" if r["username"] else ""
+    when = time.strftime("%Y-%m-%d %H:%M", time.gmtime((r["created_at"] or 0) + 3600))
+    await update.message.reply_text(
+        f"{KIND_ICON.get(r['kind'], '📖')} <b>{KIND_NAME.get(r['kind'], r['kind'])} #{r['id']}</b>\n"
+        f"👤 {html.escape(r['name'] or '—')}{uname} · <code>{r['user_id']}</code>\n🕒 {when}\n\n"
+        f"{html.escape(r['text'])}\n\nللرد: <code>/storyreply {r['id']} نص الرد</code>")
+
+
+async def cmd_storyreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/storyreply 12 نص الرد</code>")
+        return
+    if not STORY_APP:
+        await update.message.reply_text("❌ بوت الحكايات متوقف. شغّله بـ /setstorybot")
+        return
+    r = await asyncio.to_thread(_get_story, int(parts[1]))
+    if not r:
+        await update.message.reply_text("الحكاية غير موجودة.")
+        return
+    try:
+        await STORY_APP.bot.send_message(r["user_id"], "💌 <b>ردّ على حكايتك:</b>\n\n" + html.escape(parts[2]))
+    except Exception as e:
+        await update.message.reply_text(f"❌ تعذّر الإرسال (ربما حظر البوت): {html.escape(str(e))[:200]}")
+        return
+    await asyncio.to_thread(_mark_replied, r["id"])
+    await update.message.reply_text("✅ وصل ردّك.")
+
+
+async def cmd_delstory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/delstory 12</code>")
+        return
+    n = await asyncio.to_thread(_del_story, int(context.args[0]))
+    await update.message.reply_text("🗑 تم الحذف" if n else "غير موجودة.")
+
+
+async def cmd_setstorywelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _s_is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "✏️ <code>/setstorywelcome نص الترحيب {name}</code>\n(<code>{name}</code> = اسم المستخدم)\n"
+            "للعودة للافتراضي: <code>/setstorywelcome reset</code>")
+        return
+    new = parts[1].strip()
+    if new.lower() in ("reset", "default", "افتراضي"):
+        new = ""
+    await asyncio.to_thread(ENV["set_setting"], "story_welcome", new)
+    await update.message.reply_text("✅ تم تحديث رسالة الترحيب." if new else "✅ رجعت الرسالة الافتراضية.")
+
+
+# ═══════════ نقاط الربط مع الملف الرئيسي ═══════════
+def story_register(app, env):
+    """تُستدعى مرة واحدة في main() قبل run_polling: تسجّل أوامر الأدمن على بوت التعدين."""
+    ENV.update(env)
+    app.add_handler(CommandHandler("setstorybot", cmd_setstorybot))
+    app.add_handler(CommandHandler("stopstorybot", cmd_stopstorybot))
+    app.add_handler(CommandHandler("storybot", cmd_storybot))
+    app.add_handler(CommandHandler("stories", cmd_stories))
+    app.add_handler(CommandHandler("story", cmd_story))
+    app.add_handler(CommandHandler("storyreply", cmd_storyreply))
+    app.add_handler(CommandHandler("delstory", cmd_delstory))
+    app.add_handler(CommandHandler("setstorywelcome", cmd_setstorywelcome))
+
+
+async def story_autostart(main_bot):
+    """تُستدعى في post_init: تشغّل بوت الحكايات تلقائياً إن كان التوكن محفوظاً (يعمل بعد كل إعادة تشغيل)."""
+    ENV["main_bot"] = main_bot
+    try:
+        token = await asyncio.to_thread(ENV["get_setting"], "story_token", "")
+    except Exception:
+        slog.exception("story autostart read")
+        return
+    if not token:
+        return
+    try:
+        uname = await start_story(token)
+        slog.info("Story bot started: @%s", uname)
+    except Exception as e:
+        slog.warning("Story bot failed to start: %s", e)
+        if ENV.get("admin_id"):
+            try:
+                await main_bot.send_message(ENV["admin_id"],
+                                            "⚠️ تعذّر تشغيل بوت الحكايات تلقائياً (التوكن لم يعد صالحاً؟).\n"
+                                            "أعد ربطه بـ /setstorybot")
+            except Exception:
+                pass
+
+
+async def story_shutdown():
+    await stop_story()
+
+
 # ═══════════ 7) التشغيل ═══════════
 def main():
     init_db()
@@ -3220,6 +3602,8 @@ def main():
     app.add_handler(CommandHandler("wkcancel", cmd_wkcancel))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+    story_register(app, dict(cursor=cursor, get_setting=get_setting, set_setting=set_setting,
+                             admin_id=ADMIN_ID, main_token=BOT_TOKEN))
     log.info("Bot started (polling)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
