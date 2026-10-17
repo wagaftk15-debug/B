@@ -98,16 +98,16 @@ STALE_SECS = 15         # أي معدّن لم تُحدَّث بياناته م�
 
 # أوضاع التعدين:
 #   mul   = مضاعف الهاش
-#   cost  = مضاعف استهلاك الطاقة (عدّله لتوازن اللعبة)
+#   cost  = مضاعف استهلاك الطاقة. الكفاءة = mul/cost = الربح لكل وحدة طاقة (العادي 1.0؛ كل وضع أغلى = كفاءة أعلى)
 #   stars = سعر فتح الوضع بنجوم تيليجرام (0 = مفتوح مجاناً)
 MODES = {1: dict(name="عادي", mul=1.0, cost=1.0, stars=0),
-         2: dict(name="تيربو", mul=1.5, cost=2.0, stars=199),
-         3: dict(name="سوبر", mul=4.0, cost=5.0, stars=499),
-         4: dict(name="نيترو", mul=6.0, cost=8.0, stars=999),
-         5: dict(name="بلازما", mul=14.0, cost=18.0, stars=1499),
-         6: dict(name="كوازار", mul=20.0, cost=26.0, stars=2499),
-         7: dict(name="نجم نابض", mul=34.0, cost=44.0, stars=3999),
-         8: dict(name="التفرد", mul=40.0, cost=52.0, stars=6999)}
+         2: dict(name="تيربو", mul=1.5, cost=1.30, stars=199),
+         3: dict(name="سوبر", mul=4.0, cost=2.96, stars=499),
+         4: dict(name="نيترو", mul=6.0, cost=3.75, stars=999),
+         5: dict(name="بلازما", mul=14.0, cost=7.37, stars=1499),
+         6: dict(name="كوازار", mul=20.0, cost=8.70, stars=2499),
+         7: dict(name="نجم نابض", mul=34.0, cost=12.14, stars=3999),
+         8: dict(name="التفرد", mul=40.0, cost=11.43, stars=6999)}
 # أسماء بديلة تُقبل في أمر /gencode mode ...
 MODE_ALIASES = {"normal": 1, "turbo": 2, "super": 3, "nitro": 4, "plasma": 5,
                 "quasar": 6, "pulsar": 7, "singularity": 8}
@@ -2917,7 +2917,7 @@ function modeCard(k){
     `<span class="mbtn pr">${ic('lock',12)}${m.stars}${ic('star',12)}</span>`;
   return `<div class="mc ${on?'act':''}" style="--mc:${c[1]}" onclick="modeClick(${k})">
     <span class="mi">${ic(c[0],18)}</span>
-    <div class="mt"><b>${esc(m.name)}</b><em>×${m.mul}</em><div class="ms" id="ms${k}">${mSub(k)}</div></div>${btn}
+    <div class="mt"><b>${esc(m.name)}</b><em>×${m.mul}</em><em style="color:var(--grn)">كفاءة ${(m.mul/m.cost).toFixed(2)}×</em><div class="ms" id="ms${k}">${mSub(k)}</div></div>${btn}
     <i class="mbar" id="mb${k}" style="width:${mBar(k)}%"></i></div>`}
 
 function walletCard(){return `<div class="card"><div class="cap">WALLET · MAIN VAULT</div>
