@@ -272,7 +272,10 @@ def init_db():
                          ("modes", "TEXT NOT NULL DEFAULT '1'"),
                          ("banned", "INT NOT NULL DEFAULT 0"),
                          ("ban_reason", "TEXT NOT NULL DEFAULT ''"),
-                         ("week_base", "DOUBLE PRECISION NOT NULL DEFAULT 0")])
+                         ("week_base", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+                         ("last_win", "BIGINT NOT NULL DEFAULT 0"),
+                         ("last_win_at", "BIGINT NOT NULL DEFAULT 0"),
+                         ("week_wins", "INT NOT NULL DEFAULT 0")])
     add_cols("m_blocks", [("thr", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
                           ("bhash", "TEXT NOT NULL DEFAULT ''"),
                           ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -560,6 +563,8 @@ def make_block():
         u["wins"] += 1
         u["income"] += win
         save_user(cur, u)
+        cur.execute("UPDATE m_users SET last_win=?, last_win_at=?, week_wins=week_wins+1 WHERE id=?",
+                    (bid, int(now), w["id"]))
         cur.execute("UPDATE m_blocks SET miner_level=?, miner_mode=? WHERE id=?", (u["level"], cur_mode(u), bid))
         cur.execute("UPDATE m_block_rewards SET amount=amount+? WHERE block_id=? AND user_id=?",
                     (win, bid, w["id"]))
@@ -601,7 +606,7 @@ def dex_info():
 
 # ═══════════ 3.3) الترتيب الأسبوعي ═══════════
 # الأسبوع يبدأ كل اثنين 00:00 (بتوقيت TZ_OFFSET). ربح الأسبوع = total - week_base.
-WEEK_CACHE = [0.0, None]
+WEEK_CACHE = [0.0, None, 0]
 
 
 def week_id_of(ts):
@@ -621,7 +626,7 @@ def roll_week():
     saved = get_setting("week_id")
     if saved is None:                                   # أول تشغيل: يبدأ العدّ من الآن
         with cursor() as cur:
-            cur.execute("UPDATE m_users SET week_base=total")
+            cur.execute("UPDATE m_users SET week_base=total, week_wins=0")
         set_setting("week_id", cw)
         return None
     sw = int(saved)
@@ -635,7 +640,7 @@ def roll_week():
         for i, r in enumerate(rows, 1):
             cur.execute("INSERT INTO m_week_top(week_id,pos,user_id,name,amount) VALUES(?,?,?,?,?)",
                         (sw, i, r["id"], r["name"], r["w"]))
-        cur.execute("UPDATE m_users SET week_base=total")
+        cur.execute("UPDATE m_users SET week_base=total, week_wins=0")
         cur.execute("INSERT INTO m_settings(k,v) VALUES('week_id',?) ON CONFLICT (k) DO UPDATE SET v=excluded.v",
                     (str(cw),))
     WEEK_CACHE[1] = None
@@ -653,17 +658,35 @@ def weekly_data(tg):
     now = time.time()
     wid, st, en = week_bounds(now)
     if WEEK_CACHE[1] is None or now - WEEK_CACHE[0] > 20:       # كاش 20 ثانية لتخفيف الضغط
-        WEEK_CACHE[:] = [now, week_top_rows(100)]
+        rows = week_top_rows(100)
+        with cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM m_users WHERE banned=0 AND total-week_base>0")
+            players = cur.fetchone()["n"]
+        WEEK_CACHE[:] = [now, rows, players]
+    top, players = WEEK_CACHE[1], WEEK_CACHE[2]
     with cursor() as cur:
-        cur.execute("SELECT name,level,mode,total-week_base AS w FROM m_users WHERE id=?", (tg["id"],))
-        me = cur.fetchone() or dict(name=tg["name"], level=1, mode=1, w=0)
+        cur.execute("SELECT name,level,mode,hr,last_win,last_win_at,week_wins,total-week_base AS w "
+                    "FROM m_users WHERE id=?", (tg["id"],))
+        me = cur.fetchone() or dict(name=tg["name"], level=1, mode=1, hr=BASE_HR, last_win=0,
+                                    last_win_at=0, week_wins=0, w=0)
         w = max(0.0, float(me["w"] or 0))
         cur.execute("SELECT COUNT(*)+1 AS r FROM m_users WHERE banned=0 AND total-week_base>?", (w,))
         rank = cur.fetchone()["r"]
+    gap, gap_kind = None, ""
+    if rank > 1 and top:                      # كم ينقصك لتتخطى من فوقك (أو لتدخل أفضل 100)
+        if rank - 2 < len(top):
+            above, gap_kind = float(top[rank - 2]["w"]), "up"
+        else:
+            above, gap_kind = float(top[-1]["w"]), "top100"
+        gap = max(0.0, above - w)
+    mode = me["mode"] if me["mode"] in MODES else 1
     return dict(top=[dict(name=r["name"], level=r["level"], tier=tier(r["mode"]), total=r["w"],
-                          me=r["id"] == tg["id"]) for r in WEEK_CACHE[1]],
-                rank=rank, mine=dict(name=me["name"], level=me["level"], total=w, tier=tier(me["mode"])),
-                left=int(en - now), start=fmt_d(st), end=fmt_d(en - 1))
+                          me=r["id"] == tg["id"]) for r in top],
+                rank=rank, mine=dict(name=me["name"], level=me["level"], total=w, tier=tier(mode)),
+                left=int(en - now), start=fmt_d(st), end=fmt_d(en - 1),
+                start_ts=int(st), end_ts=int(en), players=int(players), gap=gap, gap_kind=gap_kind,
+                me=dict(mode=mode, level=me["level"], hr=float(me["hr"] or 0), last_win=int(me["last_win"] or 0),
+                        last_win_at=int(me["last_win_at"] or 0), wins=int(me["week_wins"] or 0)))
 
 
 # ═══════════ 3.2) أكواد الاسترداد ═══════════
@@ -1886,6 +1909,10 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+WEEK_SUFFIX = " {name}! مركزك {rank} هذا الأسبوع بـ {amount} نقطة 🎉"
+WEEK_DEFAULT_MSG = "مبروك {name}! مركزك {rank} هذا الأسبوع بـ {amount} نقطة 🎉"
+
+
 def _pers(text, it):
     return (text.replace("{rank}", str(it["pos"])).replace("{name}", html.escape(it["name"] or ""))
             .replace("{amount}", f"{float(it['amount']):,.0f}"))
@@ -1898,15 +1925,22 @@ async def cmd_weeksend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text_html or "").split(None, 1)
     rest = parts[1].strip() if len(parts) > 1 else ""
     live = False
-    if rest.split(None, 1)[:1] and rest.split(None, 1)[0].lower() == "now":
+    tok = rest.split(None, 1)
+    if tok and tok[0].lower() in ("now", "new", "الان", "الآن"):      # للأسبوع الجاري
         live = True
-        rest = rest.split(None, 1)[1].strip() if len(rest.split(None, 1)) > 1 else ""
+        rest = tok[1].strip() if len(tok) > 1 else ""
+        if not rest:
+            rest = WEEK_DEFAULT_MSG
+    if rest and not any(v in rest for v in ("{name}", "{rank}", "{amount}")):
+        # نص بدون متغيرات: نُلحق به الاسم والمركز والنقاط تلقائياً لكل لاعب
+        rest = rest + WEEK_SUFFIX
     if not rest:
         await update.message.reply_text(
             "🏆 <b>تهنئة أفضل 100 في الترتيب الأسبوعي</b>\n\n"
             "<code>/weeksend مبروك {name}! مركزك {rank} هذا الأسبوع بـ {amount} نقطة 🎉</code>\n"
             "← يُرسل لأفضل 100 في آخر أسبوع منتهٍ\n\n"
-            "<code>/weeksend now نص الرسالة</code> ← لترتيب الأسبوع الجاري الآن\n\n"
+            "<code>/weeksend now مبروك</code> ← للأسبوع الجاري؛ يُضاف الاسم والمركز والنقاط تلقائياً\n"
+            "<code>/weeksend now</code> ← للأسبوع الجاري بالرسالة الجاهزة\n\n"
             "المتغيرات (اختيارية): <code>{name}</code> الاسم · <code>{rank}</code> المركز · <code>{amount}</code> النقاط\n"
             "ستظهر معاينة ثم أرسل /wkconfirm للإرسال أو /wkcancel للإلغاء.")
         return
@@ -2208,6 +2242,20 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .bnb p b{color:#c3c6c9}
 .bnbtn{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:20px;font-size:13px;padding:13px}
 .bnl{border-top:1px solid #303337;padding:12px 20px 14px}
+/* ── بطاقة التصنيف الأسبوعي ── */
+.bm.flat{max-height:none;overflow:hidden;margin-bottom:12px}
+.wkc{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 16px 14px}
+.wkc .bmd{direction:rtl;justify-content:flex-start}
+.wkc .bmd small:first-child{font:600 10px var(--disp);color:#8b9098}
+.wkc .bmd b,.wkc .bmd small:last-child{direction:ltr;unicode-bidi:isolate;text-align:right}
+.cdw{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:12px;direction:ltr}
+.cdb{min-width:58px;text-align:center;background:#25282b;border:1px solid #33363a;border-radius:9px;padding:8px 6px}
+.cdb b{display:block;font:700 24px var(--mono);color:#f4f4f4;line-height:1.15}
+.cdb small{font:400 10px var(--disp);color:#8b9098}
+.cds{font:700 20px var(--mono);color:#6b7178;margin-bottom:14px}
+.bmg.g3 .bmc2:nth-child(-n+4){border-bottom:1px solid #33363a}
+.bmcv .sm{font:400 11px var(--mono);color:#6b7178}
+.bmcv .ar{font:700 15px var(--disp)}
 /* ── نافذة تفاصيل الكتلة ── */
 .bm{position:relative;border:1px solid #3a3d41;border-radius:16px;overflow:hidden;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;max-height:86vh;overflow-y:auto}
 .bm::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent)}
@@ -2578,14 +2626,41 @@ const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
 function amt(n){const s=f(n,4);return '<i class="cn">#</i><span class="amt">'+s.slice(0,-3)+'<small>'+s.slice(-3)+'</small></span>'}
 function who(name,lv,t,tot){return `<div class="nm"><div class="nl"><b>${esc(name)}</b>${badge(t)}<span class="lv">مستوى ${lv}</span></div><div class="am">${amt(tot)}</div></div>`}
+function ago(t){const x=Math.max(0,Date.now()/1000-t);if(x<60)return 'الآن';if(x<3600)return 'منذ '+Math.floor(x/60)+' د';if(x<86400)return 'منذ '+Math.floor(x/3600)+' س';return 'منذ '+Math.floor(x/86400)+' ي'}
+function cdParts(l){l=Math.max(0,Math.floor(l));return [Math.floor(l/86400),Math.floor(l%86400/3600),Math.floor(l%3600/60),l%60]}
+function wkTick(){if(!TOP||!TOP.week||tab!=='top'||topView!=='week')return;
+  const W=TOP.week,now=Date.now()/1000,p=cdParts(W.end_ts-now);
+  ['d','h','m','s'].forEach((k,i)=>{const e=$('wk'+k);if(e)e.textContent=String(p[i]).padStart(2,'0')});
+  const b=$('wkp');if(b)b.style.width=Math.min(100,Math.max(0,(now-W.start_ts)/(W.end_ts-W.start_ts)*100))+'%'}
 function vTopWeek(){
   const W=TOP&&TOP.week;if(!W)return '<p class="h">…</p>';
-  const M=W.mine,L=W.top;
-  return `<div class="stc"><div class="sth"><span class="stic or">${ic('trophy',14)}</span>ترتيبي هذا الأسبوع<span class="rb">#${fi(W.rank)}</span></div>
-  <div class="tmb"><div class="tr"><span class="mlb">ينتهي بعد</span><span class="pc" style="font-size:14px">${fmtDays(W.left)}</span></div>
-  <div class="mlb" style="margin-top:8px;direction:ltr;text-align:right">${esc(W.start)} → ${esc(W.end)}</div></div>
-  <div class="mb">${avs(M.name)}${who(M.name,M.level,M.tier,M.total)}</div></div>
-  <div class="stc"><div class="sth"><span class="stic">${ic('trophy',14)}</span>أفضل 100 هذا الأسبوع</div>`+
+  const L=W.top,M=W.mine,X=W.me,m=S.modes[X.mode]||S.modes[1],mc=MC[X.mode]||MC[1],c=mc[1];
+  const p=cdParts(W.end_ts-Date.now()/1000),pr=Math.min(100,Math.max(0,(Date.now()/1000-W.start_ts)/(W.end_ts-W.start_ts)*100));
+  const cell=(st,icn,l,v)=>`<div class="bmc2"><div class="bmcl"><span class="bmi" style="${st}">${ic(icn,13)}</span><span>${l}</span></div><div class="bmcv">${v}</div></div>`;
+  const col=x=>`color:${x};background:${x}1f;border-color:${x}66`;
+  const gapTxt=W.rank===1?'👑 الأول':(W.gap==null?'—':'+'+f(W.gap,2));
+  const gapLbl=W.rank===1?'مركزك':(W.gap_kind==='top100'?'للدخول في أفضل 100':'للمركز الأعلى');
+  const card=`<div class="bm flat">
+  <div class="bmh"><div><div class="bml">تصنيفي الأسبوعي</div><div class="bmn">#${fi(W.rank)}</div></div>
+   <div class="bmr"><div class="bmd">${ic('users',14)}<div><b>${fi(W.players)}</b><small>منافس</small></div></div></div></div>
+  <div class="wkc"><div class="bmd">${ic('cal',14)}<div><small>بداية الأسبوع</small><b>${esc(W.start)}</b><small>00:00</small></div></div>
+   <div class="bmd">${ic('cal',14)}<div><small>نهاية الأسبوع</small><b>${esc(W.end)}</b><small>23:59</small></div></div></div>
+  <div class="bmy"><div class="bml">المتبقي لنهاية الأسبوع</div>
+   <div class="cdw"><div class="cdb"><b id="wkd">${String(p[0]).padStart(2,'0')}</b><small>يوم</small></div><span class="cds">:</span>
+   <div class="cdb"><b id="wkh">${String(p[1]).padStart(2,'0')}</b><small>ساعة</small></div><span class="cds">:</span>
+   <div class="cdb"><b id="wkm">${String(p[2]).padStart(2,'0')}</b><small>دقيقة</small></div><span class="cds">:</span>
+   <div class="cdb"><b id="wks">${String(p[3]).padStart(2,'0')}</b><small>ثانية</small></div></div>
+   <div class="pb"><i id="wkp" style="width:${pr}%"></i></div></div>
+  <div class="bmy"><div class="bml">أرباحي هذا الأسبوع</div><div class="bmv"><i class="cx" style="--s:26px">#</i><span class="${M.total>0?'':'z'}">${bal(M.total)}</span></div></div>
+  <div class="bmg g3">`+
+   cell(col(c),mc[0],'وضعك',`<span class="ar">${esc(m.name)}</span> <span class="sm">×${m.mul}</span>`)+
+   cell(col('#ffa861'),'bars','المستوى',`Lv ${X.level} <span class="sm">${fk(X.hr)} H/s</span>`)+
+   cell(col('#3ecf8e'),'pick','آخر كتلة عدّنتها',X.last_win?`#${fi(X.last_win)} <span class="sm">${ago(X.last_win_at)}</span>`:'<span class="sm">لم تفز بعد</span>')+
+   cell(col('#ffc23f'),'trophy','كتل فزت بها',fi(X.wins)+' <span class="sm">هذا الأسبوع</span>')+
+   cell(col('#38b6ff'),'trend',gapLbl,gapTxt)+
+   cell(col(S.mining?'#3ecf8e':'#8b9098'),'server','حالة التعدين',`<span class="ar">${S.mining?'قيد التشغيل':'متوقف'}</span>`)+
+  `</div><div class="bmf"><div class="mnote" style="margin:0">يُصفَّر الترتيب كل اثنين 00:00، وأفضل 100 يصلهم تهنئة من الإدارة.</div></div></div>`;
+  return card+`<div class="stc"><div class="sth"><span class="stic">${ic('trophy',14)}</span>أفضل 100 هذا الأسبوع</div>`+
   (L.length?L.map((r,i)=>`<div class="lr ${r.me?'me':''}"><span class="lrk ${i<3?'tp':''}">${String(i+1).padStart(2,'0')}</span>${avs(r.name)}${who(r.name,r.level,r.tier,r.total)}</div>`).join(''):'<p class="h" style="padding:14px">لا أحد بعد هذا الأسبوع.</p>')+'</div>'}
 function vTop(){
   const seg=`<div class="seg" style="margin-bottom:12px"><button class="${topView==='all'?'on':''}" onclick="setView('all')">الإجمالي</button><button class="${topView==='week'?'on':''}" onclick="setView('week')">الأسبوعي</button></div>`;
@@ -2676,6 +2751,7 @@ setInterval(()=>{if(!S||!S.chain||S.chain.started||!S.chain.scheduled)return;
   let l=Math.floor(S.chain.start-Date.now()/1000);if(l<=0){load().catch(()=>{});return}
   const e=$('cdn'),d=Math.floor(l/86400),h=Math.floor(l%86400/3600),m=Math.floor(l%3600/60),s=l%60,p=n=>String(n).padStart(2,'0');
   if(e)e.textContent=(d?d+'ي ':'')+p(h)+':'+p(m)+':'+p(s)},1000);
+setInterval(wkTick,1000);
 if(!tg.initData){$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">افتح التطبيق من داخل تيليجرام.</p>'}
 else load().catch(e=>{if(BANNED)return;$('app').innerHTML='<p class="h" style="text-align:center;margin-top:35vh">'+esc(e.message)+'<br><br><button class="pri" style="width:auto;padding:10px 24px" onclick="location.reload()">إعادة المحاولة</button></p>'});
 </script></body></html>
