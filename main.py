@@ -1086,7 +1086,9 @@ async def start_web():
         log.error("WEBAPP_URL / RAILWAY_PUBLIC_DOMAIN غير مضبوط: لن تعمل واجهة الويب")
         return
     w = web.Application(middlewares=[err_mw])
-    w.add_routes([web.get("/", web_health), web.get("/app", web_page),
+    w.add_routes([web.get("/", story_site_page), web.get("/stories", story_site_page),
+                  web.get("/sapi/wall", story_wall), web.post("/sapi/send", story_send),
+                  web.get("/health", web_health), web.get("/app", web_page),
                   web.route("*", "/api/{act}", web_api)])
     WEB_RUNNER = web.AppRunner(w)
     await WEB_RUNNER.setup()
@@ -2469,7 +2471,8 @@ async def post_init(app: Application):
                                       BotCommand("suspects", "⚠️ مُحيلون مشتبه بهم"),
                                       BotCommand("storybot", "📖 بوت الحكايات"),
                                       BotCommand("setstorybot", "🔗 ربط بوت الحكايات"),
-                                      BotCommand("stories", "📚 آخر الحكايات")]
+                                      BotCommand("stories", "📚 آخر الحكايات"),
+                                      BotCommand("publish", "🌍 نشر حكاية في الجدار")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -3179,15 +3182,14 @@ else load().catch(e=>{if(BANNED)return;$('app').innerHTML='<p class="h" style="t
 """
 
 
-# ═══════════ 6.5) بوت «احكِ لي حكايتك» (يُربط بتوكن من أمر الأدمن /setstorybot) ═══════════
+# ═══════════ 6.5) «احكِ لي حكايتك»: بوت + موقع (يُربط البوت بتوكن من أمر الأدمن /setstorybot) ═══════════
 STORY_APP = None    # تطبيق بوت الحكايات الشغّال حالياً
-slog = logging.getLogger("story-bot")
-
-ENV = {}            # يملؤها الملف الرئيسي: cursor, get_setting, set_setting, admin_id, main_token, pk
-LAST_MSG = {}       # آخر وقت أرسل فيه كل مستخدم حكاية (لمنع الإزعاج)
-
+ENV = {}            # يملؤها main(): cursor, get_setting, set_setting, admin_id, main_token
+STORY_RATE = {}     # حدّ الإرسال من الموقع لكل IP
+LAST_MSG = {}       # آخر وقت أرسل فيه كل مستخدم حكاية من البوت
 MAX_LEN = 3500
-COOLDOWN = 15       # ثواني بين حكاية وأخرى
+COOLDOWN = 15       # ثواني بين حكاية وأخرى (البوت)
+slog = logging.getLogger("story-bot")
 
 KINDS = {
     "dream": ("🌙 حلمي وأهدافي", "🌙 <b>احكيلي عن حلمك وأهدافك في هذه الحياة…</b>\n\nما الذي تتمنى أن تصل إليه؟ اكتب بحرّية."),
@@ -3204,32 +3206,31 @@ DEFAULT_WELCOME = (
     "🌙 حلمك وأهدافك في هذه الحياة\n"
     "📖 قصة من حياتك\n"
     "🤫 اعتراف بشيء لم تقله لأحد\n\n"
+    "🕶 يمكنك الإرسال <b>كمجهول</b>: لا يُحفظ اسمك ولا حسابك أبداً.\n\n"
     "ℹ️ <i>ما تكتبه يصل إلى صاحب البوت ليقرأه، فلا تكتب بيانات سرّية مثل كلمات المرور.</i>"
 )
 
 
-# ═══════════ قاعدة البيانات ═══════════
+# ───────── قاعدة البيانات ─────────
 def story_ensure_tables(cursor, pk):
     with cursor() as cur:
         cur.execute(f"""CREATE TABLE IF NOT EXISTS s_stories(
             id {pk}, user_id BIGINT NOT NULL, name TEXT, username TEXT,
             kind TEXT NOT NULL DEFAULT 'story', text TEXT NOT NULL,
             replied INT NOT NULL DEFAULT 0, created_at BIGINT)""")
+    add_cols("s_stories", [("anon", "INT NOT NULL DEFAULT 0"),
+                           ("consent", "INT NOT NULL DEFAULT 0"),
+                           ("public", "INT NOT NULL DEFAULT 0"),
+                           ("source", "TEXT NOT NULL DEFAULT 'bot'")])
 
 
-def _save_story(u, kind, text):
-    cursor = ENV["cursor"]
-    with cursor() as cur:
-        cur.execute("INSERT INTO s_stories(user_id,name,username,kind,text,created_at) VALUES(?,?,?,?,?,?)",
-                    (u.id, u.full_name, u.username or "", kind, text, int(time.time())))
+def _save_story(uid, name, username, kind, text, anon, consent, source):
+    with ENV["cursor"]() as cur:
+        cur.execute("INSERT INTO s_stories(user_id,name,username,kind,text,anon,consent,source,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (uid, name, username, kind, text, int(anon), int(consent), source, int(time.time())))
         cur.execute("SELECT MAX(id) AS m FROM s_stories")
         return (cur.fetchone() or {}).get("m") or 0
-
-
-def _count_user(uid):
-    with ENV["cursor"]() as cur:
-        cur.execute("SELECT COUNT(*) AS n FROM s_stories WHERE user_id=?", (uid,))
-        return cur.fetchone()["n"]
 
 
 def _get_story(sid):
@@ -3246,7 +3247,9 @@ def _list_stories(n):
 
 def _total_stories():
     with ENV["cursor"]() as cur:
-        cur.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM s_stories")
+        cur.execute("SELECT COUNT(*) AS n, SUM(CASE WHEN source='web' THEN 1 ELSE 0 END) AS w, "
+                    "SUM(CASE WHEN public=1 THEN 1 ELSE 0 END) AS p, SUM(CASE WHEN anon=1 THEN 1 ELSE 0 END) AS a "
+                    "FROM s_stories")
         return cur.fetchone()
 
 
@@ -3261,18 +3264,74 @@ def _del_story(sid):
         return cur.rowcount
 
 
+def _set_public(sid, val):
+    """يرجع: None غير موجودة · 'noconsent' صاحبها لم يوافق على النشر · True تم"""
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT consent FROM s_stories WHERE id=?", (sid,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        if val and not r["consent"]:
+            return "noconsent"
+        cur.execute("UPDATE s_stories SET public=? WHERE id=?", (1 if val else 0, sid))
+        return True
+
+
+def _wall_rows():
+    with ENV["cursor"]() as cur:
+        cur.execute("SELECT id,kind,text,name,anon,created_at FROM s_stories "
+                    "WHERE public=1 AND consent=1 ORDER BY id DESC LIMIT 40")
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        nm = "" if r["anon"] else (r["name"] or "").split(" ")[0]       # الاسم الأول فقط، أو مجهول
+        out.append(dict(id=r["id"], kind=r["kind"], text=r["text"], name=nm or "مجهول", t=r["created_at"]))
+    return out
+
+
 def _welcome_text(name):
     raw = ENV["get_setting"]("story_welcome") or DEFAULT_WELCOME
     return raw.replace("{name}", html.escape(name or ""))
 
 
-# ═══════════ بوت الحكايات (واجهة المستخدمين) ═══════════
+def _who(r):
+    if r["anon"] or not (r["name"] or r["user_id"]):
+        return "🕶 مجهول"
+    un = f" @{html.escape(r['username'])}" if r["username"] else ""
+    return f"{html.escape(r['name'] or '—')}{un} · <code>{r['user_id']}</code>"
+
+
+async def _notify_admin(sid, kind, text, who, consent, src, can_reply):
+    mb, admin = ENV.get("main_bot"), ENV.get("admin_id")
+    if not (mb and admin):
+        return
+    try:
+        body = html.escape(text if len(text) <= 1500 else text[:1500] + "…")
+        tail = (f"للرد: <code>/storyreply {sid} نص الرد</code>" if can_reply
+                else "🕶 مجهول: لا يمكن الرد (لا نحفظ هويته)")
+        if consent:
+            tail += f"\n🌍 وافق على نشرها: <code>/publish {sid}</code>"
+        await mb.send_message(
+            admin, f"{KIND_ICON.get(kind, '📖')} <b>{KIND_NAME.get(kind, kind)} جديد #{sid}</b> · {src}\n"
+                   f"👤 {who}\n\n{body}\n\n{tail}")
+    except Exception:
+        slog.exception("notify admin")
+
+
+# ───────── بوت الحكايات (واجهة المستخدمين) ─────────
 def _kinds_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton(v[0], callback_data=f"k:{k}")] for k, v in KINDS.items()])
 
 
+def _opts_kb(anon, consent):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if not anon else "") + "👤 باسمي", callback_data="a:0"),
+         InlineKeyboardButton(("✅ " if anon else "") + "🕶 مجهول", callback_data="a:1")],
+        [InlineKeyboardButton(("✅ " if consent else "⬜ ") + "🌍 أسمح بنشرها في جدار الحكايات", callback_data="p:t")]])
+
+
 async def s_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("kind", None)
+    context.user_data.clear()
     name = update.effective_user.first_name or update.effective_user.full_name
     text = await asyncio.to_thread(_welcome_text, name)
     await update.message.reply_text(text, reply_markup=_kinds_kb())
@@ -3286,7 +3345,24 @@ async def s_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["kind"] = key
     await q.answer()
-    await q.message.reply_text(KINDS[key][1] + "\n\n<i>اكتب رسالتك الآن 👇</i>")
+    await q.message.reply_text(KINDS[key][1] + "\n\n<i>اختر طريقة الإرسال ثم اكتب رسالتك 👇</i>",
+                               reply_markup=_opts_kb(context.user_data.get("anon", False),
+                                                     context.user_data.get("consent", False)))
+
+
+async def s_opt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    d = q.data or ""
+    if d.startswith("a:"):
+        context.user_data["anon"] = d == "a:1"
+    elif d == "p:t":
+        context.user_data["consent"] = not context.user_data.get("consent", False)
+    anon, consent = context.user_data.get("anon", False), context.user_data.get("consent", False)
+    await q.answer("🕶 سيُرسل كمجهول" if anon and d.startswith("a:") else None)
+    try:
+        await q.edit_message_reply_markup(reply_markup=_opts_kb(anon, consent))
+    except BadRequest:
+        pass
 
 
 async def s_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3302,36 +3378,31 @@ async def s_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✂️ حكايتك طويلة جداً ({len(text)} حرف). الحد الأقصى {MAX_LEN} حرف، "
                                         "قسّمها على رسالتين من فضلك.")
         return
-    kind = context.user_data.pop("kind", "story")
+    kind = context.user_data.get("kind", "story")
+    anon = bool(context.user_data.get("anon", False))
+    consent = bool(context.user_data.get("consent", False))
+    context.user_data.clear()
     LAST_MSG[u.id] = now
-    sid = await asyncio.to_thread(_save_story, u, kind, text)
-    n = await asyncio.to_thread(_count_user, u.id)
-    await update.message.reply_text(
-        "💌 وصلتني حكايتك، شكراً لأنك شاركتني إياها.\n\nتريد أن تحكي شيئاً آخر؟ اختر 👇",
-        reply_markup=_kinds_kb())
-    # إشعار الأدمن عبر بوت التعدين
-    mb, admin = ENV.get("main_bot"), ENV.get("admin_id")
-    if mb and admin:
-        try:
-            uname = f" @{html.escape(u.username)}" if u.username else ""
-            body = html.escape(text if len(text) <= 1500 else text[:1500] + "…")
-            await mb.send_message(
-                admin,
-                f"{KIND_ICON.get(kind, '📖')} <b>{KIND_NAME.get(kind, kind)} جديد #{sid}</b>\n"
-                f"👤 {html.escape(u.full_name)}{uname} · <code>{u.id}</code> · (حكايته رقم {n})\n\n"
-                f"{body}\n\n"
-                f"للرد: <code>/storyreply {sid} نص الرد</code>")
-        except Exception:
-            slog.exception("notify admin")
+    # المجهول: لا نحفظ المعرّف ولا الاسم نهائياً
+    uid, name, uname = (0, "", "") if anon else (u.id, u.full_name, u.username or "")
+    sid = await asyncio.to_thread(_save_story, uid, name, uname, kind, text, anon, consent, "bot")
+    thanks = ("💌 وصلت حكايتك <b>بدون أي اسم</b> 🕶 شكراً لأنك شاركتني إياها."
+              if anon else "💌 وصلتني حكايتك، شكراً لأنك شاركتني إياها.")
+    if consent:
+        thanks += "\n🌍 ستُنشر في جدار الحكايات إن وافقت الإدارة."
+    await update.message.reply_text(thanks + "\n\nتريد أن تحكي شيئاً آخر؟ اختر 👇", reply_markup=_kinds_kb())
+    who = "🕶 مجهول" if anon else f"{html.escape(u.full_name)}" + (f" @{html.escape(u.username)}" if u.username else "") + f" · <code>{u.id}</code>"
+    await _notify_admin(sid, kind, text, who, consent, "🤖 البوت", not anon)
 
 
 def _add_story_handlers(app):
     app.add_handler(CommandHandler("start", s_start))
     app.add_handler(CallbackQueryHandler(s_pick, pattern=r"^k:"))
+    app.add_handler(CallbackQueryHandler(s_opt, pattern=r"^(a:|p:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, s_text))
 
 
-# ═══════════ تشغيل/إيقاف بوت الحكايات ═══════════
+# ───────── تشغيل/إيقاف بوت الحكايات ─────────
 async def stop_story():
     global STORY_APP
     app, STORY_APP = STORY_APP, None
@@ -3348,7 +3419,7 @@ async def start_story(token):
     """يشغّل بوت الحكايات بالتوكن المعطى ويرجع اسم المستخدم. يرمي استثناء إن كان التوكن خاطئاً."""
     global STORY_APP
     await stop_story()
-    app = (Application.builder().token(token).defaults(Defaults(parse_mode=ParseMode.HTML)).build())
+    app = Application.builder().token(token).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
     _add_story_handlers(app)
     try:
         await app.initialize()                       # يتحقق من التوكن (getMe)
@@ -3361,14 +3432,69 @@ async def start_story(token):
             pass
         raise
     STORY_APP = app
-    try:
-        await app.bot.set_my_commands([])           # لا أوامر ظاهرة، الأزرار تكفي
-    except Exception:
-        pass
     return app.bot.username
 
 
-# ═══════════ أوامر الأدمن (على بوت التعدين) ═══════════
+# ───────── الموقع ─────────
+def _client_ip(request):
+    xf = request.headers.get("X-Forwarded-For", "")
+    return (xf.split(",")[0].strip() if xf else request.remote) or "?"
+
+
+def _rate_ok(ip):
+    now = time.time()
+    lst = [t for t in STORY_RATE.get(ip, []) if now - t < 3600]
+    if (lst and now - lst[-1] < 45) or len(lst) >= 5:
+        STORY_RATE[ip] = lst
+        return False
+    lst.append(now)
+    STORY_RATE[ip] = lst
+    if len(STORY_RATE) > 5000:
+        for k in [k for k, v in STORY_RATE.items() if not v or now - v[-1] > 3600]:
+            STORY_RATE.pop(k, None)
+    return True
+
+
+async def story_site_page(request):
+    bot = STORY_APP.bot.username if STORY_APP else ""
+    return web.Response(text=STORY_HTML.replace("__BOT__", html.escape(bot or "")),
+                        content_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
+async def story_wall(request):
+    rows = await asyncio.to_thread(_wall_rows)
+    return web.json_response({"ok": True, "items": rows})
+
+
+async def story_send(request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    if not isinstance(b, dict):
+        b = {}
+    if str(b.get("hp") or "").strip():                      # فخّ للروبوتات: نتجاهل بصمت
+        return web.json_response({"ok": True})
+    kind = b.get("kind") if b.get("kind") in KINDS else "story"
+    text = str(b.get("text") or "").strip()
+    if len(text) < 5:
+        return web.json_response({"ok": False, "error": "اكتب شيئاً أطول قليلاً ✍️"})
+    if len(text) > MAX_LEN:
+        return web.json_response({"ok": False, "error": f"النص طويل جداً (الحد {MAX_LEN} حرف)"})
+    consent = bool(b.get("consent"))
+    name = " ".join(str(b.get("name") or "").split())[:40]
+    anon = bool(b.get("anon")) or not name
+    if anon:
+        name = ""
+    if not _rate_ok(_client_ip(request)):
+        return web.json_response({"ok": False, "error": "مهلاً ⏳ انتظر قليلاً قبل إرسال حكاية جديدة"})
+    sid = await asyncio.to_thread(_save_story, 0, name, "", kind, text, anon, consent, "web")
+    await _notify_admin(sid, kind, text, "🕶 مجهول" if anon else html.escape(name) + " (من الموقع، بلا حساب)",
+                        consent, "🌐 الموقع", False)
+    return web.json_response({"ok": True})
+
+
+# ───────── أوامر الأدمن (على بوت التعدين) ─────────
 def _s_is_admin(update):
     a = ENV.get("admin_id")
     return bool(a) and update.effective_user is not None and update.effective_user.id == a
@@ -3402,7 +3528,8 @@ async def cmd_setstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await asyncio.to_thread(ENV["set_setting"], "story_token", token)
     await wait.edit_text(f"✅ تم ربط بوت الحكايات: @{html.escape(uname)}\n"
-                         "🔒 حُذفت رسالتك التي فيها التوكن.\n\nجرّبه الآن بإرسال /start له.")
+                         "🔒 حُذفت رسالتك التي فيها التوكن.\n\nجرّبه الآن بإرسال /start له."
+                         + (f"\n🌐 الموقع: {WEBAPP_URL}/" if WEBAPP_URL else ""))
 
 
 async def cmd_stopstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3410,18 +3537,19 @@ async def cmd_stopstorybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await stop_story()
     await asyncio.to_thread(ENV["set_setting"], "story_token", "")
-    await update.message.reply_text("⏹ تم إيقاف بوت الحكايات وحذف التوكن. الحكايات المحفوظة باقية.")
+    await update.message.reply_text("⏹ تم إيقاف بوت الحكايات وحذف التوكن. الحكايات المحفوظة والموقع باقيان.")
 
 
 async def cmd_storybot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _s_is_admin(update):
         return
-    tot = await asyncio.to_thread(_total_stories)
+    t = await asyncio.to_thread(_total_stories)
+    I = lambda x: int(x or 0)
     st = f"🟢 يعمل: @{html.escape(STORY_APP.bot.username)}" if STORY_APP else "🔴 متوقف (استخدم /setstorybot)"
     await update.message.reply_text(
-        f"📖 <b>بوت الحكايات</b>\n{st}\n\n"
-        f"📚 الحكايات: <b>{tot['n']:,}</b> من {tot['u']:,} شخص\n\n"
-        "/stories · /story ID · /storyreply ID نص · /delstory ID · /setstorywelcome نص")
+        f"📖 <b>الحكايات</b>\n{st}\n🌐 الموقع: {WEBAPP_URL + '/' if WEBAPP_URL else 'WEBAPP_URL غير مضبوط'}\n\n"
+        f"📚 الإجمالي: <b>{I(t['n']):,}</b> (من الموقع {I(t['w']):,}) · 🕶 مجهول {I(t['a']):,} · 🌍 منشورة {I(t['p']):,}\n\n"
+        "/stories · /story ID · /storyreply ID نص · /publish ID · /unpublish ID · /delstory ID · /setstorywelcome نص")
 
 
 def _preview(r, n=70):
@@ -3441,8 +3569,8 @@ async def cmd_stories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     out = ["📚 <b>آخر الحكايات</b>", ""]
     for r in rows:
-        out.append(f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> {'✅' if r['replied'] else ''} · "
-                   f"{html.escape(r['name'] or '—')} · <code>{r['user_id']}</code>\n   {_preview(r)}\n   /story {r['id']}")
+        flags = ("✅" if r["replied"] else "") + ("🌍" if r["public"] else "") + ("🌐" if r["source"] == "web" else "")
+        out.append(f"{KIND_ICON.get(r['kind'], '📖')} <b>#{r['id']}</b> {flags} · {_who(r)}\n   {_preview(r)}\n   /story {r['id']}")
     await update.message.reply_text("\n".join(out))
 
 
@@ -3456,12 +3584,12 @@ async def cmd_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not r:
         await update.message.reply_text("غير موجودة.")
         return
-    uname = f" @{html.escape(r['username'])}" if r["username"] else ""
     when = time.strftime("%Y-%m-%d %H:%M", time.gmtime((r["created_at"] or 0) + 3600))
+    st = ("🌍 منشورة" if r["public"] else ("موافق على النشر: <code>/publish %d</code>" % r["id"] if r["consent"] else "غير مسموح بنشرها"))
     await update.message.reply_text(
-        f"{KIND_ICON.get(r['kind'], '📖')} <b>{KIND_NAME.get(r['kind'], r['kind'])} #{r['id']}</b>\n"
-        f"👤 {html.escape(r['name'] or '—')}{uname} · <code>{r['user_id']}</code>\n🕒 {when}\n\n"
-        f"{html.escape(r['text'])}\n\nللرد: <code>/storyreply {r['id']} نص الرد</code>")
+        f"{KIND_ICON.get(r['kind'], '📖')} <b>{KIND_NAME.get(r['kind'], r['kind'])} #{r['id']}</b> · {'🌐 الموقع' if r['source'] == 'web' else '🤖 البوت'}\n"
+        f"👤 {_who(r)}\n🕒 {when}\n{st}\n\n{html.escape(r['text'])}\n\n"
+        + ("للرد: <code>/storyreply %d نص الرد</code>" % r["id"] if r["user_id"] else "🕶 لا يمكن الرد"))
 
 
 async def cmd_storyreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3478,6 +3606,9 @@ async def cmd_storyreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not r:
         await update.message.reply_text("الحكاية غير موجودة.")
         return
+    if not r["user_id"]:
+        await update.message.reply_text("🕶 هذه الحكاية مجهولة (أو من الموقع)، لا يمكن الرد عليها.")
+        return
     try:
         await STORY_APP.bot.send_message(r["user_id"], "💌 <b>ردّ على حكايتك:</b>\n\n" + html.escape(parts[2]))
     except Exception as e:
@@ -3485,6 +3616,29 @@ async def cmd_storyreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await asyncio.to_thread(_mark_replied, r["id"])
     await update.message.reply_text("✅ وصل ردّك.")
+
+
+async def _pub_cmd(update, context, val):
+    if not _s_is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/%s 12</code>" % ("publish" if val else "unpublish"))
+        return
+    res = await asyncio.to_thread(_set_public, int(context.args[0]), val)
+    if res is None:
+        await update.message.reply_text("غير موجودة.")
+    elif res == "noconsent":
+        await update.message.reply_text("🚫 صاحبها لم يوافق على النشر، لا يمكن نشرها.")
+    else:
+        await update.message.reply_text("🌍 نُشرت في الجدار." if val else "🙈 أُخفيت من الجدار.")
+
+
+async def cmd_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _pub_cmd(update, context, True)
+
+
+async def cmd_unpublish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _pub_cmd(update, context, False)
 
 
 async def cmd_delstory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3513,22 +3667,19 @@ async def cmd_setstorywelcome(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("✅ تم تحديث رسالة الترحيب." if new else "✅ رجعت الرسالة الافتراضية.")
 
 
-# ═══════════ نقاط الربط مع الملف الرئيسي ═══════════
+# ───────── نقاط الربط مع بقية الملف ─────────
 def story_register(app, env):
-    """تُستدعى مرة واحدة في main() قبل run_polling: تسجّل أوامر الأدمن على بوت التعدين."""
+    """تُستدعى مرة واحدة في main(): تسجّل أوامر الأدمن على بوت التعدين."""
     ENV.update(env)
-    app.add_handler(CommandHandler("setstorybot", cmd_setstorybot))
-    app.add_handler(CommandHandler("stopstorybot", cmd_stopstorybot))
-    app.add_handler(CommandHandler("storybot", cmd_storybot))
-    app.add_handler(CommandHandler("stories", cmd_stories))
-    app.add_handler(CommandHandler("story", cmd_story))
-    app.add_handler(CommandHandler("storyreply", cmd_storyreply))
-    app.add_handler(CommandHandler("delstory", cmd_delstory))
-    app.add_handler(CommandHandler("setstorywelcome", cmd_setstorywelcome))
+    for name, fn in (("setstorybot", cmd_setstorybot), ("stopstorybot", cmd_stopstorybot),
+                     ("storybot", cmd_storybot), ("stories", cmd_stories), ("story", cmd_story),
+                     ("storyreply", cmd_storyreply), ("publish", cmd_publish), ("unpublish", cmd_unpublish),
+                     ("delstory", cmd_delstory), ("setstorywelcome", cmd_setstorywelcome)):
+        app.add_handler(CommandHandler(name, fn))
 
 
 async def story_autostart(main_bot):
-    """تُستدعى في post_init: تشغّل بوت الحكايات تلقائياً إن كان التوكن محفوظاً (يعمل بعد كل إعادة تشغيل)."""
+    """تُستدعى في post_init: تشغّل بوت الحكايات تلقائياً إن كان التوكن محفوظاً."""
     ENV["main_bot"] = main_bot
     try:
         token = await asyncio.to_thread(ENV["get_setting"], "story_token", "")
@@ -3553,6 +3704,150 @@ async def story_autostart(main_bot):
 
 async def story_shutdown():
     await stop_story()
+
+
+STORY_HTML = r"""<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>احكِ لي حكايتك</title>
+<meta name="description" content="مساحة هادئة لتحكي حلمك أو حكايتك أو اعترافك، باسمك أو كمجهول.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0e1f;--glass:#ffffff0d;--line:#ffffff1f;--tx:#eef0ff;--mut:#9aa3c7;--gold:#ffc46b;--pink:#ff7eb6;--vio:#8b7bff;--grn:#4ee3a8}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{margin:0;min-height:100vh;color:var(--tx);font:16px/1.7 "Tajawal",system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;
+ background:radial-gradient(1200px 700px at 80% -10%,#2a1b5e66,transparent 60%),radial-gradient(900px 600px at 0% 30%,#0f3a6b55,transparent 60%),var(--bg);overflow-x:hidden}
+#sky{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.wrap{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:0 16px 60px}
+header{text-align:center;padding:54px 0 26px}
+.moon{width:74px;height:74px;margin:0 auto 18px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff7dc,#ffc46b 55%,#d98a3a);box-shadow:0 0 50px 8px #ffc46b66,0 0 120px 30px #ffc46b22;animation:float 6s ease-in-out infinite}
+@keyframes float{50%{transform:translateY(-8px)}}
+h1{margin:0;font-size:clamp(34px,9vw,54px);font-weight:800;line-height:1.25;background:linear-gradient(90deg,var(--gold),var(--pink),var(--vio));-webkit-background-clip:text;background-clip:text;color:transparent}
+.typ{min-height:32px;margin:10px 0 0;color:var(--mut);font-size:19px}
+.typ::after{content:"|";margin-inline-start:3px;color:var(--gold);animation:bl 1s steps(1) infinite}
+@keyframes bl{50%{opacity:0}}
+.card{background:var(--glass);border:1px solid var(--line);border-radius:26px;padding:22px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 20px 60px #0006}
+.chips{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.chip{border:1px solid var(--line);background:#ffffff08;border-radius:16px;padding:12px 6px;text-align:center;cursor:pointer;color:var(--mut);font:600 14px "Tajawal",sans-serif;transition:.2s}
+.chip i{display:block;font-style:normal;font-size:26px;margin-bottom:2px}
+.chip.on{color:var(--tx);border-color:var(--gold);background:linear-gradient(160deg,#ffc46b2e,#ff7eb622);box-shadow:0 0 24px #ffc46b33}
+.chip:active{transform:scale(.97)}
+.q{margin:0 0 10px;color:var(--tx);font-weight:700;font-size:17px}
+textarea,input[type=text]{width:100%;background:#0a0e1fb3;border:1px solid var(--line);border-radius:16px;color:var(--tx);font:inherit;padding:14px 16px;outline:none;transition:.2s}
+textarea{min-height:170px;resize:vertical;line-height:1.8}
+textarea:focus,input[type=text]:focus{border-color:var(--vio);box-shadow:0 0 0 4px #8b7bff22}
+.cnt{text-align:left;color:var(--mut);font-size:12px;margin:4px 4px 12px;direction:ltr}
+.opt{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 4px;border-top:1px solid var(--line);cursor:pointer}
+.opt b{display:block;font-size:15px}.opt small{display:block;color:var(--mut);font-size:12.5px;line-height:1.5}
+.sw{position:relative;flex:none;width:50px;height:30px;border-radius:30px;background:#ffffff22;transition:.25s}
+.sw::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:.25s;box-shadow:0 2px 6px #0006}
+.sw.on{background:linear-gradient(90deg,var(--vio),var(--pink))}
+.sw.on::after{inset-inline-start:23px}
+#nameRow{overflow:hidden;max-height:90px;transition:max-height .3s,opacity .3s;margin:6px 0 4px}
+#nameRow.hide{max-height:0;opacity:0}
+.hp{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
+.go{width:100%;margin-top:14px;border:0;border-radius:18px;padding:16px;font:800 18px "Tajawal",sans-serif;color:#1d1230;cursor:pointer;background:linear-gradient(90deg,var(--gold),var(--pink));box-shadow:0 10px 34px #ff7eb633;transition:.2s}
+.go:active{transform:scale(.98)}.go:disabled{opacity:.55}
+.err{color:#ff8a9a;text-align:center;margin:10px 0 0;min-height:22px;font-size:14px}
+.note{color:var(--mut);font-size:12.5px;text-align:center;margin:14px 6px 0;line-height:1.7}
+.done{text-align:center;padding:22px 6px}
+.done .big{font-size:64px;animation:pop .6s}
+@keyframes pop{0%{transform:scale(.2);opacity:0}70%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
+.done h2{margin:10px 0 6px;font-size:26px}.done p{color:var(--mut);margin:0 0 18px}
+.sec{background:#ffffff10;border:1px solid var(--line);color:var(--tx);border-radius:14px;padding:12px 22px;font:700 15px "Tajawal",sans-serif;cursor:pointer}
+.tgb{display:flex;align-items:center;justify-content:center;gap:10px;margin:18px auto 0;width:max-content;max-width:100%;padding:11px 20px;border-radius:50px;text-decoration:none;color:#fff;font-weight:700;background:linear-gradient(90deg,#2aa6e8,#5b7cff);box-shadow:0 8px 28px #2aa6e844}
+h3.wh{margin:46px 0 4px;text-align:center;font-size:26px}
+.ws{text-align:center;color:var(--mut);margin:0 0 20px;font-size:14px}
+.wall{columns:2;column-gap:14px}
+.st{break-inside:avoid;background:var(--glass);border:1px solid var(--line);border-radius:20px;padding:16px;margin:0 0 14px;animation:up .5s both}
+@keyframes up{from{opacity:0;transform:translateY(14px)}}
+.st .k{display:flex;align-items:center;gap:8px;color:var(--gold);font-weight:700;font-size:13px;margin-bottom:8px}
+.st .k i{font-style:normal;font-size:20px}
+.st p{margin:0;white-space:pre-wrap;word-break:break-word;line-height:1.85;font-size:15px}
+.st .f{display:flex;justify-content:space-between;margin-top:12px;color:var(--mut);font-size:12.5px}
+.empty{text-align:center;color:var(--mut);padding:26px 10px;border:1px dashed var(--line);border-radius:20px}
+footer{text-align:center;color:var(--mut);font-size:12.5px;margin-top:34px}
+@media(max-width:560px){.wall{columns:1}.card{padding:18px}}
+</style></head><body>
+<canvas id="sky"></canvas>
+<div class="wrap">
+<header><div class="moon"></div><h1>احكِ لي حكايتك</h1><p class="typ" id="typ"></p></header>
+
+<section class="card" id="box">
+ <div id="formv">
+  <div class="chips" id="chips">
+   <div class="chip on" data-k="dream"><i>🌙</i>حلمي وأهدافي</div>
+   <div class="chip" data-k="story"><i>📖</i>حكايتي</div>
+   <div class="chip" data-k="confess"><i>🤫</i>اعتراف</div>
+  </div>
+  <p class="q" id="ql"></p>
+  <textarea id="tx" maxlength="3500" placeholder="اكتب هنا بحرّية… لا أحد سيحكم عليك."></textarea>
+  <div class="cnt"><span id="cn">0</span> / 3500</div>
+  <div class="opt" id="oa"><div><b>🕶 أرسلها كمجهول</b><small>لا يُحفظ اسمك ولا أي معلومة عنك.</small></div><span class="sw on" id="sa"></span></div>
+  <div id="nameRow" class="hide"><input type="text" id="nm" maxlength="40" placeholder="اسمك (اختياري)"></div>
+  <div class="opt" id="oc"><div><b>🌍 أسمح بنشرها في جدار الحكايات</b><small>تُنشر فقط بعد موافقة الإدارة، وبدون أي بيانات شخصية.</small></div><span class="sw" id="sc"></span></div>
+  <input class="hp" id="hp" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
+  <button class="go" id="go">أرسل حكايتي ✨</button>
+  <div class="err" id="er"></div>
+  <p class="note">🔒 ما تكتبه يصل إلى صاحب الموقع ليقرأه. لا تكتب كلمات مرور أو بيانات سرّية.</p>
+ </div>
+ <div class="done" id="donev" style="display:none">
+  <div class="big">💌</div><h2>وصلت حكايتك</h2><p id="dm">شكراً لأنك شاركتني إياها.</p>
+  <button class="sec" id="again">احكِ شيئاً آخر</button>
+ </div>
+</section>
+<a class="tgb" id="tg" href="#" target="_blank" rel="noopener" style="display:none">✈️ أو احكِ لي عبر تيليجرام</a>
+
+<h3 class="wh">🌌 جدار الحكايات</h3>
+<p class="ws">حكايات شاركها أصحابها بإذنهم</p>
+<div class="wall" id="wall"></div>
+<footer>احكِ… فالكلمات تخفّف الحِمل 🤍</footer>
+</div>
+<script>
+const BOT="__BOT__";
+const $=id=>document.getElementById(id);
+const KINDS={dream:['🌙','حلم وأهداف','احكيلي عن حلمك وأهدافك في هذه الحياة…'],story:['📖','حكاية','احكيلي حكايتك… ابدأ من حيث تشاء.'],confess:['🤫','اعتراف','اعترف لي بشيء لم تقله لأحد…']};
+let kind='dream',anon=true,consent=false,busy=false;
+/* سماء النجوم */
+(function(){const c=$('sky'),x=c.getContext('2d');let W,H,S=[];
+ function init(){W=c.width=innerWidth;H=c.height=innerHeight;S=Array.from({length:Math.round(W*H/9000)},()=>({x:Math.random()*W,y:Math.random()*H,r:Math.random()*1.5+.3,p:Math.random()*6.28,s:.5+Math.random()*1.6,v:.02+Math.random()*.06}))}
+ function fr(t){x.clearRect(0,0,W,H);for(const s of S){s.y+=s.v;if(s.y>H)s.y=0;const a=.3+.7*Math.abs(Math.sin(t/1000*s.s+s.p));x.fillStyle='rgba(255,240,215,'+a.toFixed(2)+')';x.beginPath();x.arc(s.x,s.y,s.r,0,6.28);x.fill()}requestAnimationFrame(fr)}
+ addEventListener('resize',init);init();requestAnimationFrame(fr)})();
+/* كتابة متحركة */
+(function(){const P=['احكيلي عن حلمك وأهدافك في هذه الحياة…','احكيلي حكايتك…','اعترف لي بشيء لم تقله لأحد…'];let i=0,j=0,d=false;const e=$('typ');
+ (function t(){const s=P[i];if(!d){j++;e.textContent=s.slice(0,j);if(j===s.length){d=true;return setTimeout(t,1800)}}else{j--;e.textContent=s.slice(0,j);if(j===0){d=false;i=(i+1)%P.length}}setTimeout(t,d?28:70)})()})();
+function setKind(k){kind=k;document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.dataset.k===k));$('ql').textContent=KINDS[k][2]}
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>setKind(c.dataset.k));setKind('dream');
+$('oa').onclick=()=>{anon=!anon;$('sa').classList.toggle('on',anon);$('nameRow').classList.toggle('hide',anon)};
+$('oc').onclick=()=>{consent=!consent;$('sc').classList.toggle('on',consent)};
+$('tx').oninput=()=>{$('cn').textContent=$('tx').value.length};
+if(BOT){const a=$('tg');a.href='https://t.me/'+BOT;a.style.display='flex'}
+$('go').onclick=async()=>{
+ if(busy)return;const text=$('tx').value.trim();$('er').textContent='';
+ if(text.length<5){$('er').textContent='اكتب شيئاً أطول قليلاً ✍️';return}
+ busy=true;$('go').disabled=true;$('go').textContent='جاري الإرسال…';
+ try{const r=await fetch('/sapi/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,text,anon,consent,name:$('nm').value,hp:$('hp').value})});
+  const j=await r.json();
+  if(j.ok){$('formv').style.display='none';$('donev').style.display='block';
+   $('dm').textContent=(anon?'وصلت بدون أي اسم 🕶 ':'')+'شكراً لأنك شاركتني إياها.'+(consent?' ستُنشر في الجدار إن وافقت الإدارة.':'');
+   $('tx').value='';$('cn').textContent='0'}
+  else $('er').textContent=j.error||'حدث خطأ، حاول مجدداً'}
+ catch(e){$('er').textContent='تعذّر الاتصال، حاول مجدداً'}
+ busy=false;$('go').disabled=false;$('go').textContent='أرسل حكايتي ✨'};
+$('again').onclick=()=>{$('donev').style.display='none';$('formv').style.display='block';window.scrollTo({top:0,behavior:'smooth'})};
+/* الجدار */
+function mk(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+async function wall(){try{const j=await (await fetch('/sapi/wall')).json();const w=$('wall');w.textContent='';
+ if(!j.items.length){const e=mk('div','empty','لا توجد حكايات منشورة بعد. كن أول من يحكي 🌙');e.style.columnSpan='all';w.appendChild(e);return}
+ j.items.forEach((s,i)=>{const k=KINDS[s.kind]||KINDS.story,c=mk('div','st');c.style.animationDelay=(i*60)+'ms';
+  const h=mk('div','k');h.appendChild(mk('i','',k[0]));h.appendChild(mk('span','',k[1]));c.appendChild(h);
+  c.appendChild(mk('p','',s.text));
+  const f=mk('div','f');f.appendChild(mk('span','',s.name));f.appendChild(mk('span','',new Date(s.t*1000).toLocaleDateString('ar')));c.appendChild(f);w.appendChild(c)})}catch(e){}}
+wall();setInterval(wall,40000);
+</script></body></html>
+"""
 
 
 # ═══════════ 7) التشغيل ═══════════
