@@ -3328,7 +3328,7 @@ def _story_url():
 def _kinds_kb():
     rows = []
     if WEBAPP_URL:
-        rows.append([InlineKeyboardButton("🌐 افتح التطبيق", web_app=WebAppInfo(url=_story_url()))])
+        rows.append([InlineKeyboardButton("🌙 افتح مساحة الحكايات", web_app=WebAppInfo(url=_story_url()))])
     rows += [[InlineKeyboardButton(v[0], callback_data=f"k:{k}")] for k, v in KINDS.items()]
     return InlineKeyboardMarkup(rows)
 
@@ -3489,7 +3489,9 @@ async def story_site_page(request):
 
 async def story_wall(request):
     rows = await asyncio.to_thread(_wall_rows)
-    return web.json_response({"ok": True, "items": rows})
+    t = await asyncio.to_thread(_total_stories)
+    return web.json_response({"ok": True, "items": rows, "total": int(t["n"] or 0),
+                              "published": int(t["p"] or 0), "anon": int(t["a"] or 0)})
 
 
 async def story_send(request):
@@ -3532,7 +3534,7 @@ async def story_send(request):
     else:
         who = html.escape(name) + " (من الموقع، بلا حساب)"
     await _notify_admin(sid, kind, text, who, consent, "📱 التطبيق" if tgu else "🌐 الموقع", named_tg)
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "id": sid})
 
 
 # ───────── أوامر الأدمن (على بوت التعدين) ─────────
@@ -3762,148 +3764,276 @@ async def story_shutdown():
 
 STORY_HTML = r"""<!doctype html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>احكِ لي حكايتك</title>
 <meta name="description" content="مساحة هادئة لتحكي حلمك أو حكايتك أو اعترافك، باسمك أو كمجهول.">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0a0e1f;--glass:#ffffff0d;--line:#ffffff1f;--tx:#eef0ff;--mut:#9aa3c7;--gold:#ffc46b;--pink:#ff7eb6;--vio:#8b7bff;--grn:#4ee3a8}
+:root{--mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;--disp:"Space Grotesk",system-ui,-apple-system,"Segoe UI","Noto Sans Arabic",Tahoma,sans-serif;--bg:#1a1c1e;--card:#282b2e;--line:#33363a;--ac:#ffa45b;--tx:#eceef0;--mut:#8b9098;--red:#d94848;--grn:#3ecf8e;--blue:#38b6ff;--pur:#9b7bff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{scroll-behavior:smooth}
-body{margin:0;min-height:100vh;color:var(--tx);font:16px/1.7 "Tajawal",system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;
- background:radial-gradient(1200px 700px at 80% -10%,#2a1b5e66,transparent 60%),radial-gradient(900px 600px at 0% 30%,#0f3a6b55,transparent 60%),var(--bg);overflow-x:hidden}
-#sky{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
-.wrap{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:0 16px 60px}
-header{text-align:center;padding:54px 0 26px}
-.moon{width:74px;height:74px;margin:0 auto 18px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff7dc,#ffc46b 55%,#d98a3a);box-shadow:0 0 50px 8px #ffc46b66,0 0 120px 30px #ffc46b22;animation:float 6s ease-in-out infinite}
-@keyframes float{50%{transform:translateY(-8px)}}
-h1{margin:0;font-size:clamp(34px,9vw,54px);font-weight:800;line-height:1.25;background:linear-gradient(90deg,var(--gold),var(--pink),var(--vio));-webkit-background-clip:text;background-clip:text;color:transparent}
-.typ{min-height:32px;margin:10px 0 0;color:var(--mut);font-size:19px}
-.typ::after{content:"|";margin-inline-start:3px;color:var(--gold);animation:bl 1s steps(1) infinite}
-@keyframes bl{50%{opacity:0}}
-.card{background:var(--glass);border:1px solid var(--line);border-radius:26px;padding:22px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 20px 60px #0006}
-.chips{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
-.chip{border:1px solid var(--line);background:#ffffff08;border-radius:16px;padding:12px 6px;text-align:center;cursor:pointer;color:var(--mut);font:600 14px "Tajawal",sans-serif;transition:.2s}
-.chip i{display:block;font-style:normal;font-size:26px;margin-bottom:2px}
-.chip.on{color:var(--tx);border-color:var(--gold);background:linear-gradient(160deg,#ffc46b2e,#ff7eb622);box-shadow:0 0 24px #ffc46b33}
-.chip:active{transform:scale(.97)}
-.q{margin:0 0 10px;color:var(--tx);font-weight:700;font-size:17px}
-textarea,input[type=text]{width:100%;background:#0a0e1fb3;border:1px solid var(--line);border-radius:16px;color:var(--tx);font:inherit;padding:14px 16px;outline:none;transition:.2s}
-textarea{min-height:170px;resize:vertical;line-height:1.8}
-textarea:focus,input[type=text]:focus{border-color:var(--vio);box-shadow:0 0 0 4px #8b7bff22}
-.cnt{text-align:left;color:var(--mut);font-size:12px;margin:4px 4px 12px;direction:ltr}
-.opt{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 4px;border-top:1px solid var(--line);cursor:pointer}
-.opt b{display:block;font-size:15px}.opt small{display:block;color:var(--mut);font-size:12.5px;line-height:1.5}
-.sw{position:relative;flex:none;width:50px;height:30px;border-radius:30px;background:#ffffff22;transition:.25s}
-.sw::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:.25s;box-shadow:0 2px 6px #0006}
-.sw.on{background:linear-gradient(90deg,var(--vio),var(--pink))}
-.sw.on::after{inset-inline-start:23px}
-#nameRow{overflow:hidden;max-height:90px;transition:max-height .3s,opacity .3s;margin:6px 0 4px}
-#nameRow.hide{max-height:0;opacity:0}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",Tahoma,sans-serif;padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+.w{max-width:560px;margin:0 auto;padding:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:16px;margin-bottom:12px}
+h3{margin:0 0 10px;font-size:15px;color:var(--mut)}
+.h{color:var(--mut);font-size:13px;margin:0}
+button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:14px;width:100%;margin-top:10px;cursor:pointer;color:var(--tx);background:var(--bg);border:1px solid var(--line)}
+button:active{transform:scale(.98)}button:disabled{opacity:.45}
+.inv{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;height:46px;margin:4px 0 0;padding:0;border:0;border-radius:9px;background:var(--ac);color:#1e1307;font:600 15px var(--disp);letter-spacing:.03em}
+.err{color:#ff8a9a;text-align:center;margin:10px 0 0;min-height:22px;font-size:13px}
 .hp{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
-.go{width:100%;margin-top:14px;border:0;border-radius:18px;padding:16px;font:800 18px "Tajawal",sans-serif;color:#1d1230;cursor:pointer;background:linear-gradient(90deg,var(--gold),var(--pink));box-shadow:0 10px 34px #ff7eb633;transition:.2s}
-.go:active{transform:scale(.98)}.go:disabled{opacity:.55}
-.err{color:#ff8a9a;text-align:center;margin:10px 0 0;min-height:22px;font-size:14px}
-.note{color:var(--mut);font-size:12.5px;text-align:center;margin:14px 6px 0;line-height:1.7}
-.done{text-align:center;padding:22px 6px}
-.done .big{font-size:64px;animation:pop .6s}
-@keyframes pop{0%{transform:scale(.2);opacity:0}70%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
-.done h2{margin:10px 0 6px;font-size:26px}.done p{color:var(--mut);margin:0 0 18px}
-.sec{background:#ffffff10;border:1px solid var(--line);color:var(--tx);border-radius:14px;padding:12px 22px;font:700 15px "Tajawal",sans-serif;cursor:pointer}
-.tgb{display:flex;align-items:center;justify-content:center;gap:10px;margin:18px auto 0;width:max-content;max-width:100%;padding:11px 20px;border-radius:50px;text-decoration:none;color:#fff;font-weight:700;background:linear-gradient(90deg,#2aa6e8,#5b7cff);box-shadow:0 8px 28px #2aa6e844}
-h3.wh{margin:46px 0 4px;text-align:center;font-size:26px}
-.ws{text-align:center;color:var(--mut);margin:0 0 20px;font-size:14px}
-.wall{columns:2;column-gap:14px}
-.st{break-inside:avoid;background:var(--glass);border:1px solid var(--line);border-radius:20px;padding:16px;margin:0 0 14px;animation:up .5s both}
-@keyframes up{from{opacity:0;transform:translateY(14px)}}
-.st .k{display:flex;align-items:center;gap:8px;color:var(--gold);font-weight:700;font-size:13px;margin-bottom:8px}
-.st .k i{font-style:normal;font-size:20px}
-.st p{margin:0;white-space:pre-wrap;word-break:break-word;line-height:1.85;font-size:15px}
-.st .f{display:flex;justify-content:space-between;margin-top:12px;color:var(--mut);font-size:12.5px}
-.empty{text-align:center;color:var(--mut);padding:26px 10px;border:1px dashed var(--line);border-radius:20px}
-footer{text-align:center;color:var(--mut);font-size:12.5px;margin-top:34px}
-@media(max-width:560px){.wall{columns:1}.card{padding:18px}}
+/* ── الشريط السفلي ── */
+.nav{position:fixed;inset:auto 0 0 0;display:flex;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;border-top:1px solid #33363a;padding:9px 6px calc(8px + env(safe-area-inset-bottom));z-index:5}
+.nav div{position:relative;flex:1;text-align:center;padding:5px 2px 3px;color:#8b9098;font:600 11px var(--disp);cursor:pointer}
+.nav div.on{color:var(--ac)}
+.nav div.on::before{content:"";position:absolute;top:-10px;left:50%;width:36px;margin-left:-18px;height:2px;border-radius:2px;background:var(--ac)}
+.nav span{display:block;height:22px;margin-bottom:3px}.nav svg{width:20px;height:20px}
+/* ── كروت ── */
+.stc{position:relative;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;border:1px solid #33363a;border-radius:14px;margin-bottom:12px;overflow:hidden}
+.stc::before,.nav::before,.bm::before{content:"";position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,#ffa45bb8,transparent);z-index:1}
+.sth{display:flex;align-items:center;gap:8px;padding:9px 12px;min-height:43px;border-bottom:1px solid #303337;font:700 13px/1.4 var(--disp);color:#f0f0f0}
+.stic{width:24px;height:24px;border:1px solid #3a3d41;border-radius:7px;display:grid;place-items:center;color:#8b9098;background:#ffffff05;flex:none}
+.stic.or{border-color:#6e4c32;background:#3e3833;color:#ffa861}
+.stic.big{width:32px;height:32px;border-radius:8px}
+.rb{margin-inline-start:auto;font:700 11px var(--mono);color:#ffa861;background:#3e3833;border:1px solid #7a5535;border-radius:7px;padding:4px 10px;direction:ltr;flex:none}
+.cap2{display:flex;align-items:center;gap:6px}.dot{width:5px;height:5px;border-radius:50%;background:#ffa861;flex:none}
+.mlb{font:400 11px var(--mono);letter-spacing:.04em;color:#8b9098}
+.pc{font:700 20px var(--mono);color:#ffa861;direction:ltr}.pc small{font-size:13px;color:#8b9098;font-weight:400}
+.pb{height:6px;background:#483e35;border-radius:6px;overflow:hidden;margin-top:13px}.pb i{display:block;height:100%;background:#ffa861;border-radius:6px;transition:width .2s}
+.tmb{padding:14px 14px 15px}.tr{display:flex;justify-content:space-between;align-items:center}
+.st3{display:grid;grid-template-columns:repeat(3,1fr)}
+.st3>div{padding:11px 12px 10px;border-inline-start:1px solid #303337;min-width:0}.st3>div:first-child{border:0}
+.fl{display:flex;align-items:center;gap:5px;font:600 11px var(--disp);color:#8b9098}
+.fv{font:700 15px var(--mono);color:#f4f4f4;direction:ltr;text-align:right;margin-top:6px}
+textarea,.inp{width:100%;background:#1f2225;border:1px solid #33363a;border-radius:12px;color:var(--tx);font:inherit;padding:14px;outline:none;transition:.2s}
+textarea{min-height:170px;resize:vertical;line-height:1.85}
+textarea:focus,.inp:focus{border-color:var(--ac)}
+.nmi{margin:8px 0 2px}
+/* ── كروت الاختيار (مثل أوضاع التعدين) ── */
+.mc{position:relative;display:flex;align-items:center;gap:12px;padding:12px;margin-top:8px;border:1px solid #33363a;border-radius:10px;background:#25282b;overflow:hidden;cursor:pointer;transition:.15s}
+.mc:active{transform:scale(.99)}
+.mc.act{border-color:#b9702f;background:#3a342f}
+.mi{width:36px;height:36px;border:1px solid var(--mc);border-radius:8px;display:grid;place-items:center;color:var(--mc);background:color-mix(in srgb,var(--mc) 14%,transparent);flex:none}
+.mt{flex:1;min-width:0}.mt b{font:700 14px var(--disp);color:#f4f4f4;line-height:1.3}
+.mt em{font:700 10px var(--mono);color:var(--mc);font-style:normal;margin-inline-start:6px;direction:ltr;display:inline-block}
+.ms{font-size:11.5px;color:var(--mut);margin-top:3px;line-height:1.5}
+.mbtn{display:flex;align-items:center;gap:4px;flex:none;padding:4px 9px;border-radius:6px;font:700 11px var(--disp);line-height:1.5}
+.mbtn.on{border:1px solid #4a4e53;color:#c3c6c9}
+.mbtn.ok{border:1px solid #3a3d41;color:var(--tx)}
+.sw{position:relative;flex:none;width:44px;height:26px;border-radius:26px;background:#ffffff22;transition:.25s}
+.sw::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.25s;box-shadow:0 2px 6px #0006}
+.sw.on{background:var(--ac)}.sw.on::after{inset-inline-start:21px}
+.mnote{font-size:11px;line-height:1.7;color:var(--mut);margin:12px 2px 0}
+/* ── بطاقات الجدار (مثل بطاقات الكتل) ── */
+.bkc{background:#25282b;border:1px solid #33363a;border-radius:12px;padding:13px 14px 12px;margin-bottom:12px;cursor:pointer}
+.bkc:active{background:#2a2d30}
+.bkh{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.bkn{font:400 11px var(--mono);letter-spacing:.12em;color:#8b9098;direction:ltr;white-space:nowrap}
+.bkn b{font:700 15px var(--mono);letter-spacing:0;color:#ffa861;margin-inline-start:8px}
+.bkr{display:flex;align-items:center;gap:8px;color:#8b9098}
+.rar{font:700 11px var(--disp);border:1px solid #4a4e53;border-radius:5px;padding:2px 10px;color:#9aa0a6;background:#ffffff08;white-space:nowrap}
+.stx{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.9;color:#e6e8ea;margin:11px 0 0}
+.cl{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.bkf{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:11px}
+.bkm{display:flex;align-items:center;gap:8px;min-width:0}
+.bkm b{font:700 14px var(--disp);color:#f4f4f4;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bkd{font:400 11px var(--mono);color:#8b9098;direction:ltr}
+.avs{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font:700 10px var(--disp);color:#fff;text-shadow:0 1px 2px #0005;flex:none}
+/* ── قواعد/معلومات ── */
+.bn{padding:12px}.bnr{display:flex;gap:12px;align-items:center}
+.bt{font:700 14px var(--disp);margin-top:4px;color:#f4f4f4}
+.bd{font-size:12.5px;line-height:1.7;color:#8b9098;margin:11px 0 0}
+.em{display:flex;flex-direction:column;align-items:center;gap:15px;padding:38px 26px 42px;text-align:center;color:#8b9098;font-size:13px;line-height:1.65}
+.emi{width:38px;height:38px;border:1px solid #3a3d41;border-radius:9px;display:grid;place-items:center;background:#25282b;color:#9aa0a6}
+/* ── النوافذ المنبثقة ── */
+.ov{position:fixed;inset:0;background:#000b;z-index:30;display:flex;align-items:center;justify-content:center;padding:14px}
+.shw{position:relative;width:100%;max-width:560px}
+.bm{position:relative;border:1px solid #3a3d41;border-radius:16px;overflow:hidden;background:radial-gradient(#ffffff0b 1px,transparent 1.2px) 0 0/12px 12px,#282b2e;max-height:86vh;overflow-y:auto}
+.bmh{display:flex;justify-content:space-between;align-items:flex-start;padding:16px 16px 12px;gap:10px}
+.bml{font:400 11px var(--mono);letter-spacing:.1em;color:#8b9098}
+.bmn{font:700 24px var(--disp);color:#f4f4f4;direction:ltr;text-align:start;margin-top:4px}
+.bmr{display:flex;align-items:center;gap:8px}
+.bmd{display:flex;align-items:center;gap:8px;border:1px solid #3a3d41;border-radius:9px;background:#25282b;padding:6px 10px;color:#8b9098;direction:ltr}
+.bmd b{display:block;font:700 12px var(--mono);color:#f4f4f4;line-height:1.3}.bmd small{display:block;font:400 11px var(--mono);color:#8b9098;line-height:1.3}
+.bmx{width:26px;height:26px;margin:0;padding:0;display:grid;place-items:center;border:1px solid #3a3d41;border-radius:7px;background:#25282b;color:#9aa0a6}
+.bmy{margin:0 16px 14px;border:1px solid #33363a;border-radius:11px;background:#1f2225;padding:14px 16px}
+.bmf{padding:0 16px 16px}
+.bmfr{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.bmc{display:flex;align-items:center;gap:6px;width:auto;margin:0;padding:6px 12px;border:1px solid #4a4e53;border-radius:8px;background:#25282b;font:600 12px var(--disp);color:#e6e8ea}
+.okc{width:54px;height:54px;margin:0 auto;border-radius:13px;display:grid;place-items:center;background:#1e3a30;border:1px solid #2c5a47;color:#3ecf8e}
+#toast{position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#000c;color:#fff;padding:9px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
+#toast.on{opacity:1}
+/* ── المقدمة ── */
+#introw{position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
+#intro{position:absolute;inset:0;width:100%;height:100%}
+.it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:clamp(26px,8vw,40px);color:#fff;padding:0 14px}
+.it i{color:var(--ac);font-style:normal}
+.is{position:absolute;left:0;right:0;top:57%;text-align:center;font:500 15px var(--disp);color:#e6e8ea}
+.ib{position:absolute;left:12%;right:12%;top:75%;height:3px;background:#ffffff12;border-radius:3px;overflow:hidden}
+.ib i{display:block;height:100%;width:0;background:var(--ac)}
 </style></head><body>
-<canvas id="sky"></canvas>
-<div class="wrap">
-<header><div class="moon"></div><h1>احكِ لي حكايتك</h1><p class="typ" id="typ"></p></header>
-
-<section class="card" id="box">
- <div id="formv">
-  <div class="chips" id="chips">
-   <div class="chip on" data-k="dream"><i>🌙</i>حلمي وأهدافي</div>
-   <div class="chip" data-k="story"><i>📖</i>حكايتي</div>
-   <div class="chip" data-k="confess"><i>🤫</i>اعتراف</div>
-  </div>
-  <p class="q" id="ql"></p>
-  <textarea id="tx" maxlength="3500" placeholder="اكتب هنا بحرّية… لا أحد سيحكم عليك."></textarea>
-  <div class="cnt"><span id="cn">0</span> / 3500</div>
-  <div class="opt" id="oa"><div><b>🕶 أرسلها كمجهول</b><small>لا يُحفظ اسمك ولا أي معلومة عنك.</small></div><span class="sw on" id="sa"></span></div>
-  <div id="nameRow" class="hide"><input type="text" id="nm" maxlength="40" placeholder="اسمك (اختياري)"></div>
-  <div class="opt" id="oc"><div><b>🌍 أسمح بنشرها في جدار الحكايات</b><small>تُنشر فقط بعد موافقة الإدارة، وبدون أي بيانات شخصية.</small></div><span class="sw" id="sc"></span></div>
-  <input class="hp" id="hp" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
-  <button class="go" id="go">أرسل حكايتي ✨</button>
-  <div class="err" id="er"></div>
-  <p class="note">🔒 ما تكتبه يصل إلى صاحب الموقع ليقرأه. لا تكتب كلمات مرور أو بيانات سرّية.</p>
- </div>
- <div class="done" id="donev" style="display:none">
-  <div class="big">💌</div><h2>وصلت حكايتك</h2><p id="dm">شكراً لأنك شاركتني إياها.</p>
-  <button class="sec" id="again">احكِ شيئاً آخر</button>
- </div>
-</section>
-<a class="tgb" id="tg" href="#" target="_blank" rel="noopener" style="display:none">✈️ أو احكِ لي عبر تيليجرام</a>
-
-<h3 class="wh">🌌 جدار الحكايات</h3>
-<p class="ws">حكايات شاركها أصحابها بإذنهم</p>
-<div class="wall" id="wall"></div>
-<footer>احكِ… فالكلمات تخفّف الحِمل 🤍</footer>
-</div>
+<div id="introw"><canvas id="intro"></canvas><div class="it">احكِ لي حكايتك<i>.</i></div><div class="is" id="is"></div><div class="ib"><i id="ibf"></i></div></div>
+<script>
+(function(){
+  const wrap=document.getElementById('introw'),cv=document.getElementById('intro'),st=document.getElementById('is'),bf=document.getElementById('ibf');
+  try{
+    const S=['تجهيز المساحة الهادئة','فتح صفحة بيضاء لك','حماية خصوصيتك','جاهز لتحكي'],DUR=2800,cx=cv.getContext('2d'),dpr=Math.min(2,window.devicePixelRatio||1);
+    let W=0,H=0,cells=[],CELL=16,SZ=11,t=0,last=0,fading=false,si=-1;
+    function init(){
+      const r=cv.getBoundingClientRect();W=Math.max(1,Math.round(r.width));H=Math.max(1,Math.round(r.height));
+      const U=W/590;CELL=16*U;SZ=11*U;cv.width=W*dpr;cv.height=H*dpr;cx.setTransform(dpr,0,0,dpr,0,0);cells=[];
+      const cols=Math.ceil(W/CELL)+1,rows=Math.ceil(H/CELL)+1;
+      for(let r2=0;r2<rows;r2++){const yf=r2*CELL/H;if(yf<.46)continue;const ramp=Math.min(1,(yf-.46)/.18);
+        for(let c=0;c<cols;c++)cells.push({x:c*CELL+(CELL-SZ)/2,y:r2*CELL+(CELL-SZ)/2,ramp:ramp,o:Math.random()<.2,p:Math.random()*6.28,s:1.2+Math.random()*2.6,pw:4+Math.random()*3})}}
+    init();
+    function frame(now){
+      const dt=last?Math.min(50,now-last):16;last=now;t+=dt;
+      if(t>=DUR){wrap.remove();return}
+      if(!fading&&t>DUR-600){fading=true;wrap.style.opacity='0'}
+      const i=Math.min(S.length-1,Math.floor(t/DUR*S.length*.95));if(i!==si){si=i;st.textContent=S[i]}
+      bf.style.width=Math.min(100,t/(DUR-500)*100)+'%';
+      cx.clearRect(0,0,W,H);const g=Math.min(1,t/300);
+      for(const c of cells){const w=.5+.5*Math.sin(t/1000*c.s+c.p),a=c.ramp*g*(.1+.9*Math.pow(w,c.pw));
+        cx.fillStyle=c.o?`rgba(215,138,78,${(a*.85).toFixed(3)})`:`rgba(105,96,80,${(a*.6).toFixed(3)})`;cx.fillRect(c.x,c.y,SZ,SZ)}
+      requestAnimationFrame(frame)}
+    requestAnimationFrame(frame);
+    setTimeout(()=>{if(wrap.parentNode)wrap.remove()},DUR+6000);
+  }catch(e){wrap.remove()}
+})();
+</script>
+<div class="w" id="app"></div>
+<div class="nav" id="nav"></div><div id="sh"></div><div id="toast"></div>
 <script>
 const BOT="__BOT__";
-const TGW=window.Telegram&&window.Telegram.WebApp,INIT=(TGW&&TGW.initData)||'',TGU=INIT&&TGW.initDataUnsafe&&TGW.initDataUnsafe.user;
-if(INIT){try{TGW.ready();TGW.expand();TGW.setHeaderColor('#0a0e1f');TGW.setBackgroundColor('#0a0e1f')}catch(e){}}
+const tg=window.Telegram&&window.Telegram.WebApp,INIT=(tg&&tg.initData)||'',TGU=INIT&&tg.initDataUnsafe&&tg.initDataUnsafe.user;
+if(INIT){try{tg.ready();tg.expand();tg.setHeaderColor('#1a1c1e');tg.setBackgroundColor('#1a1c1e')}catch(e){}}
+try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
+function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
 const $=id=>document.getElementById(id);
-const KINDS={dream:['🌙','حلم وأهداف','احكيلي عن حلمك وأهدافك في هذه الحياة…'],story:['📖','حكاية','احكيلي حكايتك… ابدأ من حيث تشاء.'],confess:['🤫','اعتراف','اعترف لي بشيء لم تقله لأحد…']};
-let kind='dream',anon=true,consent=false,busy=false;
-/* سماء النجوم */
-(function(){const c=$('sky'),x=c.getContext('2d');let W,H,S=[];
- function init(){W=c.width=innerWidth;H=c.height=innerHeight;S=Array.from({length:Math.round(W*H/9000)},()=>({x:Math.random()*W,y:Math.random()*H,r:Math.random()*1.5+.3,p:Math.random()*6.28,s:.5+Math.random()*1.6,v:.02+Math.random()*.06}))}
- function fr(t){x.clearRect(0,0,W,H);for(const s of S){s.y+=s.v;if(s.y>H)s.y=0;const a=.3+.7*Math.abs(Math.sin(t/1000*s.s+s.p));x.fillStyle='rgba(255,240,215,'+a.toFixed(2)+')';x.beginPath();x.arc(s.x,s.y,s.r,0,6.28);x.fill()}requestAnimationFrame(fr)}
- addEventListener('resize',init);init();requestAnimationFrame(fr)})();
-/* كتابة متحركة */
-(function(){const P=['احكيلي عن حلمك وأهدافك في هذه الحياة…','احكيلي حكايتك…','اعترف لي بشيء لم تقله لأحد…'];let i=0,j=0,d=false;const e=$('typ');
- (function t(){const s=P[i];if(!d){j++;e.textContent=s.slice(0,j);if(j===s.length){d=true;return setTimeout(t,1800)}}else{j--;e.textContent=s.slice(0,j);if(j===0){d=false;i=(i+1)%P.length}}setTimeout(t,d?28:70)})()})();
-function setKind(k){kind=k;document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.dataset.k===k));$('ql').textContent=KINDS[k][2]}
-document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>setKind(c.dataset.k));setKind('dream');
-function hint(){if(TGU)$('oa').querySelector('small').textContent=anon?'لا يُحفظ اسمك ولا حسابك نهائياً.':'سيصل باسمك في تيليجرام، ويمكنني الرد عليك هناك.'}
-$('oa').onclick=()=>{anon=!anon;$('sa').classList.toggle('on',anon);$('nameRow').classList.toggle('hide',anon||!!TGU);hint()};hint();
-$('oc').onclick=()=>{consent=!consent;$('sc').classList.toggle('on',consent)};
-$('tx').oninput=()=>{$('cn').textContent=$('tx').value.length};
-if(BOT&&!INIT){const a=$('tg');a.href='https://t.me/'+BOT;a.style.display='flex'}
-$('go').onclick=async()=>{
- if(busy)return;const text=$('tx').value.trim();$('er').textContent='';
- if(text.length<5){$('er').textContent='اكتب شيئاً أطول قليلاً ✍️';return}
- busy=true;$('go').disabled=true;$('go').textContent='جاري الإرسال…';
- try{const r=await fetch('/sapi/send',{method:'POST',headers:{'Content-Type':'application/json','X-Init-Data':INIT},body:JSON.stringify({kind,text,anon,consent,name:$('nm').value,hp:$('hp').value})});
-  const j=await r.json();
-  if(j.ok){$('formv').style.display='none';$('donev').style.display='block';
-   $('dm').textContent=(anon?'وصلت بدون أي اسم 🕶 ':'')+'شكراً لأنك شاركتني إياها.'+(consent?' ستُنشر في الجدار إن وافقت الإدارة.':'');
-   $('tx').value='';$('cn').textContent='0'}
-  else $('er').textContent=j.error||'حدث خطأ، حاول مجدداً'}
- catch(e){$('er').textContent='تعذّر الاتصال، حاول مجدداً'}
- busy=false;$('go').disabled=false;$('go').textContent='أرسل حكايتي ✨'};
-$('again').onclick=()=>{$('donev').style.display='none';$('formv').style.display='block';window.scrollTo({top:0,behavior:'smooth'})};
-/* الجدار */
-function mk(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-async function wall(){try{const j=await (await fetch('/sapi/wall')).json();const w=$('wall');w.textContent='';
- if(!j.items.length){const e=mk('div','empty','لا توجد حكايات منشورة بعد. كن أول من يحكي 🌙');e.style.columnSpan='all';w.appendChild(e);return}
- j.items.forEach((s,i)=>{const k=KINDS[s.kind]||KINDS.story,c=mk('div','st');c.style.animationDelay=(i*60)+'ms';
-  const h=mk('div','k');h.appendChild(mk('i','',k[0]));h.appendChild(mk('span','',k[1]));c.appendChild(h);
-  c.appendChild(mk('p','',s.text));
-  const f=mk('div','f');f.appendChild(mk('span','',s.name));f.appendChild(mk('span','',new Date(s.t*1000).toLocaleDateString('ar')));c.appendChild(f);w.appendChild(c)})}catch(e){}}
-wall();setInterval(wall,40000);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fi=n=>Number(n).toLocaleString('en',{maximumFractionDigits:0});
+function toast(m){if(!m)return;const e=$('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2200)}
+const MAXC=3500;
+const K={dream:{ic:'moon',c:'#9b7bff',t:'حلمي وأهدافي',n:'حلم',s:'ما الذي تتمنى أن تصل إليه في هذه الحياة؟',q:'احكيلي عن حلمك وأهدافك في هذه الحياة…',tag:'DREAM'},
+ story:{ic:'book',c:'#38b6ff',t:'حكايتي',n:'حكاية',s:'قصة مرّت بك وتحب أن تحكيها',q:'احكيلي حكايتك… ابدأ من حيث تشاء.',tag:'STORY'},
+ confess:{ic:'lock',c:'#ff4fa3',t:'اعتراف',n:'اعتراف',s:'شيء تحمله في قلبك ولم تقله لأحد',q:'اعترف لي بشيء لم تقله لأحد…',tag:'SECRET'}};
+const TABS=[['write','pen','احكِ'],['wall','spark','الجدار'],['about','shield','عن المساحة']];
+let tab='write',kind='dream',anon=true,consent=false,text='',nm='',busy=false,err='',sheet=null,DONE=null,W=null,CUR=null;
+const ICO={
+ pen:'<path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/>',
+ spark:'<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>',
+ shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+ moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+ book:'<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+ lock:'<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+ eyeoff:'<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>',
+ globe:'<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+ check:'<path d="M20 6 9 17l-5-5"/>',
+ x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+ copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+ send:'<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>',
+ chev:'<path d="m15 18-6-6 6-6"/>',
+ cal:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+ trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>'};
+const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
+function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
+function dparts(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');return [p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear(),p(d.getHours())+':'+p(d.getMinutes())]}
+
+/* ═══ الحالة والتنقل ═══ */
+function sync(){const t=$('tx');if(t)text=t.value;const n=$('nm');if(n)nm=n.value}
+function go(t){sync();tab=t;sheet=null;bb();draw();window.scrollTo(0,0);if(t!=='write')loadWall()}
+function openSheet(s){sync();sheet=s;draw();bb()}
+function closeSheet(){sheet=null;draw();bb()}
+function setKind(k){sync();kind=k;draw()}
+function tog(w){sync();if(w==='a')anon=!anon;else consent=!consent;draw()}
+function cnt(){const n=$('tx').value.length;$('cn').textContent=n;$('cp').style.width=(n/MAXC*100)+'%'}
+function openStory(i){if(!W||!W.items[i])return;CUR=W.items[i];openSheet('story')}
+function cpTxt(){if(CUR)navigator.clipboard.writeText(CUR.text).then(()=>toast('تم النسخ')).catch(()=>toast('تعذّر النسخ'))}
+async function loadWall(){try{const j=await (await fetch('/sapi/wall')).json();if(j.ok){W=j;if(tab!=='write'&&!sheet)draw()}}catch(e){}}
+async function send(){
+  if(busy)return;sync();const hp=$('hp')?$('hp').value:'';err='';
+  if(text.trim().length<5){err='اكتب شيئاً أطول قليلاً ✍️';draw();return}
+  busy=true;draw();
+  try{
+    const r=await fetch('/sapi/send',{method:'POST',headers:{'Content-Type':'application/json','X-Init-Data':INIT},body:JSON.stringify({kind:kind,text:text.trim(),anon:anon,consent:consent,name:nm,hp:hp})});
+    const j=await r.json();
+    if(j.ok){DONE={id:j.id||0,anon:anon,consent:consent,kind:kind};text='';sheet='done';window.scrollTo(0,0)}
+    else err=j.error||'حدث خطأ، حاول مجدداً';
+  }catch(e){err='تعذّر الاتصال، حاول مجدداً'}
+  busy=false;draw();bb()}
+
+/* ═══ الواجهات ═══ */
+function kindCard(k){const m=K[k],on=kind===k;
+  return `<div class="mc ${on?'act':''}" style="--mc:${m.c}" onclick="setKind('${k}')"><span class="mi">${ic(m.ic,18)}</span>
+  <div class="mt"><b>${m.t}</b><em>${m.tag}</em><div class="ms">${m.s}</div></div>
+  <span class="mbtn ${on?'on':'ok'}">${on?ic('check',12)+'نشط':'اختر'}</span></div>`}
+function togCard(w,icn,title,sub,on,col){
+  return `<div class="mc ${on?'act':''}" style="--mc:${col}" onclick="tog('${w}')"><span class="mi">${ic(icn,18)}</span>
+  <div class="mt"><b>${title}</b><div class="ms">${sub}</div></div><span class="sw ${on?'on':''}"></span></div>`}
+function vWrite(){
+  const m=K[kind],n=text.length;
+  const subA=TGU?(anon?'لا يُحفظ اسمك ولا حسابك نهائياً':'سيصل باسمك في تيليجرام ويمكنني الرد عليك هناك'):'لا يُحفظ اسمك ولا أي معلومة عنك';
+  return `<div class="stc"><div class="sth"><span class="stic or">${ic('spark',14)}</span>اختر ما تشاركه<span class="rb">${m.tag}</span></div>
+  <div style="padding:4px 12px 14px">${Object.keys(K).map(kindCard).join('')}</div></div>
+  <div class="stc"><div class="sth"><span class="stic">${ic('pen',14)}</span>${m.q}</div>
+  <div class="tmb"><textarea id="tx" maxlength="${MAXC}" placeholder="اكتب هنا بحرّية… لا أحد سيحكم عليك." oninput="cnt()">${esc(text)}</textarea>
+  <div class="tr" style="margin-top:12px"><span class="mlb">عدد الحروف</span><span class="pc"><span id="cn">${n}</span><small> / ${MAXC}</small></span></div>
+  <div class="pb"><i id="cp" style="width:${n/MAXC*100}%"></i></div></div></div>
+  <div class="stc"><div class="sth"><span class="stic">${ic('shield',14)}</span>الخصوصية والنشر</div>
+  <div style="padding:4px 12px 14px">${togCard('a','eyeoff','أرسلها كمجهول',subA,anon,'#3ecf8e')}
+  ${(!anon&&!TGU)?`<input id="nm" class="inp nmi" maxlength="40" placeholder="اسمك (اختياري)" value="${esc(nm)}">`:''}
+  ${togCard('c','globe','أسمح بنشرها في الجدار','تُنشر بعد موافقة الإدارة وبدون أي بيانات شخصية',consent,'#38b6ff')}</div></div>
+  <input class="hp" id="hp" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
+  <button class="inv" ${busy?'disabled':''} onclick="send()">${busy?'جاري الإرسال…':ic('send',16)+'أرسل حكايتي'}</button>
+  <div class="err">${esc(err)}</div>
+  <p class="mnote" style="text-align:center">🔒 ما تكتبه يصل إلى صاحب البوت ليقرأه. لا تكتب كلمات مرور أو بيانات سرّية.</p>`}
+function wallCard(s,i){const k=K[s.kind]||K.story,d=dparts(s.t);
+  return `<div class="bkc" onclick="openStory(${i})"><div class="bkh"><span class="bkn">${k.tag}<b>#${fi(s.id)}</b></span>
+  <span class="bkr"><span class="rar" style="color:${k.c};border-color:${k.c}b0;background:${k.c}1f">${k.n}</span>${ic('chev',14)}</span></div>
+  <p class="stx cl">${esc(s.text)}</p>
+  <div class="bkf"><span class="bkm">${avs(s.name)}<b>${esc(s.name)}</b></span><span class="bkd">${d[0]}</span></div></div>`}
+function vWall(){
+  const it=W?W.items:null;
+  const h=`<h3 style="margin:4px 2px 10px">🌌 جدار الحكايات <span style="font-weight:400">· شاركها أصحابها بإذنهم</span></h3>`;
+  if(!it)return h+'<div class="card"><p class="h">…</p></div>';
+  return h+(it.length?it.map(wallCard).join(''):`<div class="stc"><div class="em"><span class="emi">${ic('moon',20)}</span><div>لا توجد حكايات منشورة بعد. كن أول من يحكي 🌙</div></div></div>`)}
+function rule(icn,tag,title,d){
+  return `<div class="stc bn"><div class="bnr"><span class="stic or big">${ic(icn,18)}</span><div><span class="mlb cap2"><i class="dot"></i>${tag}</span><div class="bt">${title}</div></div></div><p class="bd">${d}</p></div>`}
+function vAbout(){
+  const t=W||{total:0,published:0,anon:0};
+  return `<div class="stc"><div class="sth"><span class="stic">${ic('trend',14)}</span>إحصائيات المساحة</div>
+  <div class="st3"><div><div class="fl">${ic('book',12)}الحكايات</div><div class="fv">${fi(t.total)}</div></div>
+  <div><div class="fl">${ic('globe',12)}المنشورة</div><div class="fv">${fi(t.published)}</div></div>
+  <div><div class="fl">${ic('eyeoff',12)}المجهولة</div><div class="fv">${fi(t.anon)}</div></div></div></div>`+
+  rule('eyeoff','PRIVACY','إرسال مجهول','عند اختيار «مجهول» لا نحفظ اسمك ولا حسابك أبداً، ولا يمكن لأحد معرفة هويتك.')+
+  rule('globe','WALL','النشر في الجدار','لا تُنشر أي حكاية إلا إذا وافقت أنت ثم وافقت الإدارة، ويظهر الاسم الأول فقط أو «مجهول».')+
+  rule('send','REPLY','الردّ عليك','إن أرسلت باسمك عبر تيليجرام فقد يصلك ردّ خاص من صاحب البوت.')+
+  (BOT&&!INIT?`<button class="inv" onclick="window.open('https://t.me/${esc(BOT)}','_blank')">${ic('send',16)}أو احكِ لي عبر تيليجرام</button>`:'')+
+  `<p class="mnote" style="text-align:center;margin-top:16px">احكِ… فالكلمات تخفّف الحِمل 🤍</p>`}
+function sheetHTML(){
+  if(sheet==='story'&&CUR){
+    const s=CUR,k=K[s.kind]||K.story,d=dparts(s.t);
+    return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="shw"><div class="bm">
+    <div class="bmh"><div><div class="bml">${k.tag}</div><div class="bmn">#${fi(s.id)}</div></div>
+    <div class="bmr"><div class="bmd">${ic('cal',14)}<div><b>${d[0]}</b><small>${d[1]}</small></div></div><button class="bmx" onclick="closeSheet()">${ic('x',14)}</button></div></div>
+    <div class="bmy"><div class="bml">${esc(s.name)} · ${k.n}</div><div class="stx">${esc(s.text)}</div></div>
+    <div class="bmf"><div class="bmfr"><span class="bml">نسخ النص</span><button class="bmc" onclick="cpTxt()">${ic('copy',13)}نسخ</button></div></div></div></div></div>`}
+  if(sheet==='done'&&DONE){
+    return `<div class="ov" onclick="if(event.target===this)closeSheet()"><div class="shw"><div class="bm">
+    <div class="bmh"><div><div class="bml">تم الإرسال</div><div class="bmn">${DONE.id?'#'+fi(DONE.id):'✓'}</div></div>
+    <div class="bmr"><button class="bmx" onclick="closeSheet()">${ic('x',14)}</button></div></div>
+    <div class="bmy" style="text-align:center"><span class="okc">${ic('check',26)}</span><div class="bt" style="font-size:17px;margin-top:12px">وصلت حكايتك 💌</div>
+    <p class="bd">${DONE.anon?'وصلت بدون أي اسم 🕶 ':''}شكراً لأنك شاركتني إياها.${DONE.consent?' ستُنشر في الجدار إن وافقت الإدارة.':''}</p></div>
+    <div class="bmf"><button class="inv" onclick="closeSheet()">احكِ شيئاً آخر</button></div></div></div></div>`}
+  return ''}
+const V={write:vWrite,wall:vWall,about:vAbout};
+function draw(){
+  $('nav').innerHTML=TABS.map(t=>`<div class="${t[0]===tab?'on':''}" onclick="go('${t[0]}')"><span>${ic(t[1])}</span>${t[2]}</div>`).join('');
+  $('app').innerHTML='<div class="w" style="padding:0">'+V[tab]()+'</div>';
+  $('sh').innerHTML=sheetHTML()}
+setInterval(()=>{if(!document.hidden&&tab==='wall'&&!sheet)loadWall()},40000);
+draw();loadWall();
 </script></body></html>
 """
 
