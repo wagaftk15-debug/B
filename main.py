@@ -260,6 +260,9 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS m_week_top(
             week_id INT NOT NULL, pos INT NOT NULL, user_id BIGINT NOT NULL, name TEXT,
             amount DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY(week_id, pos))""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS m_sched(
+            id {pk}, hhmm INT NOT NULL, days TEXT NOT NULL DEFAULT '', text TEXT NOT NULL,
+            active INT NOT NULL DEFAULT 1, last_run TEXT NOT NULL DEFAULT '', created_at BIGINT)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS m_block_rewards(
             block_id BIGINT NOT NULL, user_id BIGINT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
             PRIMARY KEY(block_id, user_id))""")
@@ -1974,7 +1977,7 @@ async def cmd_wkcancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم الإلغاء.")
 
 
-async def _send_many(bot, pairs, admin_chat):
+async def _send_many(bot, pairs, admin_chat, label=""):
     sent = failed = 0
     kb = (InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=APP_URL))]])
           if WEBAPP_URL else None)
@@ -1995,7 +1998,7 @@ async def _send_many(bot, pairs, admin_chat):
             failed += 1
         await asyncio.sleep(0.05)
     try:
-        await bot.send_message(admin_chat, f"✅ انتهى الإرسال\n📨 وصلت: <b>{sent}</b>\n🚫 فشلت: {failed}")
+        await bot.send_message(admin_chat, f"✅ انتهى الإرسال{label}\n📨 وصلت: <b>{sent}</b>\n🚫 فشلت: {failed}")
     except Exception:
         pass
 
@@ -2010,6 +2013,229 @@ async def cmd_wkconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pairs = [(i["uid"], _pers(d["text"], i)) for i in d["items"]]
     await update.message.reply_text(f"🚀 بدأ الإرسال إلى {len(pairs)} لاعب... سأبلغك عند الانتهاء.")
     BG.append(asyncio.create_task(_send_many(context.bot, pairs, update.effective_chat.id)))
+
+
+# ═══════════ 5.2) الرسائل المجدولة (تُرسل تلقائياً كل يوم في ساعة محددة) ═══════════
+DAY_NAMES_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+DAY_ALIASES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+               "الاثنين": 0, "الإثنين": 0, "الثلاثاء": 1, "الاربعاء": 2, "الأربعاء": 2,
+               "الخميس": 3, "الجمعة": 4, "السبت": 5, "الأحد": 6, "الاحد": 6}
+SCHED_TIME_RE = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s+(.+)$", re.S)
+
+
+def _days_txt(days):
+    return "يومياً" if not days else "، ".join(DAY_NAMES_AR[int(x)] for x in days.split(",") if x != "")
+
+
+def _parse_sched(chunk):
+    """'20:00 نص' أو '20:00 mon,thu نص' ← (دقائق_من_منتصف_الليل, أيام, نص) أو None"""
+    m = SCHED_TIME_RE.match(chunk)
+    if not m:
+        return None
+    h, mi, rest = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+    if not (0 <= h < 24 and 0 <= mi < 60) or not rest:
+        return None
+    days = ""
+    tok = rest.split(None, 1)
+    first = tok[0].lower().strip(",")
+    if len(tok) > 1:
+        if first in ("daily", "يومي", "يومياً", "كل"):
+            rest = tok[1].strip()
+        else:
+            ds = [x for x in first.split(",") if x]
+            if ds and all(x in DAY_ALIASES for x in ds):
+                days = ",".join(str(i) for i in sorted({DAY_ALIASES[x] for x in ds}))
+                rest = tok[1].strip()
+    if not rest:
+        return None
+    return h * 60 + mi, days, rest
+
+
+def _plain(t, n=60):
+    return html.escape(re.sub(r"<[^>]+>", "", t).replace("\n", " ")[:n])
+
+
+async def cmd_addsched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addsched 20:00 نص  ← رسالة يومية · /addsched 20:00 mon,thu نص ← أيام محددة · أو عدة أسطر دفعة واحدة"""
+    if not _is_admin(update):
+        return
+    parts = (update.message.text_html or "").split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body:
+        await update.message.reply_text(
+            "⏰ <b>الرسائل المجدولة</b>\n\n"
+            "رسالة يومية في ساعة محددة:\n<code>/addsched 20:00 لا تنسَ مكافأتك اليومية 🎁</code>\n\n"
+            "أيام محددة فقط:\n<code>/addsched 20:00 mon,thu نص الرسالة</code>\n"
+            "(أو بالعربي: الاثنين,الخميس · الأيام: mon tue wed thu fri sat sun)\n\n"
+            "عدة رسائل دفعة واحدة (كل سطر: الوقت ثم النص):\n"
+            "<code>/addsched\n09:00 صباح الخير {name}! ⛏\n21:00 لا تنسَ مكافأتك اليومية 🎁</code>\n\n"
+            f"الوقت بتوقيت UTC{TZ_OFFSET:+g}. يمكنك استعمال <code>{{name}}</code> و<code>{{level}}</code> في النص.\n\n"
+            "/schedules لعرضها · /delsched ID للحذف · /togglesched ID للإيقاف/التشغيل · /testsched ID لتجربتها عندك")
+        return
+    lines = [l for l in body.split("\n") if l.strip()]
+    chunks = lines if (len(lines) > 1 and all(SCHED_TIME_RE.match(l) for l in lines)) else [body]
+    items, bad = [], 0
+    for ch in chunks:
+        it = _parse_sched(ch)
+        if not it:
+            bad += 1
+            continue
+        try:                                     # معاينة (وتتحقق أن التنسيق صالح)
+            await update.message.reply_text(
+                f"👁 معاينة ({it[0] // 60:02d}:{it[0] % 60:02d}):\n\n"
+                + it[2].replace("{name}", html.escape(update.effective_user.full_name))
+                .replace("{level}", "1"))
+        except Exception as e:
+            await update.message.reply_text(f"❌ تعذّر قبول رسالة ({html.escape(str(e))})")
+            bad += 1
+            continue
+        items.append(it)
+    if not items:
+        await update.message.reply_text("❌ صيغة غير صحيحة. مثال:\n<code>/addsched 20:00 نص الرسالة</code>")
+        return
+
+    def save():
+        now = time.time()
+        lt = _local(now)
+        today, cm = lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute
+        ids = []
+        with cursor() as cur:
+            for hhmm, days, text in items:
+                # لو كان الوقت قد مرّ اليوم، يبدأ الإرسال من الغد
+                cur.execute("INSERT INTO m_sched(hhmm,days,text,active,last_run,created_at) VALUES(?,?,?,?,?,?)",
+                            (hhmm, days, text, 1, today if cm >= hhmm else "", int(now)))
+                cur.execute("SELECT MAX(id) AS m FROM m_sched")
+                ids.append(cur.fetchone()["m"])
+        return ids
+    ids = await asyncio.to_thread(save)
+    out = [f"✅ تمت جدولة {len(ids)} رسالة:"]
+    out += [f"#{i} · {h // 60:02d}:{h % 60:02d} · {_days_txt(d)}" for i, (h, d, _) in zip(ids, items)]
+    if bad:
+        out.append(f"\n⚠️ تم تجاهل {bad} سطر بصيغة غير صحيحة.")
+    out.append("\nستُرسل لكل اللاعبين تلقائياً. /schedules لعرضها.")
+    await update.message.reply_text("\n".join(out))
+
+
+def _all_sched():
+    with cursor() as cur:
+        cur.execute("SELECT * FROM m_sched ORDER BY hhmm, id")
+        return cur.fetchall()
+
+
+async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    rs = await asyncio.to_thread(_all_sched)
+    if not rs:
+        await update.message.reply_text("لا توجد رسائل مجدولة.\nأضف واحدة: <code>/addsched 20:00 نص الرسالة</code>")
+        return
+    lt = _local(time.time())
+    out = [f"⏰ <b>الرسائل المجدولة</b> (الآن {lt.strftime('%H:%M')} UTC{TZ_OFFSET:+g})", ""]
+    for r in rs:
+        h = r["hhmm"]
+        out.append(f"{'✅' if r['active'] else '⏸'} <b>#{r['id']}</b> · {h // 60:02d}:{h % 60:02d} · {_days_txt(r['days'])}"
+                   f"{' · آخر إرسال ' + r['last_run'] if r['last_run'] else ''}\n"
+                   f"   {_plain(r['text'])}\n"
+                   f"   /delsched {r['id']} · /togglesched {r['id']} · /testsched {r['id']}")
+    await update.message.reply_text("\n".join(out))
+
+
+async def cmd_delsched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/delsched 1</code>")
+        return
+    sid = int(context.args[0])
+
+    def rm():
+        with cursor() as cur:
+            cur.execute("DELETE FROM m_sched WHERE id=?", (sid,))
+            return cur.rowcount
+    await update.message.reply_text("🗑 تم الحذف" if await asyncio.to_thread(rm) else "غير موجودة.")
+
+
+async def cmd_togglesched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/togglesched 1</code>")
+        return
+    sid = int(context.args[0])
+
+    def work():
+        with cursor() as cur:
+            cur.execute("UPDATE m_sched SET active=1-active WHERE id=?", (sid,))
+            if cur.rowcount != 1:
+                return None
+            cur.execute("SELECT active FROM m_sched WHERE id=?", (sid,))
+            return cur.fetchone()["active"]
+    a = await asyncio.to_thread(work)
+    await update.message.reply_text("غير موجودة." if a is None else ("▶️ تم التشغيل" if a else "⏸ تم الإيقاف"))
+
+
+async def cmd_testsched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/testsched ID ← يرسلها لك أنت فقط لتتأكد من شكلها"""
+    if not _is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("الاستعمال: <code>/testsched 1</code>")
+        return
+    sid = int(context.args[0])
+
+    def get():
+        with cursor() as cur:
+            cur.execute("SELECT text FROM m_sched WHERE id=?", (sid,))
+            return cur.fetchone()
+    r = await asyncio.to_thread(get)
+    if not r:
+        await update.message.reply_text("غير موجودة.")
+        return
+    txt = r["text"].replace("{name}", html.escape(update.effective_user.full_name)).replace("{level}", "1")
+    kb = (InlineKeyboardMarkup([[InlineKeyboardButton("⛏ افتح التعدين", web_app=WebAppInfo(url=APP_URL))]])
+          if WEBAPP_URL else None)
+    await update.message.reply_text(txt, reply_markup=kb)
+
+
+def sched_due():
+    now = time.time()
+    lt = _local(now)
+    today, cm, wd = lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute, lt.weekday()
+    due = []
+    with cursor() as cur:
+        cur.execute("SELECT * FROM m_sched WHERE active=1")
+        for r in cur.fetchall():
+            if r["last_run"] == today:
+                continue
+            if r["days"] and str(wd) not in r["days"].split(","):
+                continue
+            if 0 <= cm - r["hhmm"] <= 10:       # نافذة 10 دقائق (إن كان البوت متوقفاً أطول من ذلك تُتخطى)
+                cur.execute("UPDATE m_sched SET last_run=? WHERE id=?", (today, r["id"]))
+                due.append(r)
+    return due
+
+
+def _sched_pairs(text):
+    with cursor() as cur:
+        cur.execute("SELECT id,name,level FROM m_users WHERE banned=0 ORDER BY id")
+        return [(r["id"], text.replace("{name}", html.escape(r["name"] or "")).replace("{level}", str(r["level"])))
+                for r in cur.fetchall()]
+
+
+async def _run_sched(bot, r):
+    pairs = await asyncio.to_thread(_sched_pairs, r["text"])
+    await _send_many(bot, pairs, ADMIN_ID, label=f" (مجدولة #{r['id']})")
+
+
+async def sched_loop():
+    while True:
+        await asyncio.sleep(20)
+        try:
+            BG[:] = [t for t in BG if not t.done()]
+            for r in await asyncio.to_thread(sched_due):
+                BG.append(asyncio.create_task(_run_sched(MAIN_APP.bot, r)))
+        except Exception:
+            log.exception("sched loop")
 
 
 async def post_init(app: Application):
@@ -2037,7 +2263,9 @@ async def post_init(app: Application):
                                       BotCommand("unban", "✅ إلغاء حظر"),
                                       BotCommand("bans", "📋 قائمة المحظورين"),
                                       BotCommand("weekly", "🏆 الترتيب الأسبوعي"),
-                                      BotCommand("weeksend", "🎉 تهنئة أفضل 100 أسبوعياً")]
+                                      BotCommand("weeksend", "🎉 تهنئة أفضل 100 أسبوعياً"),
+                                      BotCommand("addsched", "⏰ جدولة رسالة يومية"),
+                                      BotCommand("schedules", "📋 الرسائل المجدولة")]
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         if WEBAPP_URL:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
@@ -2047,6 +2275,7 @@ async def post_init(app: Application):
     BG.append(asyncio.create_task(block_loop()))
     BG.append(asyncio.create_task(settle_loop()))
     BG.append(asyncio.create_task(week_loop()))
+    BG.append(asyncio.create_task(sched_loop()))
     if ADMIN_ID:
         try:
             await app.bot.send_message(ADMIN_ID, f"✅ البوت يعمل.\n🗄 {'PostgreSQL' if USE_PG else 'SQLite'}\n"
@@ -2789,6 +3018,11 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("bans", cmd_bans))
+    app.add_handler(CommandHandler("addsched", cmd_addsched))
+    app.add_handler(CommandHandler("schedules", cmd_schedules))
+    app.add_handler(CommandHandler("delsched", cmd_delsched))
+    app.add_handler(CommandHandler("togglesched", cmd_togglesched))
+    app.add_handler(CommandHandler("testsched", cmd_testsched))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
     app.add_handler(CommandHandler("weeksend", cmd_weeksend))
     app.add_handler(CommandHandler("wkconfirm", cmd_wkconfirm))
