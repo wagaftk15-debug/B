@@ -2717,6 +2717,61 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .bmfr{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}
 .bmc{display:flex;align-items:center;gap:6px;width:auto;margin:0;padding:6px 12px;border:1px solid #4a4e53;border-radius:8px;background:#25282b;font:600 12px var(--disp);color:#e6e8ea}
 .bmhash{font:400 12px/1.6 var(--mono);color:#e6e8ea;background:#1f2225;border:1px solid #33363a;border-radius:9px;padding:12px;word-break:break-all;direction:ltr;text-align:left}
+/* ── مكافآت يومية · قائمة المهام · بطاقات المعلومات ── */
+.ibt{width:28px;height:28px;margin:0;padding:0;display:grid;place-items:center;border:1px solid #3a3d41;border-radius:7px;background:#25282b;color:#9aa0a6;flex:none}
+.hdr2{display:flex;align-items:center;gap:8px}
+.dr{display:flex;align-items:center;gap:12px;padding:14px;cursor:pointer}
+.dr:active{background:#ffffff08}
+.dr .stic{width:30px;height:30px;border-radius:8px}
+.dtx{flex:1;min-width:0}
+.dtx b{display:block;font:700 14px var(--disp);color:#f4f4f4}
+.dtx span{display:block;font:500 12px var(--mono);color:#ffa861;line-height:1.5;margin-top:2px}
+.dtx span.w2{color:#8b9098}
+.drt{display:flex;align-items:center;gap:10px;color:#8b9098}
+.plp{font:700 12px var(--mono);color:#ffa861;border:1px solid #7a5535;background:#3e3833;border-radius:7px;padding:5px 10px}
+.dh{display:flex;align-items:center;gap:14px;margin-top:16px}
+.dhi{width:40px;height:40px;border:1px solid #6e4c32;border-radius:9px;background:#3e3833;color:#ffa861;display:grid;place-items:center;flex:none}
+.dht b{display:block;font:700 18px var(--disp);color:#f4f4f4;line-height:1.3}
+.dht span{display:block;font-size:12.5px;line-height:1.5;color:var(--mut);margin-top:2px}
+.dys{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
+.dy{display:flex;flex-direction:column;align-items:center;gap:8px;min-height:86px;padding:12px 6px 10px;border:1px solid #33363a;border-radius:10px;background:#25282b;color:#8b9098}
+.dy small{font:400 11px var(--mono)}
+.dy b{font:700 12.5px var(--mono);color:#f4f4f4;direction:ltr}
+.dy.done{border-color:#7a5535;background:#3a342f}
+.dy.cur{border-color:#ffa861;background:#3e3833;box-shadow:0 0 0 1px #ffa86133,0 0 18px #ffa86122}
+.dy.lock b{color:#c3c6c9}
+.dy .st{height:12px;display:grid;place-items:center;color:#ffa861}
+.dy.lock .st{color:#6b7178}
+.dy .pt{width:6px;height:6px;border-radius:50%;background:#ffa861}
+.dy .bi{width:20px;height:20px;border-radius:5px;background:var(--blue);color:#fff;display:grid;place-items:center;flex:none}
+.dy.wide{grid-column:1/-1;flex-direction:row;align-items:center;gap:14px;min-height:68px;padding:12px 16px;text-align:start}
+.dy.wide .bi{width:44px;height:44px;border-radius:10px}
+.dy.wide .dtx2{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.dy.wide .dtx2 small i{font-style:normal;font-weight:700;color:var(--blue);margin-inline-start:8px;font-family:var(--disp);font-size:13px}
+.dy.wide .dtx2 span{font-size:12.5px;color:var(--mut);line-height:1.4}
+.dy.wide .st{flex:none}
+.claim{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;height:44px;margin:18px 0 0;padding:0;border:0;border-radius:9px;background:#ffa861;color:#1e1307;font:600 15px var(--disp)}
+.claim:active{transform:scale(.98)}
+.claim:disabled{background:#4a3320;color:#ffd9b8;opacity:.8;cursor:default;transform:none}
+.dsc{margin:0 0 16px;font-size:13.5px;line-height:1.7;color:#a5aab0}
+.inl{border:1px solid #33363a;border-radius:10px;background:#25282b;overflow:hidden}
+.inr{display:flex;gap:12px;align-items:flex-start;padding:12px;border-bottom:1px solid #33363a}
+.inr:last-child{border:0}
+.ini{width:28px;height:28px;border:1px solid #3a3d41;border-radius:7px;display:grid;place-items:center;color:#9aa0a6;background:#ffffff05;flex:none;margin-top:1px}
+.ini.or{border-color:#6e4c32;background:#3e3833;color:#ffa861}
+.intx{min-width:0}
+.intx b{display:block;font:700 13px var(--disp);color:#f4f4f4;line-height:1.4}
+.intx span{display:block;margin-top:2px;font-size:12px;line-height:1.6;color:#8b9098}
+.tk{display:flex;align-items:center;gap:14px;padding:0 14px;min-height:58px;border-bottom:1px solid #303337}
+.tk:last-child{border:0}
+.nb{width:30px;height:30px;border:1px solid #3a3d41;border-radius:7px;display:grid;place-items:center;font:400 11px var(--mono);color:#8b9098;background:#25282b;flex:none}
+.tt{flex:1;min-width:0}
+.tt b{display:block;font:700 14px var(--disp);color:#f4f4f4;line-height:1.4}
+.tts{margin-top:3px;font-size:12px;color:#8b9098}
+.tts em{font:700 12px var(--mono);font-style:normal;color:#ffa861;direction:ltr;display:inline-block}
+.tok{color:var(--grn);display:grid}
+.jn{width:auto;margin:0;height:34px;padding:0 16px;border:0;border-radius:8px;background:#ffa861;color:#1e1307;font:700 12.5px var(--disp)}
+.cntb{margin-inline-start:auto;font:700 11px var(--mono);color:#8b9098;border:1px solid #3a3d41;border-radius:7px;padding:4px 7px;background:#25282b;direction:ltr}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2977,7 +3032,7 @@ function vMine(){
   h+=`<div class="card"><div class="row"><div><b style="color:var(--tx);font-size:16px">👑 كن راعي التعدين</b><br><span class="h">×2 مكافأة كل كتلة · 24h+</span></div>
     <button class="sm pri" onclick="buy('patron')">⭐ ${S.prices.patron}</button></div>
     ${S.patron_left>0?`<p class="h" style="margin-top:8px;color:var(--grn)">فعّال · المتبقي ${fmtWait(S.patron_left)}</p>`:''}</div>`;
-  h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">معلومات الكتلة <span class="tag">#${fi(S.next_block)}</span></b><span class="off">عادي</span></div>
+  h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">معلومات الكتلة <span class="tag">#${fi(S.next_block)}</span></b><button class="ibt" onclick="openSheet('binfo')">${ic('info',15)}</button></div>
     <div class="grid" style="margin:12px 0 0"><div class="cell"><span class="h">الصعوبة</span><b>${fk(S.difficulty)}</b></div>
     <div class="cell"><span class="h">إجمالي معدل الهاش</span><b>${fk(S.total_hr)}</b></div>
     <div class="cell"><span class="h">المكافأة</span><b>${f(S.block_reward,1)} #</b></div>
@@ -2987,7 +3042,7 @@ function vMine(){
     <button class="pri" onclick="buy('permit')">⭐ ادفع ${S.prices.permit} نجمة</button></div>`;
   }else{
     const m=S.modes[S.mode],mc=MC[S.mode]||MC[1];
-    h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">⛏ تعدين</b>${S.mining?'<span class="live">قيد التشغيل</span>':'<span class="off">متوقف</span>'}</div>
+    h+=`<div class="card"><div class="row"><b style="color:var(--tx);font-size:16px">⛏ تعدين</b><span class="hdr2">${S.mining?'<span class="live">قيد التشغيل</span>':'<span class="off">متوقف</span>'}<button class="ibt" onclick="openSheet('session')">${ic('info',15)}</button></span></div>
     <div class="grid" style="margin:12px 0 0"><div class="cell"><span class="h">معدل الهاش</span><b>${fk(S.hashrate)} H/s</b></div>
     <div class="cell"><span class="h">هاش</span><b id="hs">${fk(S.hashes)}</b></div>
     <div class="cell"><span class="h">أسهم</span><b>${fi(S.wins)}</b></div>
@@ -3013,14 +3068,16 @@ function vRefs(){
     <p class="bd">تحصل على +${fi(S.ref_energy)} طاقة قصوى عن كل مُحال يعدّن ${fi(S.ref_hours)} ساعة فعلية على الأقل (حتى ${fi(S.ref_max)} مُحال). المُحالون النشطون حالياً: <b style="color:var(--tx)">${fi(S.ref_active)}</b> / ${fi(S.ref_max)}. الإحالات الوهمية لا تُحتسب.</p></div>
   <div class="stc"><div class="sth lbh"><div><div class="lbt">أفضل 100 إحالة</div><div class="lbs">لوحة الصدارة</div></div><span class="lbn">${String(L.length).padStart(3,'0')}</span></div>${rows}</div>`}
 function vTasks(){
-  const lab=['+1,000','+2,000','+3,000','+5,000','+7,500','+12,000','+20,000'];
   const ready=S.daily_wait<=0;
-  let h=`<div class="card"><div class="cap">DAILY · STREAK</div><h2>🎁 مكافآت يومية</h2><p class="h">عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى).</p><div class="days" style="margin-top:12px">`+
-  lab.map((l,i)=>`<div class="day ${i==6?'wide':''} ${i<S.day_idx?'on':''}"><span>اليوم ${i+1}</span><b>⚡ ${l}</b>${i<S.day_idx?'✓':'🔒'}</div>`).join('')+
-  `</div>
-  <button class="pri" ${ready?'':'disabled'} onclick="act('daily')">${ready?'🎁 استلم مكافأة اليوم':'التالية بعد '+fmtWait(S.daily_wait)}</button></div>`;
-  if(S.tasks.length)h+=`<div class="card"><h3>المهام</h3>`+S.tasks.map(t=>`<div class="rk"><span class="n">${esc(t.title)}</span><span class="tag">+${t.reward}</span>
-  ${t.done?'<span>✅</span>':`<button class="sm pri" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>';
+  let h=`<div class="stc"><div class="dr" onclick="openSheet('daily')"><span class="stic or">${ic('gift',16)}</span>
+    <div class="dtx"><b>مكافآت يومية</b><span class="${ready?'':'w2'}">${ready?'المكافأة جاهزة — استلمها':'التالية بعد '+fmtWait(S.daily_wait)}</span></div>
+    <span class="drt">${ready?'<span class="plp">جاهز</span>':''}${ic('chev',16)}</span></div></div>`;
+  if(S.tasks.length){
+    const nd=S.tasks.filter(t=>t.done).length;
+    h+=`<div class="stc"><div class="sth"><span class="stic">${ic('list',14)}</span>المهام<span class="cntb">${nd}/${S.tasks.length}</span></div>`+
+    S.tasks.map((t,i)=>`<div class="tk"><span class="nb">${String(i+1).padStart(2,'0')}</span>
+      <div class="tt"><b>${esc(t.title)}</b><div class="tts"><em>+${t.reward} HASH</em></div></div>
+      ${t.done?'<span class="tok">'+ic('check',17)+'</span>':`<button class="jn" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>'}
   return h}
 
 const ICO={trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
@@ -3053,6 +3110,14 @@ Object.assign(ICO,{
 Object.assign(ICO,{logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.59 13.51 6.83 3.98"/><path d="m15.41 6.51-6.82 3.98"/>',chev:'<path d="m15 18-6-6 6-6"/>',
  user:'<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
  link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>'});
+Object.assign(ICO,{
+ bolt:'<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" fill="currentColor"/>',
+ gift:'<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"/>',
+ info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+ pulse:'<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
+ cpu:'<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
+ hash:'<line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/>',
+ crown:'<path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"/><path d="M5 21h14"/>'});
 const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
 const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
@@ -3125,9 +3190,44 @@ function vWallet(){return `<div class="card"><div class="row"><span>الرصيد
   <button class="pri" onclick="donate()">⭐ ادعم الآن</button></div>
   <div class="card"><p class="h">ℹ️ النقاط افتراضية داخل اللعبة فقط، ولا تمثل عملة رقمية ولا يمكن سحبها أو تحويلها لمال.</p></div>`}
 
+/* ═══ نوافذ وسط الشاشة: مكافآت يومية + بطاقات المعلومات ═══ */
+function shellMid(inner){return `<div class="ov mid" onclick="if(event.target===this)closeSheet()"><div class="shw"><button class="xb" onclick="closeSheet()">${ic('x',16)}</button><div class="sh lt">${inner}</div></div></div>`}
+function dayCell(i){
+  const dn=i<S.day_idx,cu=i===S.day_idx,a='+'+fi(S.daily[i]);
+  const st=dn?ic('check',13):cu?'<i class="pt"></i>':ic('lock',12),c=dn?'done':cu?'cur':'lock';
+  if(i===6)return `<div class="dy wide ${c}"><span class="bi">${ic('bolt',24)}</span><div class="dtx2"><small>اليوم 7<i>${a}</i></small><span>الجائزة الكبرى · طاقة إضافية</span></div><span class="st">${st}</span></div>`;
+  return `<div class="dy ${c}"><small>اليوم ${i+1}</small><span class="bi">${ic('bolt',12)}</span><b>${a}</b><span class="st">${st}</span></div>`}
+function dailySheet(){
+  const ready=S.daily_wait<=0;
+  return shellMid(`<div class="cap cap2"><i class="dot"></i>DAILY · STREAK</div>
+  <div class="dh"><span class="dhi">${ic('gift',22)}</span><div class="dht"><b>مكافآت يومية</b><span>عُد كل يوم — تزداد المكافآت (الطاقة تتجاوز الحد الأقصى)</span></div></div>
+  <div class="dys">${S.daily.map((_,i)=>dayCell(i)).join('')}</div>
+  <button class="claim" ${ready?'':'disabled'} onclick="act('daily')">${ic('gift',16)}${ready?'استلم +'+fi(S.daily[S.day_idx])+' طاقة':'التالية بعد '+fmtWait(S.daily_wait)}</button>`)}
+const INFO={
+ session:{cap:'SESSION · INFO',title:'كيف تعمل جلسة التعدين',
+  intro:'كل معدّن نشط يحصل على حصة من مكافأة كل كتلة بنسبة هاشه، وقد يفوز بمكافأة المعدّن أيضاً.',
+  items:[['pulse','معدل الهاش','سرعة التعدين — عدد الهاشات في الثانية، ويتأثر بمستواك ووضع التعدين.'],
+   ['cpu','هاش','إجمالي الهاشات التي حسبتها منذ بدأت التعدين.'],
+   ['hash','أسهم','عدد الكتل التي فزت بمكافأة معدّنها بالقرعة.'],
+   ['coin','الدخل','مجموع ما ربحته من مكافآت الكتل (المشتركة + مكافأة المعدّن).'],
+   ['rocket','الأوضاع','الأوضاع الأعلى ترفع معدل الهاش عدة أضعاف، وتُفتح بنجوم تيليجرام أو بكود.']]},
+ binfo:{cap:'BLOCK · INFO',title:'معلومات الكتلة',
+  intro:'تُنشأ كتلة جديدة كل 5 ثوانٍ، ولكل كتلة مكافأة تُوزَّع بين الفائز وكل المعدّنين النشطين.',
+  items:[['coin','مكافأة الكتلة','إجمالي النقاط المطروحة في الكتلة الواحدة، وتُوزَّع عند إغلاقها.'],
+   ['crown','مكافأة المعدّن','40% من الكتلة للفائز بالقرعة، والقرعة موزونة بقوة هاش كل معدّن. راعي التعدين يضاعف حصته ×2.'],
+   ['users','المكافأة المشتركة','الـ60% الباقية تُقسَّم على كل المعدّنين النشطين بنسبة هاش كل منهم.'],
+   ['gauge','الصعوبة','مؤشر يُحسب من إجمالي الهاش في الشبكة.'],
+   ['pulse','إجمالي معدل الهاش','مجموع قوة هاش كل المعدّنين النشطين الآن.']]}};
+function infoRow(it){const coin=it[0]==='coin';
+  return `<div class="inr"><span class="ini ${coin?'or':''}">${coin?'<i class="cx">#</i>':ic(it[0],15)}</span><div class="intx"><b>${it[1]}</b><span>${it[2]}</span></div></div>`}
+function infoSheet(k){const d=INFO[k];
+  return shellMid(`<div class="cap cap2"><i class="dot"></i>${d.cap}</div><h2>${d.title}</h2><p class="dsc">${d.intro}</p><div class="inl">${d.items.map(infoRow).join('')}</div>`)}
+
 function sheetHTML(){
   if(!sheet)return '';
   if(sheet==='blk')return blkModal();
+  if(sheet==='daily')return dailySheet();
+  if(sheet==='session'||sheet==='binfo')return infoSheet(sheet);
   let b='';
   if(sheet==='energy'){
     b=`<div class="cap">ENERGY · UPGRADE</div><h2>زيادة الطاقة القصوى</h2>
