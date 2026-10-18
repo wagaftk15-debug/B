@@ -56,6 +56,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "0") or 0)
 DB_PATH = os.environ.get("DB_PATH", "miner.db")
 TASK_CHANNEL = os.environ.get("TASK_CHANNEL", "")          # مثال: @mychannel (اختياري)
+TASK_GROUP = os.environ.get("TASK_GROUP", "")              # مثال: @mygroup (اختياري) — يجب أن يكون البوت عضواً/مشرفاً فيها
+TASK_BOOST = os.environ.get("TASK_BOOST", "") or TASK_CHANNEL   # قناة مهمة التعزيز (البوت مشرف فيها) — افتراضياً قناة المهام
+NAME_TAG = os.environ.get("NAME_TAG", "#TotalHash")        # الوسم المطلوب إضافته لاسم المستخدم
 try:
     PORT = int(os.environ.get("PORT", "8080") or 8080)
 except ValueError:
@@ -127,7 +130,32 @@ SERVERS = {
 }
 DEX_BASE = 0.008        # (DEX معطّل حالياً)
 DEX_FEE = 0.03          # (DEX معطّل حالياً)
-TASKS = {"channel": {"title": "اشترك في القناة", "reward": 300}} if TASK_CHANNEL else {}
+
+# ── المهام: كل مهمة تمنح +TASK_ENERGY طاقة قصوى (تُضاف مرة واحدة لكل لاعب) ──
+TASK_ENERGY = 300
+
+
+def _tlink(x):
+    x = (x or "").strip()
+    return x if x.startswith("http") else "https://t.me/" + x.lstrip("@")
+
+
+TASKS = {"name": dict(kind="name", icon="at", cap="TASK · NAME", title=f"أضف {NAME_TAG} إلى اسمك",
+                      desc=f"أضف {NAME_TAG} إلى اسمك في تيليجرام لزيادة طاقتك القصوى.",
+                      reward=TASK_ENERGY, prem=False, link="")}
+if TASK_CHANNEL:
+    TASKS["channel"] = dict(kind="channel", icon="userplus", cap="TASK · CHANNEL", title="اشترك في القناة",
+                            desc=f"اشترك في قناتنا الرسمية لزيادة طاقتك القصوى بمقدار +{TASK_ENERGY}.",
+                            reward=TASK_ENERGY, prem=False, link=_tlink(TASK_CHANNEL))
+if TASK_GROUP:
+    TASKS["group"] = dict(kind="group", icon="help", cap="TASK · GROUP", title="انضم إلى المجموعة",
+                          desc=f"انضم إلى مجموعة المجتمع لزيادة طاقتك القصوى بمقدار +{TASK_ENERGY}.",
+                          reward=TASK_ENERGY, prem=False, link=_tlink(TASK_GROUP))
+if TASK_BOOST:
+    TASKS["boost"] = dict(kind="boost", icon="rocket", cap="TASK · BOOST", title="عزّز القناة",
+                          desc=f"عزّز القناة بتعزيز Telegram Premium مقابل +{TASK_ENERGY} طاقة قصوى. "
+                               "يتطلب Telegram Premium.",
+                          reward=TASK_ENERGY, prem=True, link=_tlink(TASK_BOOST))
 try:
     TZ_OFFSET = float(os.environ.get("TZ_OFFSET", "1"))    # فرق التوقيت عن UTC لتواريخ الأدمن (الجزائر = 1)
 except ValueError:
@@ -811,6 +839,7 @@ def verify_init_data(init_data, max_age=86400, token=None):
         sp = d.get("start_param", "")
         return dict(id=int(u["id"]), username=u.get("username") or "",
                     name=" ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or "Miner",
+                    premium=bool(u.get("is_premium")),
                     ref=int(sp[4:]) if sp.startswith("ref_") and sp[4:].isdigit() else None)
     except Exception:
         return None
@@ -842,8 +871,11 @@ def act_me(tg, b):
                 ref_energy=REF_ENERGY, ref_min=REF_MIN, ref_hours=REF_SECS // 3600, ref_max=REF_MAX, ref_active=ref_active, daily=DAILY, chain=chain_info(),
                 modes={k: dict(name=v["name"], mul=v["mul"], cost=v["cost"], stars=v["stars"]) for k, v in MODES.items()},
                 ref_link=f"https://t.me/{MAIN_APP.bot.username}?start=ref_{u['id']}",
-                tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done) for k, v in TASKS.items()],
-                channel=TASK_CHANNEL, prices={k: v["stars"] for k, v in ITEMS.items()})
+                premium=bool(tg.get("premium")),
+                tasks=[dict(id=k, title=v["title"], reward=v["reward"], done=k in done, icon=v["icon"], cap=v["cap"],
+                            desc=v["desc"], prem=v["prem"], link=v["link"]) for k, v in TASKS.items()],
+                channel=TASK_CHANNEL, channel_link=_tlink(TASK_CHANNEL) if TASK_CHANNEL else "",
+                prices={k: v["stars"] for k, v in ITEMS.items()})
 
 
 def act_mining(tg, b):
@@ -971,21 +1003,44 @@ def act_redeem(tg, b):
 
 
 def task_done(tg, key):
+    """يسجّل المهمة مرة واحدة ويمنح +reward طاقة قصوى. يرجع True إذا كانت أول مرة."""
     with cursor() as cur:
         cur.execute("INSERT INTO m_tasks(user_id,task) VALUES(?,?) ON CONFLICT DO NOTHING", (tg["id"], key))
         if cur.rowcount == 1:
-            add_points(cur, tg["id"], TASKS[key]["reward"])
+            cur.execute("UPDATE m_users SET max_energy=max_energy+? WHERE id=?", (TASKS[key]["reward"], tg["id"]))
+            return True
+    return False
 
 
 async def act_task(tg, b):
     key = b.get("task")
-    if key not in TASKS:
+    t = TASKS.get(key)
+    if not t:
         raise Err("مهمة غير موجودة")
-    m = await MAIN_APP.bot.get_chat_member(TASK_CHANNEL, tg["id"])
-    if m.status not in ("member", "administrator", "creator"):
-        raise Err("لم تشترك بعد")
-    await asyncio.to_thread(task_done, tg, key)
-    return {}
+    kind = t["kind"]
+    if kind == "boost" and not tg.get("premium"):
+        raise Err("هذه المهمة تتطلب Telegram Premium")
+    try:
+        if kind == "name":
+            ch = await MAIN_APP.bot.get_chat(tg["id"])
+            nm = " ".join(x for x in (ch.first_name, ch.last_name) if x)
+            ok, msg = NAME_TAG.lower() in nm.lower(), f"لم تضف {NAME_TAG} إلى اسمك بعد"
+        elif kind == "channel":
+            m = await MAIN_APP.bot.get_chat_member(TASK_CHANNEL, tg["id"])
+            ok, msg = m.status in ("member", "administrator", "creator"), "لم تشترك بعد"
+        elif kind == "group":
+            m = await MAIN_APP.bot.get_chat_member(TASK_GROUP, tg["id"])
+            ok, msg = m.status in ("member", "administrator", "creator"), "لم تنضم إلى المجموعة بعد"
+        else:
+            bs = await MAIN_APP.bot.get_user_chat_boosts(TASK_BOOST, tg["id"])
+            ok, msg = bool(bs.boosts), "لم تعزّز القناة بعد"
+    except Exception:
+        log.exception("task check %s", key)
+        raise Err("تعذّر التحقق، حاول مجدداً بعد قليل")
+    if not ok:
+        raise Err(msg)
+    first = await asyncio.to_thread(task_done, tg, key)
+    return {"msg": f"✅ +{t['reward']} طاقة قصوى" if first else "تمت هذه المهمة من قبل"}
 
 
 async def act_invoice(tg, b):
@@ -2772,6 +2827,40 @@ button.sm{width:auto;margin:0;padding:8px 14px}
 .tok{color:var(--grn);display:grid}
 .jn{width:auto;margin:0;height:34px;padding:0 16px;border:0;border-radius:8px;background:#ffa861;color:#1e1307;font:700 12.5px var(--disp)}
 .cntb{margin-inline-start:auto;font:700 11px var(--mono);color:#8b9098;border:1px solid #3a3d41;border-radius:7px;padding:4px 7px;background:#25282b;direction:ltr}
+/* ── قسم الاشتراكات والمهام + الأكواد الترويجية ── */
+.sth.ul{border-bottom:1px solid #b9552a;cursor:pointer}
+.sth small{display:block;font:400 11.5px var(--mono);color:#8b9098;margin-top:1px;letter-spacing:0}
+.rt{margin-inline-start:auto;display:flex;align-items:center;gap:10px;color:#8b9098}
+.pl{display:flex;align-items:center;gap:6px;font:700 12px var(--mono);color:#ffa861;border:1px solid #7a5535;background:#3e3833;border-radius:7px;padding:5px 10px;direction:ltr}
+.bz{display:inline-grid;place-items:center;width:12px;height:12px;border-radius:3px;background:var(--blue);color:#fff;flex:none}
+.chv{transition:transform .2s;display:grid}.chv.dn{transform:rotate(180deg)}
+.tk.c{cursor:pointer}.tk.c:active{background:#ffffff08}
+.tt b .tic{display:inline-grid;vertical-align:middle;color:#9aa0a6;margin-inline-end:7px}
+.tts .bz{vertical-align:middle;margin-inline-end:4px}
+.tkc{color:#8b9098;display:grid}
+.th{display:flex;align-items:center;gap:14px;margin:16px 0 18px}
+.gi{width:44px;height:44px;border:1px solid #3a3d41;border-radius:9px;background:#25282b;color:#c3c6c9;display:grid;place-items:center;flex:none}
+.th b{display:block;font:700 18px var(--disp);color:#f4f4f4;line-height:1.3}
+.th .tts{margin-top:2px}
+.wb{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;height:46px;margin:10px 0 0;padding:0;border:0;border-radius:9px;background:#ffa861;color:#1e1307;font:600 14px var(--disp)}
+.wb.sec{background:#2c2f32;border:1px solid #44484c;color:#e6e8ea}
+.wb:active{transform:scale(.99)}
+.wb:disabled{background:#4a3320;color:#ffd9b8;opacity:.8;cursor:default;transform:none}
+.nt{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid #7a5a22;border-radius:10px;background:#2f2b24}
+.nt svg{flex:none;margin-top:3px;color:#ffc23f}
+.nt span{font-size:13px;line-height:1.6;font-weight:600;color:#ffc23f}
+.nt.ok{border-color:#2c5a47;background:#1e2b26}.nt.ok svg{color:var(--grn)}.nt.ok span{color:var(--grn)}
+.sb2{padding:2px 14px 14px}
+.tx2{margin:0 0 12px;font-size:12.5px;line-height:1.65;color:#8b9098}
+.src{display:flex;align-items:center;gap:12px;padding:10px 12px;margin-bottom:10px;border:1px solid #33363a;border-radius:10px;background:#25282b}
+.src .si{width:40px;height:40px;border:1px solid #3a3d41;border-radius:9px;display:grid;place-items:center;color:#9aa0a6;background:#ffffff05;flex:none}
+.src .sx{flex:1;min-width:0}.src small{display:block;font:400 10px var(--mono);letter-spacing:.1em;color:#8b9098;line-height:1.4}
+.src b{display:block;font:700 13px var(--disp);color:#f4f4f4;margin-top:2px}
+.op{display:flex;align-items:center;gap:6px;width:auto;height:34px;margin:0;padding:0 12px;border:1px solid #7a5535;border-radius:8px;background:#3e3833;color:#ffa861;font:700 11px var(--mono);letter-spacing:.06em;flex:none}
+.cin{display:flex;gap:10px;margin-top:2px}
+.cin input{flex:1;min-width:0;height:48px;padding:0 14px;border:1px solid #33363a;border-radius:9px;background:#1f2225;color:#f4f4f4;font:500 13px var(--mono);letter-spacing:.06em;outline:0;direction:ltr;text-align:left}
+.cin input:focus{border-color:#7a5535}.cin input::placeholder{color:#6b7178}
+.cin button{width:112px;margin:0;height:48px;border:0;border-radius:9px;background:#8a6540;color:#f0e1cf;font:700 12.5px var(--mono);letter-spacing:.04em}
 #introw{--u:.61px;position:fixed;inset:0;z-index:100;background:#17191c;transition:opacity .6s ease;pointer-events:none;overflow:hidden}
 #intro{position:absolute;inset:0;width:100%;height:100%}
 .it{position:absolute;top:10.7%;left:0;right:0;transform:translateY(-50%);text-align:center;font-weight:800;font-size:calc(var(--u)*35);line-height:1.2;letter-spacing:calc(var(--u)*-.6);color:#fff;padding:0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2857,7 +2946,7 @@ const tg=window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}
 const SID=(()=>{try{const a=new Uint8Array(8);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return String(Math.random()).slice(2)+Date.now()}})();let SESSNEW=true;
 try{tg.BackButton.onClick(()=>{if(sheet)closeSheet()})}catch(e){}
 function bb(){try{if(sheet)tg.BackButton.show();else tg.BackButton.hide()}catch(e){}}
-let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null;
+let topView='all',BANNED=false,S=null,BK=null,B=[],TOP=null,REFS=null,tab='mine',sheet=null,subOpen=true;
 const TABS=[['mine','⛏','تعدين'],['refs','👥','إحالات'],['tasks','✅','مهام'],['top','🏆','إحصائيات'],['wallet','👛','محفظة']];
 const TL={turbo:'تيربو',nitro:'نيترو',super:'سوبر'};
 const $=id=>document.getElementById(id);
@@ -3067,18 +3156,44 @@ function vRefs(){
   <div class="stc bn"><div class="bnr"><span class="stic or big">${ic('spark',18)}</span><div><span class="mlb cap2"><i class="dot"></i>قاعدة المكافأة</span><div class="bt">احصل على +${fi(S.ref_energy)} طاقة قصوى</div></div></div>
     <p class="bd">تحصل على +${fi(S.ref_energy)} طاقة قصوى عن كل مُحال يعدّن ${fi(S.ref_hours)} ساعة فعلية على الأقل (حتى ${fi(S.ref_max)} مُحال). المُحالون النشطون حالياً: <b style="color:var(--tx)">${fi(S.ref_active)}</b> / ${fi(S.ref_max)}. الإحالات الوهمية لا تُحتسب.</p></div>
   <div class="stc"><div class="sth lbh"><div><div class="lbt">أفضل 100 إحالة</div><div class="lbs">لوحة الصدارة</div></div><span class="lbn">${String(L.length).padStart(3,'0')}</span></div>${rows}</div>`}
+
+/* ═══ تبويب المهام: مكافآت يومية + اشتراكات ومهام + أكواد ترويجية ═══ */
+function togSub(){subOpen=!subOpen;draw()}
+function verifyTask(id){
+  api('task',{task:id}).then(r=>{toast(r.msg);sheet=null;bb();return load()}).catch(e=>toast(e.message))}
+const bzi=z=>`<i class="bz">${ic('bolt',z||8)}</i>`;
+function taskRow(t,i){
+  return `<div class="tk c" onclick="openSheet('task:${t.id}')"><span class="nb">${String(i+1).padStart(2,'0')}</span>
+    <div class="tt"><b><span class="tic">${ic(t.icon,14)}</span>${esc(t.title)}</b><div class="tts">${bzi()}<em>+${fi(t.reward)}</em> طاقة قصوى</div></div>
+    ${t.done?'<span class="tok">'+ic('check',17)+'</span>':'<span class="tkc">'+ic('chev',16)+'</span>'}</div>`}
 function vTasks(){
   const ready=S.daily_wait<=0;
   let h=`<div class="stc"><div class="dr" onclick="openSheet('daily')"><span class="stic or">${ic('gift',16)}</span>
     <div class="dtx"><b>مكافآت يومية</b><span class="${ready?'':'w2'}">${ready?'المكافأة جاهزة — استلمها':'التالية بعد '+fmtWait(S.daily_wait)}</span></div>
     <span class="drt">${ready?'<span class="plp">جاهز</span>':''}${ic('chev',16)}</span></div></div>`;
   if(S.tasks.length){
-    const nd=S.tasks.filter(t=>t.done).length;
-    h+=`<div class="stc"><div class="sth"><span class="stic">${ic('list',14)}</span>المهام<span class="cntb">${nd}/${S.tasks.length}</span></div>`+
-    S.tasks.map((t,i)=>`<div class="tk"><span class="nb">${String(i+1).padStart(2,'0')}</span>
-      <div class="tt"><b>${esc(t.title)}</b><div class="tts"><em>+${t.reward} HASH</em></div></div>
-      ${t.done?'<span class="tok">'+ic('check',17)+'</span>':`<button class="jn" onclick="tg.openTelegramLink('https://t.me/${esc(S.channel.replace('@',''))}');setTimeout(()=>act('task',{task:'${t.id}'}),4000)">انضم</button>`}</div>`).join('')+'</div>'}
+    const nd=S.tasks.filter(t=>t.done).length,sum=S.tasks.reduce((a,t)=>a+t.reward,0);
+    h+=`<div class="stc"><div class="sth ${subOpen?'ul':''}" onclick="togSub()"><span class="stic">${ic('clip',14)}</span>
+      <div>اشتراكات ومهام<small>${nd}/${S.tasks.length} مكتملة</small></div>
+      <span class="rt"><span class="pl">${bzi(10)}+${fi(sum)}</span><span class="chv ${subOpen?'':'dn'}">${ic('up',16)}</span></span></div>`+
+      (subOpen?S.tasks.map(taskRow).join(''):'')+'</div>'}
+  h+=`<div class="stc"><div class="sth"><span class="stic">${ic('gift',14)}</span>أكواد ترويجية</div>
+    <div class="sb2"><p class="tx2">أدخل كوداً لتحصل على مكافأة: طاقة إضافية، وضع تعدين، تصريح أو نقاط HASH.</p>
+    ${S.channel_link?`<div class="src"><span class="si">${ic('send',17)}</span><div class="sx"><small>مصدر الأكواد الجديدة</small><b>${esc(S.channel)}</b></div>
+      <button class="op" onclick="tg.openTelegramLink('${esc(S.channel_link)}')">OPEN${ic('ext',12)}</button></div>`:''}
+    <div class="cin"><input id="cd" placeholder="TH-XXXXXXXX" autocapitalize="characters" autocomplete="off"><button onclick="redeem()">تحقق</button></div></div></div>`;
   return h}
+function taskSheet(id){
+  const t=S.tasks.find(x=>x.id===id);if(!t)return '';
+  const blocked=t.prem&&!S.premium;
+  let tail;
+  if(t.done)tail=`<div class="nt ok">${ic('check',15)}<span>تمت هذه المهمة.</span></div>`;
+  else if(blocked)tail=`<div class="nt">${ic('crown',15)}<span>ليس لديك Telegram Premium. لا يمكن إكمال هذه المهمة بدونه.</span></div>`;
+  else tail=(t.link?`<button class="wb sec" onclick="tg.openTelegramLink('${esc(t.link)}')">${ic('ext',15)}فتح</button>`:'')+
+    `<button class="wb" onclick="verifyTask('${esc(t.id)}')">${ic('check',15)}تحقق من المهمة</button>`;
+  return shellMid(`<div class="cap cap2"><i class="dot"></i>${esc(t.cap)}</div>
+    <div class="th"><span class="gi">${ic(t.icon,22)}</span><div><b>${esc(t.title)}</b><div class="tts">${bzi()}<em>+${fi(t.reward)}</em> طاقة قصوى</div></div></div>
+    <p class="dsc">${esc(t.desc)}</p>`+tail)}
 
 const ICO={trend:'<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
  trophy:'<path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/>',
@@ -3118,6 +3233,13 @@ Object.assign(ICO,{
  cpu:'<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
  hash:'<line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/>',
  crown:'<path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"/><path d="M5 21h14"/>'});
+Object.assign(ICO,{
+ clip:'<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/>',
+ at:'<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/>',
+ userplus:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>',
+ help:'<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+ ext:'<path d="M7 7h10v10"/><path d="M7 17 17 7"/>',
+ up:'<path d="m18 15-6-6-6 6"/>'});
 const ic=(n,z)=>`<svg viewBox="0 0 24 24" width="${z||20}" height="${z||20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICO[n]}</svg>`;
 const NI={mine:'pick',refs:'users',tasks:'list',top:'bars',wallet:'wallet'};
 function avs(n){let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))%360;return `<span class="avs" style="background:linear-gradient(160deg,hsl(${h},68%,66%),hsl(${h},58%,48%))">${esc(String(n).trim().slice(0,2).toUpperCase())}</span>`}
@@ -3227,6 +3349,7 @@ function sheetHTML(){
   if(!sheet)return '';
   if(sheet==='blk')return blkModal();
   if(sheet==='daily')return dailySheet();
+  if(sheet.startsWith('task:'))return taskSheet(sheet.slice(5));
   if(sheet==='session'||sheet==='binfo')return infoSheet(sheet);
   let b='';
   if(sheet==='energy'){
